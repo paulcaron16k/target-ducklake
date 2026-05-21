@@ -1376,7 +1376,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "duckdb", specifier = ">=1.5.2,<1.6.0" },
+    { name = "duckdb", specifier = "==1.5.2" },
     { name = "polars", specifier = ">=1.31.0" },
     { name = "psutil", specifier = ">=5.9.0" },
     { name = "pyarrow", specifier = ">=20.0.0" },
