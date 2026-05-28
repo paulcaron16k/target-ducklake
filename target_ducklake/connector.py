@@ -16,6 +16,16 @@ logger = logging.getLogger(__name__)
 
 PARTITION_GRANULARITIES = ["year", "month", "day", "hour"]
 
+# Integer type widths for deciding safe in-place widening (e.g. INTEGER -> BIGINT).
+_INT_TYPE_RANK = {
+    "TINYINT": 1,
+    "SMALLINT": 2,
+    "INT": 3,
+    "INTEGER": 3,
+    "BIGINT": 4,
+    "HUGEINT": 5,
+}
+
 # Postgres error messages that indicate transient connectivity issues.
 # These surface as plain duckdb.Error (not IOException) when DuckLake's
 # internal snapshot query hits a dropped Postgres connection.
@@ -346,6 +356,15 @@ class DuckLakeConnector(SQLConnector):
         result = self.execute(get_columns_query).fetchall()
         return [col[1] for col in result]
 
+    def get_table_column_types(
+        self, target_schema_name: str, table_name: str
+    ) -> dict[str, str]:
+        """Get the columns of the table mapped to their DuckDB types."""
+        get_columns_query = f"PRAGMA TABLE_INFO('{self.catalog_name}.{target_schema_name}.{table_name}');"
+        logger.info(f"Getting column types for table {table_name}")
+        result = self.execute(get_columns_query).fetchall()
+        return {col[1]: col[2] for col in result}
+
     def _add_columns(
         self,
         target_schema_name: str,
@@ -359,6 +378,61 @@ class DuckLakeConnector(SQLConnector):
                 f"Adding column {col['name']} ({col['type']}) to table {table_name}"
             )
             self.execute(add_column_query)
+
+    @staticmethod
+    def _safe_widen_target(current_type: str, desired_type: str) -> str | None:
+        """Return desired_type if it safely widens current_type in place, else None.
+
+        Only same-family promotions DuckLake applies as metadata-only changes are
+        allowed: integer-family widenings (e.g. INTEGER -> BIGINT) and FLOAT/REAL ->
+        DOUBLE. Equal types, narrowings, and cross-family changes (e.g. DOUBLE ->
+        BIGINT, VARCHAR -> JSON) return None.
+        """
+        current = current_type.strip().upper()
+        desired = desired_type.strip().upper()
+        if current == desired:
+            return None
+        if current in _INT_TYPE_RANK and desired in _INT_TYPE_RANK:
+            if _INT_TYPE_RANK[desired] > _INT_TYPE_RANK[current]:
+                return desired_type
+            return None
+        if current in {"FLOAT", "REAL"} and desired == "DOUBLE":
+            return desired_type
+        return None
+
+    def _alter_column_type(
+        self,
+        target_schema_name: str,
+        table_name: str,
+        column: str,
+        new_type: str,
+    ) -> None:
+        """Widen an existing column's type in place."""
+        alter_query = f'ALTER TABLE {self.catalog_name}.{target_schema_name}.{table_name} ALTER COLUMN "{column}" SET DATA TYPE {new_type};'
+        logger.info(f"Widening column {column} to {new_type} in table {table_name}")
+        self.execute(alter_query)
+
+    def _reconcile_column_types(
+        self,
+        target_schema_name: str,
+        table_name: str,
+        columns: list[dict[str, str]],
+        current_types: dict[str, str],
+    ) -> None:
+        """Widen existing columns whose desired type is wider than the current type.
+
+        current_types is a name->type snapshot taken before columns were added, so
+        newly added columns are absent and skipped (already created as desired).
+        """
+        for col in columns:
+            current = current_types.get(col["name"])
+            if current is None:
+                continue
+            new_type = self._safe_widen_target(current, col["type"])
+            if new_type is not None:
+                self._alter_column_type(
+                    target_schema_name, table_name, col["name"], new_type
+                )
 
     def _create_empty_table(
         self,
@@ -397,16 +471,21 @@ class DuckLakeConnector(SQLConnector):
             logger.info(
                 f"Table {table_name} already exists in schema {target_schema_name}. Checking if columns match..."
             )
-            # get the columns of the existing table
-            existing_columns = self.get_table_columns(target_schema_name, table_name)
+            existing_column_types = self.get_table_column_types(
+                target_schema_name, table_name
+            )
             new_columns = [
-                col for col in columns if col["name"] not in existing_columns
+                col for col in columns if col["name"] not in existing_column_types
             ]
             if new_columns:
                 logger.info(f"Adding new columns to table {table_name}: {new_columns}")
                 self._add_columns(target_schema_name, table_name, new_columns)
             else:
                 logger.info(f"Columns match for table {table_name}. No new columns to add.")
+            # widen any existing column whose desired type is wider (uses pre-add snapshot)
+            self._reconcile_column_types(
+                target_schema_name, table_name, columns, existing_column_types
+            )
 
         # truncate the table if necessary
         if overwrite_table:
