@@ -858,3 +858,124 @@ class TestStartupScriptGCSCredentialChain:
         assert self._make_connector()._use_definite_gcp_credential_chain() is True
         assert self._make_connector(public_key="ak", secret_key="sk")._use_definite_gcp_credential_chain() is False
         assert self._make_connector(storage_type="local", data_path="/tmp/x")._use_definite_gcp_credential_chain() is False
+
+
+class TestColumnTypeReconciliation:
+    """Test in-place column type widening during prepare_table."""
+
+    def _make_connector(self):
+        config = {
+            "catalog_url": "test.db",
+            "data_path": "/tmp/test",
+            "storage_type": "local",
+        }
+        return DuckLakeConnector(config)
+
+    @pytest.mark.parametrize(
+        ("current", "desired", "expected"),
+        [
+            # safe same-family widenings
+            ("INTEGER", "BIGINT", "BIGINT"),
+            ("SMALLINT", "BIGINT", "BIGINT"),
+            ("TINYINT", "INTEGER", "INTEGER"),
+            ("INT", "BIGINT", "BIGINT"),
+            ("FLOAT", "DOUBLE", "DOUBLE"),
+            ("REAL", "DOUBLE", "DOUBLE"),
+            # case / whitespace insensitive; return preserves the desired casing
+            (" integer ", "bigint", "bigint"),
+            # no-op: equal types
+            ("BIGINT", "BIGINT", None),
+            ("INTEGER", "INTEGER", None),
+            # no-op: narrowing
+            ("BIGINT", "INTEGER", None),
+            ("HUGEINT", "BIGINT", None),
+            ("DOUBLE", "FLOAT", None),
+            # no-op: cross-family (data-unsafe)
+            ("DOUBLE", "BIGINT", None),
+            ("DECIMAL(38, 9)", "BIGINT", None),
+            ("BIGINT", "DECIMAL(38, 9)", None),
+            ("VARCHAR", "JSON", None),
+            ("INTEGER", "DATETIME", None),
+        ],
+    )
+    def test_safe_widen_target(self, current, desired, expected):
+        """Only same-family widenings return a target type; everything else is None."""
+        assert DuckLakeConnector._safe_widen_target(current, desired) == expected
+
+    def test_reconcile_only_widens_safe_columns(self):
+        """Emit ALTER only for safe widenings of existing columns."""
+        connector = self._make_connector()
+        mock_cursor = Mock()
+        connector._connection = Mock()
+        connector._connection.cursor.return_value = mock_cursor
+
+        current_types = {
+            "id": "VARCHAR",
+            "legacy_id": "INTEGER",
+            "_sdc_sync_started_at": "INTEGER",
+            "content_type_id": "DOUBLE",
+        }
+        columns = [
+            {"name": "id", "type": "VARCHAR"},  # unchanged
+            {"name": "legacy_id", "type": "BIGINT"},  # widen
+            {"name": "_sdc_sync_started_at", "type": "BIGINT"},  # widen
+            {"name": "content_type_id", "type": "BIGINT"},  # cross-family, skip
+            {"name": "new_col", "type": "BIGINT"},  # not in snapshot, skip
+        ]
+        connector._reconcile_column_types("myschema", "mytable", columns, current_types)
+
+        executed = [call.args[0] for call in mock_cursor.execute.call_args_list]
+        assert len(executed) == 2
+        assert any(
+            'ALTER COLUMN "legacy_id" SET DATA TYPE BIGINT' in sql for sql in executed
+        )
+        assert any(
+            'ALTER COLUMN "_sdc_sync_started_at" SET DATA TYPE BIGINT' in sql
+            for sql in executed
+        )
+        assert all("content_type_id" not in sql for sql in executed)
+        assert all('"id"' not in sql for sql in executed)
+        assert all("new_col" not in sql for sql in executed)
+
+    def test_get_table_column_types_maps_name_to_type(self):
+        """get_table_column_types maps PRAGMA rows name -> type, preserving order."""
+        connector = self._make_connector()
+        mock_result = Mock()
+        mock_result.fetchall.return_value = [
+            (0, "id", "VARCHAR", False, None, False),
+            (1, "legacy_id", "INTEGER", False, None, False),
+            (2, "_sdc_sync_started_at", "INTEGER", False, None, False),
+        ]
+        mock_cursor = Mock()
+        mock_cursor.execute.return_value = mock_result
+        connector._connection = Mock()
+        connector._connection.cursor.return_value = mock_cursor
+
+        result = connector.get_table_column_types("myschema", "mytable")
+
+        assert result == {
+            "id": "VARCHAR",
+            "legacy_id": "INTEGER",
+            "_sdc_sync_started_at": "INTEGER",
+        }
+
+    def test_prepare_table_widens_existing_columns(self):
+        """prepare_table widens existing columns, not just adds new ones."""
+        connector = self._make_connector()
+        with (
+            patch.object(connector, "_check_if_table_exists", return_value=True),
+            patch.object(
+                connector,
+                "get_table_column_types",
+                return_value={"legacy_id": "INTEGER"},
+            ),
+            patch.object(connector, "_add_columns") as mock_add,
+            patch.object(connector, "_alter_column_type") as mock_alter,
+            patch.object(connector, "get_table_columns", return_value=["legacy_id"]),
+        ):
+            connector.prepare_table(
+                "myschema", "mytable", [{"name": "legacy_id", "type": "BIGINT"}]
+            )
+
+        mock_alter.assert_called_once_with("myschema", "mytable", "legacy_id", "BIGINT")
+        mock_add.assert_not_called()
