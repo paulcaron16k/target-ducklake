@@ -1,0 +1,47 @@
+{
+  "boards": [
+    {
+      "name": "Sprint board",
+      "type": "scrum"
+    },
+    {
+      "name": "Kanban",
+      "type": "kanban"
+    },
+    {
+      "name": "Backlog",
+      "type": "backlog"
+    },
+    {
+      "filter": "-status:Done",
+      "name": "Roadmap",
+      "type": "roadmap"
+    },
+    {
+      "name": "Engineering: all work",
+      "type": "kanban"
+    }
+  ],
+  "keys": [
+    {
+      "key": "DUCKLKD",
+      "name": "Target DuckLake (Definite fork)",
+      "repo": "paulcaron16k/target-ducklake-definite"
+    }
+  ],
+  "project": {
+    "issue_title_prefix": "key",
+    "key": "DUCKLKD",
+    "name": "Target DuckLake (Definite fork)",
+    "number": 34,
+    "owner": "paulcaron16k"
+  },
+  "sprint": {
+    "ahead": 2,
+    "autocreate": true,
+    "cadence_days": 14,
+    "name_template": "{n:04d} W{iso_week}-{year}",
+    "start_day": "monday",
+    "template": "2-week"
+  }
+}
