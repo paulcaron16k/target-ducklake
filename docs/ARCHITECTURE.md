@@ -25,7 +25,7 @@ The target must accept any Singer-compliant stream and land it as a queryable, c
 | ID | Requirement | How it is met | Config |
 | --- | --- | --- | --- |
 | FR-1 | Read Singer SCHEMA, RECORD, STATE and ACTIVATE_VERSION messages from stdin | Singer SDK `SQLTarget` / `SQLSink` base classes | — |
-| FR-2 | Write to GCS, S3 or local storage | DuckDB secrets (`CREATE SECRET`) or ambient credentials (IAM role, service account) | `storage_type`, `data_path`, `public_key`, `secret_key`, `region` |
+| FR-2 | Write to GCS, S3 or local storage | DuckDB secrets (`CREATE SECRET`) from static HMAC/access keys only; keyless cloud identity is not supported on `main` | `storage_type`, `data_path`, `public_key`, `secret_key`, `region` |
 | FR-3 | Use Postgres, SQLite, MySQL or DuckDB as the catalog | `ATTACH 'ducklake:<type>:<url>'` | `catalog_type`, `catalog_url`, `meta_schema` |
 | FR-4 | Create target schema and table on first sight | `prepare_target_schema`, `prepare_table` | `default_target_schema`, `target_schema_prefix` |
 | FR-5 | Evolve schema: add new columns, widen types safely | `ALTER TABLE … ADD COLUMN`; integer and FLOAT→DOUBLE widening only | — |
@@ -140,7 +140,7 @@ The target deploys as a stateless batch job, one process per tap→target run, n
 | State | Meltano system DB or orchestrator state backend | — | Singer STATE bookmarks, not stored by the target |
 | Secrets | Secret manager injected as env vars (`TARGET_DUCKLAKE_CATALOG_URL`, …) | `.env` with `--config=ENV` | `catalog_url` and `secret_key` are flagged secret |
 
-Credentials. Storage access uses either HMAC/access keys (`public_key` + `secret_key`, plus `region` for S3) or ambient workload identity when both keys are omitted. Readers need read access to the bucket and a read-only role on the catalog database; writers need read-write on both.
+Credentials. Storage access uses only HMAC/access keys (`public_key` + `secret_key`, plus `region` for S3). When both keys are omitted, `main` creates no DuckDB secret, so storage is accessed anonymously, which only works for public buckets. IAM roles, GKE Workload Identity and Azure managed identity are not supported. Only the `definite` branch adds a GCS credential chain. Closing this gap means adding `PROVIDER credential_chain` secrets (gap A2 in the gap list). Readers need read access to the bucket and a read-only role on the catalog database; writers need read-write on both.
 
 Environments. Separate dev, staging and prod by catalog database (or `meta_schema`) plus bucket prefix. Two environments must never share a catalog while pointing at different `data_path`s.
 
