@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock, patch
 
 import duckdb
@@ -270,6 +272,63 @@ class TestDucklakeSink:
                     key_properties=None,
                 )
                 # This would test the actual target_schema property
+
+
+class TestInBatchDeduplication:
+    """Duplicate keys within one batch keep the newest (last) record."""
+
+    @staticmethod
+    def _dedup(table: pa.Table, key_properties: list[str]) -> pa.Table:
+        # Only the attributes the method reads; avoids building a full sink.
+        sink: Any = SimpleNamespace(
+            key_properties=key_properties, target_table="users", logger=Mock()
+        )
+        return ducklakeSink._remove_temp_table_duplicates(sink, table)
+
+    def test_keeps_last_occurrence_per_key(self):
+        """The last version of each key wins, in stream order."""
+        table = pa.table(
+            {
+                "id": [1, 2, 1, 3, 2, 1],
+                "status": ["v1", "a1", "v2", "b1", "a2", "v3"],
+            }
+        )
+        result = self._dedup(table, ["id"])
+        assert result.to_pylist() == [
+            {"id": 3, "status": "b1"},
+            {"id": 2, "status": "a2"},
+            {"id": 1, "status": "v3"},
+        ]
+
+    def test_keeps_last_occurrence_for_composite_key(self):
+        """Composite keys dedup on the full key, keeping the last version."""
+        table = pa.table(
+            {
+                "tenant": ["a", "a", "b", "a"],
+                "id": [1, 2, 1, 1],
+                "status": ["old", "x", "y", "new"],
+            }
+        )
+        result = self._dedup(table, ["tenant", "id"])
+        assert result.to_pylist() == [
+            {"tenant": "a", "id": 2, "status": "x"},
+            {"tenant": "b", "id": 1, "status": "y"},
+            {"tenant": "a", "id": 1, "status": "new"},
+        ]
+
+    def test_keeps_last_occurrence_in_large_batch(self):
+        """Holds for batches big enough for Polars to split work across threads."""
+        n, distinct = 100_000, 1_000
+        table = pa.table(
+            {
+                "id": [i % distinct for i in range(n)],
+                "seq": list(range(n)),
+            }
+        )
+        result = self._dedup(table, ["id"])
+        newest = {row["id"]: row["seq"] for row in table.to_pylist()}
+        assert len(result) == distinct
+        assert {row["id"]: row["seq"] for row in result.to_pylist()} == newest
 
 
 class TestFlattenModule:
