@@ -67,9 +67,9 @@ flowchart TB
 
     subgraph Engines["Query engines: consumers bring their own compute"]
         embedded["Embedded DuckDB<br/><small>notebooks, dbt</small>"]
-        biduck["BI-server DuckDB<br/><small>Metabase, Superset</small>"]
-        motherduck["MotherDuck<br/><small>hosted DuckDB</small>"]
-        iceberg["Iceberg export<br/><small>Spark, Trino</small>"]
+        biduck["DuckDB in BI<br/><small>Metabase, MotherDuck</small>"]
+        trino["Trino<br/><small>trino-ducklake</small>"]
+        pgducklake["Postgres<br/><small>pg_ducklake</small>"]
     end
 
     subgraph Users["BI and analytics users"]
@@ -87,7 +87,7 @@ flowchart TB
     style target stroke-width:2px
 ```
 
-Data moves top to bottom. The ELT job writes once into the shared lakehouse, and every consumer reads through the catalog with its own DuckDB-family engine. Transformations (dbt on DuckDB) run in the engine layer and write models back into the same lakehouse as new tables.
+Data moves top to bottom. The ELT job writes once into the shared lakehouse, and every consumer reads through the catalog with its own engine: DuckDB, Trino or pg_ducklake. Transformations (dbt on DuckDB) run in the engine layer and write models back into the same lakehouse as new tables.
 
 ## Component diagram
 
@@ -155,15 +155,18 @@ Any reader must go through the DuckLake catalog, not straight to the Parquet fil
 | A. Embedded DuckDB | DuckDB + `ducklake` extension | `ATTACH 'ducklake:postgres:<url>' AS lake (DATA_PATH 'gs://…')` from Python, R, Jupyter, the DuckDB CLI, or dbt-duckdb | Analysts, notebooks, dbt transforms, scheduled analysis jobs | Each client needs bucket and catalog credentials; compute is the client's own machine |
 | B. BI tool with a DuckDB driver | DuckDB, in the BI server process | Metabase (DuckDB driver), Superset (`duckdb-engine` SQLAlchemy), Tableau or Power BI (DuckDB JDBC / ODBC), Evidence, Rill, Hex; the connection init SQL runs `INSTALL ducklake; ATTACH …` | Self-hosted BI dashboards | Query concurrency is limited to the BI host's DuckDB; cold cache on first query after restart |
 | C. Hosted DuckDB (MotherDuck) | DuckDB in the cloud | MotherDuck DuckLake support; BI tools connect through MotherDuck's drivers | Many concurrent BI users without running query servers | Managed service and cost; check which catalog types and buckets it supports |
-| D. Postgres-native access | DuckDB inside Postgres (`pg_duckdb`) | BI tools speak plain Postgres wire protocol | BI tools that only support Postgres | Extra component in the catalog DB or a sibling instance; verify DuckLake support in the installed `pg_duckdb` version |
-| E. Shared DuckDB query service | DuckDB behind an HTTP, Arrow Flight or Postgres-wire front end | Custom API or an open-source DuckDB server; BI connects to the service | Central governance, row-level filters, connection pooling | You build and operate the service |
-| F. Export to another table format | Spark, Trino, Snowflake, BigQuery, Athena | Copy DuckLake tables to Iceberg (DuckDB's `iceberg` extension) or plain Parquet snapshots on a schedule | Teams standardised on a non-DuckDB engine | Data is copied and lags by the export interval; two sources of truth |
+| D. Trino | [trino-ducklake](https://github.com/brikk/trino-ducklake) connector plugin, read and write, DuckLake spec v1.0 | Catalog properties point at the same Postgres catalog (`ducklake.catalog.database-url`) and `ducklake.data-path`; BI tools use the Trino JDBC/ODBC drivers | Teams that already run Trino; a shared, governed SQL endpoint for many BI users; federating DuckLake with other Trino catalogs | Community project; you operate a Trino cluster; documented data paths are local and S3 (GCS not shown); tested against DuckDB 1.5.4. Time travel and snapshot pinning supported |
+| E. Postgres-native (pg_ducklake) | DuckDB embedded in Postgres via [pg_ducklake](https://github.com/relytcloud/pg_ducklake) | Point target-ducklake's `catalog_url` at the pg_ducklake database with `meta_schema: ducklake`; pg_ducklake's reverse catalog sync registers tables created by outside DuckDB clients as Postgres tables; BI tools speak plain Postgres | BI tools that only support Postgres; joining lake tables with OLTP heap tables | Analytic queries run inside the catalog's Postgres and compete with catalog traffic; end-to-end use with target-ducklake not yet tested |
+| F. Shared DuckDB query service | DuckDB behind an HTTP, Arrow Flight or Postgres-wire front end | Custom API or an open-source DuckDB server; BI connects to the service | Central governance, row-level filters, connection pooling | You build and operate the service |
+| G. Export to Iceberg | Snowflake, BigQuery, Athena | Copy DuckLake tables to Iceberg (DuckDB's `iceberg` extension) or plain Parquet snapshots on a schedule | Platforms with no DuckLake reader | Data is copied and lags by the export interval; two sources of truth |
 
-Recommendation: start with A for analysts and dbt, and B for dashboards. Move to C or E once concurrent dashboard users outgrow a single BI host. Use F only where a downstream platform cannot read DuckLake.
+Spark is a writer, not a reader. MotherDuck's [ducklake-spark](https://github.com/motherduckdb/ducklake-spark) connector is write-only and append-only. It needs the tables to exist already, supports Spark 3 only, and rejects complex types. It suits Spark jobs that produce data into the lake, not BI reads.
+
+Recommendation: start with A for analysts and dbt, and B for dashboards. Move to C or D once concurrent dashboard users outgrow a single BI host: C if you'd rather buy, D if you already run Trino. Use E when a BI tool only speaks Postgres, and G only for Snowflake, BigQuery or Athena.
 
 Capability notes for every option: readers get snapshot isolation, so a dashboard never sees half of a target's batch. Time travel (`AT (VERSION => n)` or `AT (TIMESTAMP => …)`) supports audits and reproducible analyses. Partition pruning and Parquet min/max statistics stored in the catalog cut the files each query reads.
 
-Ecosystem support for DuckLake is moving quickly. The driver and product names above come from general knowledge as of mid-2026, not from sources checked for this document, so confirm current versions before committing to one.
+Sources: the Trino, pg_ducklake and Spark rows come from each project's README (and pg_ducklake's catalog-sync code and tests), checked 2026-10-16. The BI driver and MotherDuck details come from general knowledge, so confirm current versions before committing to one.
 
 ## High-level design
 
@@ -232,7 +235,7 @@ Throughput scales with streams loaded in parallel and with batch size. The limit
 | File count | Each batch adds at least one data file; merges add delete files. Many small files slow every reader | Schedule DuckLake maintenance: `ducklake_merge_adjacent_files`, then `ducklake_expire_snapshots` and `ducklake_cleanup_old_files` |
 | Partitioning | Prunes files by time or identifier before reading | Partition on the column dashboards filter by (often `year`/`month` of an event timestamp); avoid high-cardinality identifiers |
 | Statistics | Min/max per file live in the catalog, so pruning happens without opening Parquet | Keep catalog Postgres healthy; vacuum it like any OLTP database |
-| Reader concurrency | Each DuckDB reader is independent; the catalog sees only small metadata queries | Scale BI by adding DuckDB hosts (or MotherDuck), not by scaling storage |
+| Reader concurrency | Each DuckDB reader is independent; the catalog sees only small metadata queries | Scale BI by adding DuckDB hosts, MotherDuck or Trino workers, not by scaling storage |
 | Snapshot growth | Every commit creates a snapshot row; long histories grow the catalog | Expire snapshots past the retention window you need for time travel |
 
 ### Known bottlenecks and improvements
