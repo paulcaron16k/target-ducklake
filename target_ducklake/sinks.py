@@ -233,9 +233,14 @@ class ducklakeSink(SQLSink):
                 )
 
         original_row_count = len(pyarrow_df)
-        # Convert to polars, drop duplicates, then back to pyarrow
+        # Convert to polars, drop duplicates, then back to pyarrow.
+        # Keep the last occurrence: records arrive in stream order, so the last one
+        # is the newest version of the row. Polars' default (keep="any") may keep
+        # an older version and overwrite the newer one in the target table.
         polars_df = pl.from_arrow(pyarrow_df)
-        polars_df = polars_df.unique(subset=self.key_properties)
+        polars_df = polars_df.unique(
+            subset=self.key_properties, keep="last", maintain_order=True
+        )
         pyarrow_df = polars_df.to_arrow()
 
         new_row_count = len(pyarrow_df)
