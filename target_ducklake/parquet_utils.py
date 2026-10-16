@@ -1,6 +1,7 @@
 # taken from https://github.com/Automattic/target-parquet/blob/master/target_parquet/utils/parquet.py
 import logging
 from datetime import datetime, timezone
+from decimal import ROUND_HALF_EVEN, Context, Decimal
 
 import pyarrow as pa
 
@@ -9,9 +10,14 @@ FIELD_TYPE_TO_PYARROW = {
     "STRING": pa.string(),
     "ARRAY": pa.string(),
     "INTEGER": pa.int64(),
-    "NUMBER": pa.float64(),
     "OBJECT": pa.string(),
 }
+
+# JSON Schema "number" maps to DECIMAL; DuckDB supports precision up to 38.
+DECIMAL_MAX_PRECISION = 38
+DECIMAL_DEFAULT_SCALE = 9
+# Python's default decimal context keeps only 28 digits; DECIMAL(38, s) needs 38.
+_DECIMAL_CONTEXT = Context(prec=DECIMAL_MAX_PRECISION, rounding=ROUND_HALF_EVEN)
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +30,23 @@ EXTENSION_MAPPING = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+def number_precision_and_scale(jsonschema: dict) -> tuple[int, int]:
+    """Return the (precision, scale) used for a JSON Schema "number" property.
+
+    Shared by the DuckLake column DDL and the parquet staging schema so both
+    always agree. Uses the schema's ``precision``/``scale`` when present
+    (precision capped at 38, scale defaulting to 9 and never exceeding the
+    precision), otherwise DECIMAL(38, 9).
+    """
+    precision = jsonschema.get("precision")
+    scale = jsonschema.get("scale")
+    if precision is None:
+        return DECIMAL_MAX_PRECISION, DECIMAL_DEFAULT_SCALE
+    precision = min(precision, DECIMAL_MAX_PRECISION)
+    scale = DECIMAL_DEFAULT_SCALE if scale is None else scale
+    return precision, min(scale, precision)
 
 
 def _field_type_to_pyarrow_field(
@@ -44,7 +67,12 @@ def _field_type_to_pyarrow_field(
     if "NULL" in types_uppercase:
         types_uppercase.remove("NULL")
     input_type = next(iter(types_uppercase)) if types_uppercase else ""
-    pyarrow_type = FIELD_TYPE_TO_PYARROW.get(input_type, pa.string())
+    if input_type == "NUMBER":
+        # Stage numbers as decimals, not float64, so values keep their exact digits
+        # on the way into the DECIMAL column.
+        pyarrow_type = pa.decimal128(*number_precision_and_scale(input_types))
+    else:
+        pyarrow_type = FIELD_TYPE_TO_PYARROW.get(input_type, pa.string())
     return pa.field(field_name, pyarrow_type, nullable)
 
 
@@ -104,11 +132,37 @@ def _normalize_data_for_pyarrow(data: dict, datetime_fields: list[str]) -> dict:
     return data
 
 
+def _to_decimal(value: object, scale: int) -> Decimal | None:
+    """Convert a numeric value to a Decimal rounded to ``scale`` digits.
+
+    Rounds half-even, matching how DuckDB rounds when casting to DECIMAL.
+    Floats go through ``str`` so their shortest repr is kept, not binary noise.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        value = int(value)
+    if not isinstance(value, Decimal):
+        value = Decimal(str(value))
+    return value.quantize(Decimal(1).scaleb(-scale), context=_DECIMAL_CONTEXT)
+
+
+def _coerce_column(values: list, field: pa.Field) -> list:
+    """Coerce Python values so pyarrow can build the column with the field's type."""
+    if pa.types.is_decimal(field.type):
+        return [_to_decimal(v, field.type.scale) for v in values]
+    # Non-number columns keep the previous behaviour: Decimals become floats.
+    return [float(v) if isinstance(v, Decimal) else v for v in values]
+
+
 def create_pyarrow_table(
     list_dict: list[dict], pyarrow_schema: pa.Schema, datetime_fields: list = []
 ) -> pa.Table:
     """Create a pyarrow Table from a python list of dict."""
-    data = {f: [row.get(f) for row in list_dict] for f in pyarrow_schema.names}
+    data = {
+        field.name: _coerce_column([row.get(field.name) for row in list_dict], field)
+        for field in pyarrow_schema
+    }
     # Normalize datetime values to UTC timezone for PyArrow compatibility
     normalized_data = _normalize_data_for_pyarrow(data, datetime_fields)
     return pa.table(normalized_data).cast(pyarrow_schema)

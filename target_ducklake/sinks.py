@@ -7,7 +7,6 @@ import shutil
 import uuid
 from collections.abc import Sequence
 from datetime import datetime, timezone
-from decimal import Decimal
 
 import polars as pl
 import psutil
@@ -198,20 +197,6 @@ class ducklakeSink(SQLSink):
             partition_fields=self.partition_fields,
             overwrite_table=self.should_overwrite_table,
         )
-
-    def preprocess_record(self, record: dict, context: dict) -> dict:
-        """Process incoming record and convert Decimal objects to float for PyArrow compatibility
-        when writing to parquet files.
-        """
-        # Convert any Decimal objects to float so that we can write to parquet files
-        for key, value in record.items():
-            if isinstance(value, Decimal):
-                record[key] = float(value)
-                self.logger.debug(
-                    f"Converted Decimal field '{key}' from {value} to {record[key]}"
-                )
-
-        return record
 
     def process_record(self, record: dict, context: dict) -> None:
         """Process the record and flatten if necessary."""

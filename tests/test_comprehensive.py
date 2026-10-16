@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 import duckdb
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from singer_sdk.exceptions import ConfigValidationError
 
@@ -25,7 +26,9 @@ from target_ducklake.flatten import (
 )
 from target_ducklake.parquet_utils import (
     _field_type_to_pyarrow_field,
+    create_pyarrow_table,
     flatten_schema_to_pyarrow_schema,
+    number_precision_and_scale,
 )
 from target_ducklake.sinks import ducklakeSink
 from target_ducklake.target import Targetducklake
@@ -404,6 +407,84 @@ class TestParquetUtils:
         assert schema.field("id").type == pa.int64()
         assert schema.field("name").type == pa.string()
         assert schema.field("email").type == pa.string()
+
+
+class TestDecimalPrecision:
+    """Numbers are staged as decimals so they keep their exact digits."""
+
+    # 29 integer + 9 decimal digits: fills DECIMAL(38, 9), far beyond float64.
+    BIG = Decimal("12345678901234567890123456789.123456789")
+
+    @pytest.mark.parametrize(
+        ("jsonschema", "expected"),
+        [
+            ({"type": ["null", "number"]}, (38, 9)),
+            ({"type": "number", "precision": 10, "scale": 2}, (10, 2)),
+            ({"type": "number", "precision": 50}, (38, 9)),
+            ({"type": "number", "precision": 5}, (5, 5)),
+        ],
+    )
+    def test_number_precision_and_scale(self, jsonschema, expected):
+        """Precision caps at 38; scale defaults to 9, never above precision."""
+        assert number_precision_and_scale(jsonschema) == expected
+
+    def test_number_field_is_decimal(self):
+        """Number columns are staged as decimal128, not float64."""
+        field = _field_type_to_pyarrow_field(
+            "amount", {"type": ["null", "number"]}, required_fields=[]
+        )
+        assert field.type == pa.decimal128(38, 9)
+
+    def test_parquet_type_matches_ducklake_column_type(self):
+        """The staged parquet type and the DuckLake DDL type always agree."""
+        jsonschema = {"type": "number", "precision": 12, "scale": 4}
+        field = _field_type_to_pyarrow_field("amount", jsonschema, required_fields=[])
+        column_type = JSONSchemaToDuckLake().to_sql_type(jsonschema)
+        assert (field.type.precision, field.type.scale) == (12, 4)
+        assert str(column_type) == "DECIMAL(12, 4)"
+
+    def test_create_pyarrow_table_keeps_exact_digits(self):
+        """Decimals beyond float64 precision survive staging unchanged."""
+        schema = pa.schema([pa.field("amount", pa.decimal128(38, 9))])
+        table = create_pyarrow_table([{"amount": self.BIG}], schema)
+        assert table.column("amount").to_pylist() == [self.BIG]
+
+    def test_create_pyarrow_table_coerces_numeric_inputs(self):
+        """Ints, floats and None are accepted; extra digits round half-even."""
+        schema = pa.schema([pa.field("amount", pa.decimal128(38, 2))])
+        records = [
+            {"amount": 7},
+            {"amount": 0.1},
+            {"amount": Decimal("1.005")},
+            {"amount": Decimal("1.015")},
+            {"amount": None},
+        ]
+        table = create_pyarrow_table(records, schema)
+        assert table.column("amount").to_pylist() == [
+            Decimal("7.00"),
+            Decimal("0.10"),
+            Decimal("1.00"),
+            Decimal("1.02"),
+            None,
+        ]
+
+    def test_non_number_columns_still_accept_decimals(self):
+        """A Decimal in an integer column is still converted as before."""
+        schema = pa.schema([pa.field("id", pa.int64())])
+        table = create_pyarrow_table([{"id": Decimal(5)}], schema)
+        assert table.column("id").to_pylist() == [5]
+
+    def test_decimal_round_trip_through_duckdb(self, tmp_path):
+        """Staged parquet inserted into a DECIMAL(38, 9) column reads back exactly."""
+        schema = flatten_schema_to_pyarrow_schema({"amount": {"type": "number"}})
+        table = create_pyarrow_table([{"amount": self.BIG}], schema)
+        path = tmp_path / "batch.parquet"
+        pq.write_table(table, path)
+
+        con = duckdb.connect()
+        con.execute("CREATE TABLE t (amount DECIMAL(38, 9))")
+        con.execute(f"INSERT INTO t SELECT amount FROM '{path}'")
+        assert con.execute("SELECT amount FROM t").fetchone()[0] == self.BIG
 
 
 class TestIntegrationScenarios:
