@@ -12,6 +12,8 @@ from singer_sdk.connectors import SQLConnector
 from singer_sdk.connectors.sql import JSONSchemaToSQL
 from sqlalchemy.types import BIGINT, DECIMAL, INTEGER, JSON
 
+from target_ducklake.parquet_utils import number_precision_and_scale
+
 logger = logging.getLogger(__name__)
 
 PARTITION_GRANULARITIES = ["year", "month", "day", "hour"]
@@ -69,23 +71,11 @@ class JSONSchemaToDuckLake(JSONSchemaToSQL):
     def _handle_number_type(self, jsonschema: dict) -> DECIMAL:
         """Handle number type with safe default precision.
 
-        Prefer high-precision DECIMAL to avoid overflow when casting floats from
-        parquet into DECIMAL columns. DuckDB supports precision up to 38.
+        Uses the same (precision, scale) as the parquet staging schema, so the
+        staged decimal values fit the column exactly. DuckDB supports precision
+        up to 38.
         """
-        # If schema provides explicit precision/scale, widen precision to 38.
-        precision = jsonschema.get("precision")
-        scale = jsonschema.get("scale")
-
-        max_precision = 38
-        default_scale = 9
-
-        if precision is not None:
-            precision = min(precision, max_precision)
-            scale = default_scale if scale is None else min(scale, precision)
-            return DECIMAL(precision, scale)
-
-        # Otherwise, use a generous default
-        return DECIMAL(max_precision, default_scale)
+        return DECIMAL(*number_precision_and_scale(jsonschema))
 
 
 class DuckLakeConnector(SQLConnector):
