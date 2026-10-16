@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import ClassVar
 from unittest.mock import Mock, patch
 
 import duckdb
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from singer_sdk.exceptions import ConfigValidationError
 
@@ -487,6 +489,102 @@ class TestIntegrationScenarios:
             )
             # Singer SDK may convert None to empty list, both indicate no key properties
             assert sink.key_properties is None or sink.key_properties == []
+
+
+class TestMergeKeyMatching:
+    """Merge deletes match on each key column, so composite keys can't collide."""
+
+    CONFIG: ClassVar[dict[str, str]] = {
+        "catalog_url": "test.db",
+        "data_path": "/tmp/test",
+        "storage_type": "local",
+    }
+
+    def _merge_sql(
+        self,
+        key_properties: list[str],
+        date_type_keys: list[str | None] | None = None,
+    ) -> str:
+        connector = DuckLakeConnector(self.CONFIG)
+        with patch.object(connector, "execute") as mock_execute:
+            connector.merge_into_table(
+                file_location="batch.parquet",
+                target_schema_name="s",
+                table_name="t",
+                file_columns=["tenant", "id", "v"],
+                target_table_columns=["tenant", "id", "v"],
+                key_properties=key_properties,
+                date_type_keys=date_type_keys or [],
+            )
+        return mock_execute.call_args[0][0]
+
+    def test_composite_key_uses_row_value(self):
+        """Composite keys compare column by column instead of concatenating."""
+        sql = self._merge_sql(["tenant", "id"])
+        assert (
+            """WHERE ("tenant", "id") IN (SELECT "tenant", "id" FROM 'batch.parquet')"""
+            in sql
+        )
+        assert "||" not in sql
+
+    def test_single_key(self):
+        """A single key still produces a simple IN comparison."""
+        sql = self._merge_sql(["id"])
+        assert """WHERE ("id") IN (SELECT "id" FROM 'batch.parquet')""" in sql
+
+    def test_datetime_key_cast_preserved(self):
+        """Datetime keys keep their VARCHAR cast, now per column."""
+        sql = self._merge_sql(["tenant", "ts"], date_type_keys=["ts"])
+        expected = '("tenant", "ts"::VARCHAR) IN (SELECT "tenant", "ts"::VARCHAR'
+        assert expected in sql
+
+    def test_does_not_mutate_key_properties(self):
+        """The caller's key list is left unchanged."""
+        keys = ["tenant", "ts"]
+        self._merge_sql(keys, date_type_keys=["ts"])
+        assert keys == ["tenant", "ts"]
+
+    def test_composite_key_collision_keeps_unrelated_rows(self, tmp_path):
+        """Merging ('12', '3') must not delete the unrelated row ('1', '23')."""
+        con = duckdb.connect()
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        con.execute("CREATE SCHEMA ducklake_catalog.s")
+        con.execute(
+            "CREATE TABLE ducklake_catalog.s.t (tenant VARCHAR, id VARCHAR, v VARCHAR)"
+        )
+        con.execute(
+            "INSERT INTO ducklake_catalog.s.t VALUES "
+            "('1', '23', 'unrelated'), ('a', '1', 'old')"
+        )
+        batch = tmp_path / "batch.parquet"
+        pq.write_table(
+            pa.table(
+                {"tenant": ["12", "a"], "id": ["3", "1"], "v": ["new", "updated"]}
+            ),
+            batch,
+        )
+
+        connector = DuckLakeConnector(self.CONFIG)
+        with patch.object(
+            connector, "execute", side_effect=lambda sql: con.execute(sql)
+        ):
+            connector.merge_into_table(
+                file_location=str(batch),
+                target_schema_name="s",
+                table_name="t",
+                file_columns=["tenant", "id", "v"],
+                target_table_columns=["tenant", "id", "v"],
+                key_properties=["tenant", "id"],
+            )
+
+        rows = con.execute(
+            "SELECT tenant, id, v FROM ducklake_catalog.s.t ORDER BY tenant, id"
+        ).fetchall()
+        assert rows == [
+            ("1", "23", "unrelated"),
+            ("12", "3", "new"),
+            ("a", "1", "updated"),
+        ]
 
 
 class TestErrorHandling:

@@ -576,6 +576,33 @@ class DuckLakeConnector(SQLConnector):
         logger.info(f"Inserting into table {table_name} with SQL {insert_sql}")
         self.execute(insert_sql)
 
+    @staticmethod
+    def _build_key_columns_sql(
+        key_properties: list[str], date_type_keys: list[str | None]
+    ) -> str:
+        """Build the comma-separated key column list used to match merge keys.
+
+        Used as a row value on both sides of the DELETE, e.g.
+        ``("tenant", "id") IN (SELECT "tenant", "id" FROM ...)``.
+
+        Each key column is compared on its own, so composite keys can't collide.
+        Concatenating them (``tenant || id``) made ('1', '23') match ('12', '3').
+        Datetime keys are cast to VARCHAR because DuckDB can't compare the
+        TIMESTAMP table column with the staged string column in an IN clause.
+        """
+        key_columns = []
+        for key_name in key_properties:
+            if key_name in date_type_keys:
+                logger.info(
+                    f"DATETIME primary key detected (column: {key_name}), casting "
+                    "to VARCHAR for merge query (will remain date-time type in "
+                    "final table)"
+                )
+                key_columns.append(f'"{key_name}"::VARCHAR')
+            else:
+                key_columns.append(f'"{key_name}"')
+        return ", ".join(key_columns)
+
     def merge_into_table(
         self,
         file_location: str,
@@ -595,32 +622,19 @@ class DuckLakeConnector(SQLConnector):
         See: https://github.com/duckdb/ducklake/issues/643
         """
         columns_sql = self._build_columns_sql(file_columns, target_table_columns)
-        # Can't use IN comparison for datetime columns, so we cast to VARCHAR for the merge query
-        if date_type_keys:
-            for i in range(len(key_properties)):
-                key_name = key_properties[i]
-                if key_name in date_type_keys:
-                    logger.info(
-                        f"DATETIME primary key detected (column: {key_name}), casting to VARCHAR for merge query (will remain date-time type in final table)"
-                    )
-                    key_properties[i] = (
-                        f"{key_name}::VARCHAR"  # cast to VARCHAR for merge query
-                    )
-
-        if len(key_properties) == 1:
-            key_condition = key_properties[0]
-        else:
+        key_columns_sql = self._build_key_columns_sql(key_properties, date_type_keys)
+        if len(key_properties) > 1:
             logger.info(
-                f"Multiple key properties detected: {key_properties}, attempting to merge with composite key"
+                f"Multiple key properties detected: {key_properties}, "
+                "merging on composite key"
             )
-            key_condition = f"({'||'.join(key_properties)})"
 
         # Build the atomic merge operation
         table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
         combined_sql = f"""
         BEGIN TRANSACTION;
         DELETE FROM {table_ref} 
-        WHERE {key_condition} IN (SELECT {key_condition} FROM '{file_location}');
+        WHERE ({key_columns_sql}) IN (SELECT {key_columns_sql} FROM '{file_location}');
         INSERT INTO {table_ref} 
         SELECT {columns_sql} FROM '{file_location}';
         COMMIT;
