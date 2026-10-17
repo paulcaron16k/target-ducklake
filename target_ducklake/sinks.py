@@ -364,10 +364,16 @@ class ducklakeSink(SQLSink):
 
         # If load method is merge, we merge the data
         elif self.load_method == "merge":
+            # DuckDB matches identifiers case-insensitively, and the singer-sdk
+            # lowercases key_properties while columns keep the property's case.
+            table_types = {
+                name.lower(): column_type
+                for name, column_type in self._table_column_types.items()
+            }
             key_column_types = {
-                key: self._table_column_types[key]
+                key: table_types[key.lower()]
                 for key in self.key_properties
-                if key in self._table_column_types
+                if key.lower() in table_types
             }
             self.connector.merge_into_table(
                 file_location=temp_file_path,

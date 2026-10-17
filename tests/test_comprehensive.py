@@ -1065,6 +1065,7 @@ class TestMergeKeyTableTypes:
         key_prop: dict,
         value: object,
         key_properties: list[str],
+        key_name: str = "k",
     ) -> list[tuple]:
         """Run setup and two merges of the same key; return the rows left."""
         config = {
@@ -1078,7 +1079,7 @@ class TestMergeKeyTableTypes:
         schema = {
             "type": "object",
             "properties": {
-                "k": key_prop,
+                key_name: key_prop,
                 "id": {"type": ["null", "string"]},
                 "v": {"type": ["null", "string"]},
             },
@@ -1099,7 +1100,7 @@ class TestMergeKeyTableTypes:
             sink.setup()
             for version in ("first", "second"):
                 # Values arrive parsed, as the singer-sdk delivers them.
-                record = {"k": value, "id": "a", "v": version}
+                record = {key_name: value, "id": "a", "v": version}
                 sink.process_batch({"records": [record]})
         return con.execute(
             "SELECT id, v FROM ducklake_catalog.s.t ORDER BY id"
@@ -1155,6 +1156,22 @@ class TestMergeKeyTableTypes:
         """The second merge replaces the first row, for every key column type."""
         keys = ["k", "id"] if key_shape == "composite" else ["k"]
         rows = self._load_twice(self._catalog(), tmp_path, key_prop, value, keys)
+        assert rows == [("a", "second")]
+
+    def test_upper_case_key_name(self, tmp_path: Path):
+        """A key named in upper case is still cast to its column's type.
+
+        The singer-sdk lowercases key_properties ("UID" -> "uid") while the
+        column keeps the property's case ("UID"); DuckDB matches both.
+        """
+        rows = self._load_twice(
+            self._catalog(),
+            tmp_path,
+            {"type": "string", "format": "uuid"},
+            self.UUID,
+            ["UID"],
+            key_name="UID",
+        )
         assert rows == [("a", "second")]
 
     def test_existing_table_type_differs_from_stream(self, tmp_path: Path):
