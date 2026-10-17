@@ -1522,8 +1522,19 @@ class TestTimezoneOffsets:
                 datetime(2, 1, 1, 10, 0, tzinfo=ZoneInfo("Europe/Paris")),
                 "0002-01-01 10:00:00",
             ),
+            (
+                # Its UTC time is in year 0, so the DST normalisation overflows.
+                datetime(1, 1, 1, 0, 0, tzinfo=ZoneInfo("Europe/Paris")),
+                "0001-01-01 00:00:00",
+            ),
         ],
-        ids=["year-9999", "year-1", "seconds-offset", "lmt-named-zone"],
+        ids=[
+            "year-9999",
+            "year-1",
+            "seconds-offset",
+            "lmt-named-zone",
+            "named-zone-overflow",
+        ],
     )
     def test_edge_values_in_fixed_offset_column(self, value: datetime, wall_clock: str):
         """Edge years and offsets with seconds stage, and DuckDB reads them exactly."""
