@@ -1142,6 +1142,39 @@ class TestMergeKeyTableTypes:
         )
         assert rows == [("a", "second")]
 
+    def test_append_reads_table_metadata_once(self, tmp_path: Path):
+        """Only merges need the key types; append streams don't pay for them."""
+        con = self._catalog()
+        queries: list[str] = []
+
+        def execute(sql: str) -> duckdb.DuckDBPyConnection:
+            queries.append(sql)
+            return con.execute(sql)
+
+        config = {
+            "catalog_url": "test.db",
+            "data_path": str(tmp_path / "data"),
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging"),
+            "load_method": "append",
+        }
+        target = Mock()
+        target.config = config
+        connector = DuckLakeConnector(config)
+        schema = {"type": "object", "properties": {"k": {"type": "string"}}}
+        with patch.object(connector, "execute", side_effect=execute):
+            sink = ducklakeSink(
+                target=target,
+                stream_name="t",
+                schema=schema,
+                key_properties=["k"],
+                connector=connector,
+            )
+            sink.setup()
+            sink.process_batch({"records": [{"k": "a"}]})
+        assert sum("PRAGMA TABLE_INFO" in sql for sql in queries) == 1
+
     def test_existing_table_type_differs_from_stream(self, tmp_path: Path):
         """A TIMESTAMP table keyed by a stream now hinting timestamptz still merges.
 
