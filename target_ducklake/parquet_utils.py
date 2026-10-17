@@ -167,23 +167,41 @@ def _has_fixed_offset(value: object) -> bool:
 
 
 def _datetime_text(value: datetime) -> str:
-    """Render a datetime as text in the form pyarrow gives a single value.
+    """Render a datetime as ISO text that DuckDB reads exactly.
 
     Naive: '2024-01-01 10:00:00.000000'; UTC: '...000000Z'; any other zone or
-    offset: its own local time and offset, '...000000+0200'. A local time that
-    doesn't exist (a DST gap) is normalised through UTC first, as pyarrow does.
+    offset: its own local time and offset, '...000000+02:00' (with seconds,
+    '+02:00:30', when the offset has them). A named zone's local time that
+    doesn't exist (a DST gap) is normalised through UTC first, as pyarrow does;
+    fixed offsets have no gaps, so they skip that round trip, which would
+    overflow at the edges of the year range.
     """
     if value.tzinfo is None:
         return _wall_clock_text(value)
     if value.tzinfo is timezone.utc:
         return _wall_clock_text(value) + "Z"
-    local = value.astimezone(timezone.utc).astimezone(value.tzinfo)
-    return _wall_clock_text(local) + local.strftime("%z")
+    local = value
+    if not isinstance(value.tzinfo, timezone):
+        try:
+            local = value.astimezone(timezone.utc).astimezone(value.tzinfo)
+        except OverflowError:
+            local = value
+    return _wall_clock_text(local) + _offset_text(local.utcoffset())
 
 
 def _wall_clock_text(value: datetime) -> str:
     """'YYYY-MM-DD HH:MM:SS.ffffff' with a zero-padded year (strftime's %Y isn't)."""
     return value.replace(tzinfo=None).isoformat(sep=" ", timespec="microseconds")
+
+
+def _offset_text(offset: timedelta | None) -> str:
+    """'+HH:MM', or '+HH:MM:SS' when the offset has seconds (DuckDB reads both)."""
+    seconds = int((offset or timedelta(0)).total_seconds())
+    sign = "-" if seconds < 0 else "+"
+    hours, rest = divmod(abs(seconds), 3600)
+    minutes, secs = divmod(rest, 60)
+    text = f"{sign}{hours:02d}:{minutes:02d}"
+    return f"{text}:{secs:02d}" if secs else text
 
 
 def _coerce_column(values: list, field: pa.Field) -> list:

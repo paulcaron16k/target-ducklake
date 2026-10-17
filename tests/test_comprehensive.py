@@ -1498,6 +1498,52 @@ class TestTimezoneOffsets:
             "naive": ("2024-01-01 10:00:00", "2024-01-01 10:00:00+00"),
         }
 
+    @pytest.mark.parametrize(
+        ("value", "wall_clock"),
+        [
+            (
+                datetime(
+                    9999, 12, 31, 23, 59, 59, tzinfo=timezone(timedelta(hours=-7))
+                ),
+                "9999-12-31 23:59:59",
+            ),
+            (
+                datetime(1, 1, 1, 0, 0, tzinfo=timezone(timedelta(hours=2))),
+                "0001-01-01 00:00:00",
+            ),
+            (
+                datetime(
+                    2024, 1, 1, 10, 0, tzinfo=timezone(timedelta(hours=2, seconds=30))
+                ),
+                "2024-01-01 10:00:00",
+            ),
+            (
+                # Local mean time: Paris was +00:09:21 in year 2.
+                datetime(2, 1, 1, 10, 0, tzinfo=ZoneInfo("Europe/Paris")),
+                "0002-01-01 10:00:00",
+            ),
+        ],
+        ids=["year-9999", "year-1", "seconds-offset", "lmt-named-zone"],
+    )
+    def test_edge_values_in_fixed_offset_column(self, value: datetime, wall_clock: str):
+        """Edge years and offsets with seconds stage, and DuckDB reads them exactly."""
+        fixed = datetime(2024, 1, 1, 10, 0, tzinfo=timezone(timedelta(hours=2)))
+        schema = pa.schema([pa.field("ts", pa.string())])
+        staged = create_pyarrow_table([{"ts": fixed}, {"ts": value}], schema)
+        text = staged.column("ts")[1].as_py()
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'UTC'")
+        row = con.execute(
+            "SELECT CAST($1 AS TIMESTAMP)::VARCHAR, epoch(CAST($1 AS TIMESTAMPTZ))",
+            [text],
+        ).fetchone()
+        # Computed via the offset: converting to UTC would overflow datetime.
+        offset = value.utcoffset()
+        assert offset is not None
+        local = value.replace(tzinfo=None) - datetime(1970, 1, 1)  # noqa: DTZ001
+        epoch = (local - offset).total_seconds()
+        assert row == (wall_clock, epoch)
+
     def test_utc_text_unchanged_for_existing_varchar_key(self, tmp_path: Path):
         """A VARCHAR key written by earlier versions still matches a UTC value.
 
