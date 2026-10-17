@@ -12,8 +12,9 @@ Each entry mirrors its issue on the [Target DuckLake (Definite fork)](https://gi
 | [DUCKLKD-19](https://github.com/paulcaron16k/target-ducklake-definite/issues/19) | Merges keyed on a timestamp never match, so every run duplicates rows | `bug/DUCKLKD-19_timestamp-merge-keys` (deleted after merge) | `xflow_dev` | DUCKLKD-18 | Done (squash `4466be0` in `xflow_dev`); no upstream PR |
 | [DUCKLKD-21](https://github.com/paulcaron16k/target-ducklake-definite/issues/21) | Honour x-sql-datatype hints in type mapping | `story/DUCKLKD-21_x-sql-datatype-hints` (deleted after merge) | `xflow_dev` | DUCKLKD-16, DUCKLKD-19 | Done (squash `683bd73` in `xflow_dev`); no upstream PR |
 | [DUCKLKD-48](https://github.com/paulcaron16k/target-ducklake-definite/issues/48) | Merge keys are compared using the stream's declared type, not the table's column type | `bug/DUCKLKD-48_merge-key-table-types` (deleted after merge) | `xflow_dev` | DUCKLKD-18, DUCKLKD-19, DUCKLKD-21 | Done (squash `09a6e91` in `xflow_dev`); no upstream PR |
+| [DUCKLKD-49](https://github.com/paulcaron16k/target-ducklake-definite/issues/49) | NULL key values never match, so re-merging duplicates those rows | `bug/DUCKLKD-49_null-merge-keys` (deleted after merge) | `xflow_dev` | DUCKLKD-48 | Done (squash `8f83caf` in `xflow_dev`); no upstream PR |
 
-**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`). DUCKLKD-21 (`683bd73`) extends `number_precision_and_scale` from DUCKLKD-16 and the temporal key set from DUCKLKD-19, so upstream it must follow both. DUCKLKD-48 (`09a6e91`) replaces DUCKLKD-19's temporal-only cast with a cast of every key to the table's actual type, so upstream it follows DUCKLKD-18, 19 and 21; offering DUCKLKD-19 without DUCKLKD-48 would reintroduce the UUID and REAL key failures.
+**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`). DUCKLKD-21 (`683bd73`) extends `number_precision_and_scale` from DUCKLKD-16 and the temporal key set from DUCKLKD-19, so upstream it must follow both. DUCKLKD-48 (`09a6e91`) replaces DUCKLKD-19's temporal-only cast with a cast of every key to the table's actual type, so upstream it follows DUCKLKD-18, 19 and 21; offering DUCKLKD-19 without DUCKLKD-48 would reintroduce the UUID and REAL key failures. DUCKLKD-49 (`8f83caf`) rewrites the same DELETE as a NULL-safe `USING` join and renames DUCKLKD-48's helper, so upstream it follows DUCKLKD-48.
 
 **Verification baseline.** Upstream `main` already has 556 ruff findings, 4 files the formatter would change, and 2 mypy errors in `sinks.py`. "No new findings" below means none added by the fix, compared against that baseline. Tests run with `uv run --python 3.12 pytest tests/` (the default Python 3.14 has no wheel for the pinned pyarrow 20; tracked as [DUCKLKD-32](https://github.com/paulcaron16k/target-ducklake-definite/issues/32)).
 
@@ -81,7 +82,7 @@ Found reviewing the merge SQL on 2026-10-16. `merge_into_table` deleted matching
 
 ## Evidence
 
-Commit `48b523d` on `general/DUCKLKD-18_composite-key-merge`, merged into `xflow_dev` in `f931924`, where the test-import conflict with DUCKLKD-17 was resolved by keeping both sets of imports. The new `DuckLakeConnector._build_key_columns_sql()` builds the key column list.
+Commit `48b523d` on `general/DUCKLKD-18_composite-key-merge`, merged into `xflow_dev` in `f931924`, where the test-import conflict with DUCKLKD-17 was resolved by keeping both sets of imports. The new `DuckLakeConnector._build_key_columns_sql()` builds the key column list (since replaced by `_build_key_match_sql()` in DUCKLKD-49, which keeps the per-column comparison as a NULL-safe join).
 
 Verified on a local DuckLake (DuckDB 1.5.2, DuckDB-file catalog, local data path), partitioned and unpartitioned. The old SQL deleted the unrelated row. Row-value `IN`, `EXISTS` and `DELETE … USING` all kept it; row-value `IN` was chosen as the smallest change. The new `TestMergeKeyMatching` class has 5 tests, including the collision scenario run through the real merge SQL in DuckDB. All 5 fail on the old code. Branch suite: 70 passed. Upstream PR: not opened.
 
@@ -114,7 +115,7 @@ Squash-merged into `xflow_dev` as `4466be0` through fork PR #45 (branch `bug/DUC
 
 Old behaviour reproduced: DATETIME keys duplicated on every re-merge (naive whole-second, fractional and UTC-aware values); DATE and TIME keys failed with `Binder Error: Cannot compare values of type DATE and VARCHAR in IN/ANY/ALL clause`. New SQL checked on a local DuckLake (DuckDB 1.5.2): three re-merges with a composite temporal + id key leave one row per key with the latest values, unpartitioned and partitioned by `year(k)`, `month(k)` and `k`. New `TestTemporalMergeKeys` (5 re-merge cases plus a sink test); `xflow_dev` suite: 89 passed. No new ruff or mypy findings.
 
-Cleanup for duplicates already in existing tables, verified on a DuckLake copy partitioned by `year(k)`; keeps the latest row per key by `rowid` (insertion order). Run it on a copy first:
+Cleanup for duplicates already in existing tables, verified on a DuckLake copy partitioned by `year(k)`; keeps the latest row per key by `rowid` (insertion order). `GROUP BY` puts NULL key values in one group, which matches the rule adopted in [DUCKLKD-49](https://github.com/paulcaron16k/target-ducklake-definite/issues/49): NULL key values match NULL. Run it on a copy first:
 
 ```sql
 BEGIN;
@@ -186,5 +187,32 @@ Squash-merged into `xflow_dev` as `09a6e91` through fork PR #52 (branch `bug/DUC
 `TestMergeKeyTableTypes` has 31 cases through the real sink lifecycle (`setup()` plus two `process_batch()` calls on an in-memory catalog, session TimeZone `America/New_York`): 13 key types single and composite, an upper-case key, an existing TIMESTAMP table with a `timestamptz` hint, and the append query count. 8 regression cases fail on the pre-PR code: REAL x2 and the existing table by duplicate-row assertion; `uuid` format x2, `uuid` hint x2 and the upper-case key by the binder error. `xflow_dev` suite: 162 passed; no new ruff, format or mypy findings. On a local DuckLake (non-UTC session, composite keys), REAL, UUID, an upper-case UUID key, TIMESTAMPTZ partitioned by `year(k)`, DATE by `month(k)` and DECIMAL with identity partitioning each left one row per key after three merges.
 
 Independent Sonnet review: no blocking findings; two should-fix findings reproduced and fixed in their own commits (`3f9e8f5` case-insensitive key matching, `f6171d7` key types read only when merging); three nits (mock test removed, matrix run under a non-UTC zone with a BOOLEAN key, docs/format note needing no PR change). Follow-up review of those commits: no blocking or should-fix findings; one nit declined with reasoning on the PR. Found and filed: [DUCKLKD-53](https://github.com/paulcaron16k/target-ducklake-definite/issues/53), `prepare_table` matching column names case-sensitively.
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-49 NULL key values never match, so re-merging duplicates those rows
+
+## Intent
+
+Found by the independent Sonnet review of PR #45 (DUCKLKD-19) on 2026-10-17 and reproduced on `xflow_dev`; pre-existing. The merge DELETE used `(k...) IN (SELECT k... FROM staged)`, and NULL never compares equal, so a row whose key had a NULL value was never deleted and every re-merge appended another copy. The DUCKLKD-19 cleanup SQL's handling of NULL keys also needed a stated rule.
+
+## Acceptance
+
+- Decide and record whether NULL key values match each other or are rejected.
+- With the chosen rule, re-merging a batch with NULL key values never duplicates rows.
+- The DUCKLKD-19 cleanup SQL is corrected for NULL keys (here and in the PR #45 description).
+- A regression test reproduces the duplicate on the old code.
+
+## Evidence
+
+**Decision: NULL key values match NULL** (`IS NOT DISTINCT FROM`). The in-batch dedup (Polars `unique`) already treats NULL keys as equal, so the merge now agrees with it; rejecting NULL keys would fail loads that work today. `(NULL, a)`, `(NULL, b)` and `(x, a)` remain three different composite keys. Behaviour change for existing tables: duplicate NULL-key rows left by the old merge are all replaced by the next batch carrying that key. The DUCKLKD-19 cleanup SQL already follows this rule (`GROUP BY` treats NULLs as one group); noted in its entry above and on PR #45.
+
+Squash-merged into `xflow_dev` as `8f83caf` through fork PR #54 (branch `bug/DUCKLKD-49_null-merge-keys`, deleted after merge). The DELETE is now `DELETE FROM t AS "target" USING (SELECT CAST("k" AS <table type>) AS "k", ... FROM 'file') AS "staged" WHERE "target"."k" IS NOT DISTINCT FROM "staged"."k" AND ...`, built by `_build_key_match_sql()`. Performance on a 2M-row DuckLake table with a 50k-row batch: no regression (median 0.22 s vs 0.29 s for the old `IN`; the reviewer measured them equal within noise). An `EXISTS` form was rejected at about 2x slower.
+
+Four new tests through the real sink lifecycle (NULL single and composite keys, NULL keys distinct from other keys, existing NULL-key duplicates collapsing) all fail on the old merge SQL by duplicate-row assertion. `xflow_dev` suite: 166 passed; no new ruff, format or mypy findings. On a local DuckLake (non-UTC session, composite keys): NULL VARCHAR with identity partitioning, NULL UUID, REAL, an upper-case UUID key, TIMESTAMPTZ by `year(k)` and DATE by `month(k)` each left one row per key after three merges; the reviewer additionally broke nothing with keys named `target`/`staged`, NULLs in partition columns, 2M-row tables and failed casts.
+
+Independent Sonnet review: no blocking findings; finding 1 (auto-close) not reproduced, its process point kept (issue closed only after this docs commit); finding 2 deferred to [DUCKLKD-31](https://github.com/paulcaron16k/target-ducklake-definite/issues/31); finding 3 accepted (`50944fe`, collapse pinned by a test); finding 4 declined; finding 5 accepted (performance claim corrected to no regression). Follow-up review: no blocking or should-fix findings; two description nits fixed.
 
 Upstream PR: not opened.
