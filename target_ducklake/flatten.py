@@ -4,6 +4,7 @@ https://github.com/meltano/sdk/blob/35b499d6163f91752fd674f2a3e46a7e22a1fb47/sin
 """
 
 import collections
+import copy
 import itertools
 import json
 from datetime import date, datetime
@@ -107,7 +108,7 @@ def flatten_record(
 
 # A property with no usable type can hold any value, so it is stored as JSON
 # text, which keeps every value intact.
-UNTYPED_COLUMN = {"type": ["null", "object"]}
+UNTYPED_COLUMN: dict[str, list[str]] = {"type": ["null", "object"]}
 
 
 def _anyof_column(prop: dict) -> dict:
@@ -126,7 +127,7 @@ def _anyof_column(prop: dict) -> dict:
         None,
     )
     if branch is None:
-        return dict(UNTYPED_COLUMN)
+        return UNTYPED_COLUMN
     types = branch["type"]
     types = [types] if isinstance(types, str) else types
     return _with_wrapper_hint(prop, {**branch, "type": list(set(["null", *types]))})
@@ -142,10 +143,10 @@ def _first_choice_column(prop: dict) -> dict | None:
     """
     first = next(iter(prop.values()))
     if not (isinstance(first, list) and first and isinstance(first[0], dict)):
-        return dict(UNTYPED_COLUMN)
+        return UNTYPED_COLUMN
     branch = first[0]
     if "type" not in branch:
-        return dict(UNTYPED_COLUMN)
+        return UNTYPED_COLUMN
     if branch["type"] in ("string", "array", "object"):
         return {**branch, "type": ["null", branch["type"]]}
     return None
@@ -218,7 +219,9 @@ def flatten_schema(
         if len(list(g)) > 1:
             raise ValueError(f"Duplicate column name produced in schema: {k}")
 
-    return dict(sorted_items)
+    # A deep copy, so editing a column never reaches the caller's schema or
+    # UNTYPED_COLUMN.
+    return copy.deepcopy(dict(sorted_items))
 
 
 def nullable_choices(schema: dict) -> dict:

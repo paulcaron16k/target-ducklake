@@ -523,6 +523,24 @@ class TestUntypedAndChoiceProperties:
         flatten_schema(schema, max_level=1)
         assert schema == original
 
+    def test_flattened_columns_share_nothing_with_the_input(self):
+        """Editing a flattened column changes neither the input nor other columns."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "a": {"type": "string", "enum": ["x", "y"]},
+                "b": {"anyOf": [{"type": "array", "items": {"type": "string"}}]},
+                "u1": {"$ref": "#/d"},
+                "u2": {"$ref": "#/d"},
+            },
+        }
+        original = copy.deepcopy(schema)
+        flat = flatten_schema(schema)
+        flat["a"]["enum"].append("z")
+        flat["u1"]["type"].append("string")
+        assert schema == original
+        assert sorted(flatten_schema(schema)["u2"]["type"]) == ["null", "object"]
+
     def test_output_unchanged_for_schemas_that_loaded_before(self):
         """Every kind of property that flattened before still flattens the same."""
         schema = {
