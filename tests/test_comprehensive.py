@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import Mock, patch
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pyarrow as pa
@@ -1390,6 +1391,62 @@ class TestTimezoneOffsets:
             expected_wall_clock.strftime("%Y-%m-%d %H:%M:%S"),
             value.timestamp(),
         )
+
+    @pytest.mark.parametrize("convert", ["keep-offset", "convert-to-utc"])
+    @pytest.mark.parametrize(
+        ("value", "wall_clock", "utc_wall_clock", "instant"),
+        [
+            # Naive: loaded as given; TIMESTAMPTZ reads it in the session zone.
+            (
+                datetime(2024, 1, 1, 10, 0),  # noqa: DTZ001
+                "2024-01-01 10:00:00",
+                "2024-01-01 10:00:00",
+                "2024-01-01 15:00:00+00",
+            ),
+            (
+                datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc),
+                "2024-01-01 10:00:00",
+                "2024-01-01 10:00:00",
+                "2024-01-01 10:00:00+00",
+            ),
+            (
+                datetime(2024, 1, 1, 10, 0, tzinfo=ZoneInfo("Europe/Paris")),
+                "2024-01-01 10:00:00",
+                "2024-01-01 09:00:00",
+                "2024-01-01 09:00:00+00",
+            ),
+        ],
+        ids=["naive", "utc", "europe-paris"],
+    )
+    def test_values_that_loaded_before_are_unchanged(
+        self,
+        tmp_path: Path,
+        value: datetime,
+        wall_clock: str,
+        utc_wall_clock: str,
+        instant: str,
+        convert: str,
+    ):
+        """Naive, UTC and named-zone values load as they did before the fix.
+
+        Runs under a non-UTC session time zone, which DuckDB uses to read
+        naive text into TIMESTAMPTZ.
+        """
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'America/New_York'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        self._load_into(
+            con,
+            tmp_path,
+            [{"id": "a", "at": value, "at_tz": value}],
+            convert_tz_to_utc=convert == "convert-to-utc",
+        )
+        con.execute("SET TimeZone = 'UTC'")
+        row = con.execute(
+            'SELECT "at"::VARCHAR, at_tz::VARCHAR FROM ducklake_catalog.s.t'
+        ).fetchone()
+        expected = utc_wall_clock if convert == "convert-to-utc" else wall_clock
+        assert row == (expected, instant)
 
     def test_utc_text_unchanged_for_existing_varchar_key(self, tmp_path: Path):
         """A VARCHAR key written by earlier versions still matches a UTC value.
