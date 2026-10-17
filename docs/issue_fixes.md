@@ -10,8 +10,9 @@ Each entry mirrors its issue on the [Target DuckLake (Definite fork)](https://gi
 | [DUCKLKD-17](https://github.com/paulcaron16k/target-ducklake-definite/issues/17) | In-batch dedup can keep an older version of a row | `general/DUCKLKD-17_dedup-keep-last` | `origin/main` `e9dc3f3` | — | Done (in `xflow_dev`); no upstream PR |
 | [DUCKLKD-18](https://github.com/paulcaron16k/target-ducklake-definite/issues/18) | Composite merge keys collide and delete unrelated rows | `general/DUCKLKD-18_composite-key-merge` | `origin/main` `e9dc3f3` | — | Done (in `xflow_dev`); no upstream PR |
 | [DUCKLKD-19](https://github.com/paulcaron16k/target-ducklake-definite/issues/19) | Merges keyed on a timestamp never match, so every run duplicates rows | `bug/DUCKLKD-19_timestamp-merge-keys` (deleted after merge) | `xflow_dev` | DUCKLKD-18 | Done (squash `4466be0` in `xflow_dev`); no upstream PR |
+| [DUCKLKD-21](https://github.com/paulcaron16k/target-ducklake-definite/issues/21) | Honour x-sql-datatype hints in type mapping | `story/DUCKLKD-21_x-sql-datatype-hints` (deleted after merge) | `xflow_dev` | DUCKLKD-16, DUCKLKD-19 | Done (squash `683bd73` in `xflow_dev`); no upstream PR |
 
-**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`).
+**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`). DUCKLKD-21 (`683bd73`) extends `number_precision_and_scale` from DUCKLKD-16 and the temporal key set from DUCKLKD-19, so upstream it must follow both.
 
 **Verification baseline.** Upstream `main` already has 556 ruff findings, 4 files the formatter would change, and 2 mypy errors in `sinks.py`. "No new findings" below means none added by the fix, compared against that baseline. Tests run with `uv run --python 3.12 pytest tests/` (the default Python 3.14 has no wheel for the pinned pyarrow 20; tracked as [DUCKLKD-32](https://github.com/paulcaron16k/target-ducklake-definite/issues/32)).
 
@@ -118,5 +119,41 @@ DELETE FROM lake.schema.tbl
 WHERE rowid NOT IN (SELECT max(rowid) FROM lake.schema.tbl GROUP BY <key columns>);
 COMMIT;
 ```
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-21 Honour x-sql-datatype hints in type mapping
+
+## Intent
+
+Database taps declare each source column's own type in `x-sql-datatype` (smallint vs bigint, real vs double, numeric(p,s), timestamp vs timestamptz, uuid, jsonb). The target ignored them, so lake types drifted from the source: `smallint` became BIGINT, `numeric(12,4)` became DECIMAL(38,9), `timestamptz` became a naive TIMESTAMP. target-iceberg's mapping.py honours them.
+
+## Acceptance
+
+- Supported hints map to the matching DuckDB type; unknown hints fall back to today's mapping.
+- Tests cover each supported hint.
+
+## Evidence
+
+Squash-merged into `xflow_dev` as `683bd73` through fork PR #46 (branch `story/DUCKLKD-21_x-sql-datatype-hints`, deleted after merge). A new `type_hints.py` holds the vocabulary and is used by both the DDL (`JSONSchemaToDuckLake.to_sql_type`) and the parquet staging, so they can't disagree:
+
+| Hint (case and spacing ignored) | DuckDB type |
+| --- | --- |
+| `smallint`, `int2` / `integer`, `int`, `int4` / `bigint`, `int8` | SMALLINT / INTEGER / BIGINT |
+| `real`, `float4`, `float(p<=24)` | REAL |
+| `float`, `float8`, `double`, `double precision`, `float(p>24)` | DOUBLE |
+| `decimal(p,s)`, `numeric(p,s)` | DECIMAL(p,s), capped at 38 |
+| `timestamp`, `timestamp without time zone`, `timestamp_ntz` | TIMESTAMP |
+| `timestamptz`, `timestamp with time zone`, `timestamp_tz`, `timestamp_ltz` | TIMESTAMPTZ |
+| `date` / `time`, `time without time zone` | DATE / TIME |
+| `uuid`, `uniqueidentifier` / `json`, `jsonb` | UUID / JSON |
+
+Decimal hints stage at the hinted precision; float hints stage as float64 (decimal staging would round `1.5e-12` to 0). Hinted types render through `DuckDBType`, because SQLAlchemy renders `TIMESTAMP(timezone=True)` as plain `TIMESTAMP`. A `timestamptz` key gets DUCKLKD-19's merge cast.
+
+Deliberately unsupported: `timetz` (on a local DuckLake, `10:00+02` was stored as `10:00+00`: the Parquet write drops the offset without converting), `datetime` (MySQL's meaning is the opposite of ISO's), `tinyint` (MySQL booleans) and binary hints (base64 needs a decode on insert). An unqualified `float` maps to DOUBLE, unlike target-iceberg. Existing tables keep their column types except through the existing safe widenings.
+
+`TestSqlDatatypeHints` has 43 cases; 36 fail on the old code (the 7 fallback and no-hint cases pass by design). `xflow_dev` suite: 132 passed. No new ruff or mypy findings; `type_hints.py` fully clean. Verified on a local DuckLake (DuckDB 1.5.2): every hinted type created, partitioned by `year("at")`, and a composite (`id`, `timestamptz`) re-merge left one row with exact values. Found, not fixed: non-UTC offsets fail staging unless `convert_tz_to_utc` is set, filed as [DUCKLKD-47](https://github.com/paulcaron16k/target-ducklake-definite/issues/47).
 
 Upstream PR: not opened.
