@@ -9,9 +9,9 @@ Each entry mirrors its issue on the [Target DuckLake (Definite fork)](https://gi
 | [DUCKLKD-16](https://github.com/paulcaron16k/target-ducklake-definite/issues/16) | Numbers lose precision on the way into DECIMAL columns | `general/DUCKLKD-16_decimal-precision` | `origin/main` `e9dc3f3` | — | Done (in `xflow_dev`); no upstream PR |
 | [DUCKLKD-17](https://github.com/paulcaron16k/target-ducklake-definite/issues/17) | In-batch dedup can keep an older version of a row | `general/DUCKLKD-17_dedup-keep-last` | `origin/main` `e9dc3f3` | — | Done (in `xflow_dev`); no upstream PR |
 | [DUCKLKD-18](https://github.com/paulcaron16k/target-ducklake-definite/issues/18) | Composite merge keys collide and delete unrelated rows | `general/DUCKLKD-18_composite-key-merge` | `origin/main` `e9dc3f3` | — | Done (in `xflow_dev`); no upstream PR |
-| [DUCKLKD-19](https://github.com/paulcaron16k/target-ducklake-definite/issues/19) | Merges keyed on a timestamp never match, so every run duplicates rows | `bug/DUCKLKD-19_timestamp-merge-keys` | `xflow_dev` | DUCKLKD-18 (already in `xflow_dev`) | In Progress |
+| [DUCKLKD-19](https://github.com/paulcaron16k/target-ducklake-definite/issues/19) | Merges keyed on a timestamp never match, so every run duplicates rows | `bug/DUCKLKD-19_timestamp-merge-keys` (deleted after merge) | `xflow_dev` | DUCKLKD-18 | Done (squash `4466be0` in `xflow_dev`); no upstream PR |
 
-**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branches from `xflow_dev`, which already contains DUCKLKD-18; offered upstream, it must follow DUCKLKD-18.
+**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`).
 
 **Verification baseline.** Upstream `main` already has 556 ruff findings, 4 files the formatter would change, and 2 mypy errors in `sinks.py`. "No new findings" below means none added by the fix, compared against that baseline. Tests run with `uv run --python 3.12 pytest tests/` (the default Python 3.14 has no wheel for the pinned pyarrow 20; tracked as [DUCKLKD-32](https://github.com/paulcaron16k/target-ducklake-definite/issues/32)).
 
@@ -100,9 +100,23 @@ On a local DuckLake, the current comparison matched **zero** rows, for both whol
 - Datetime keys are compared as TIMESTAMP: the staged column is cast to the table column's type, not both sides to VARCHAR.
 - Re-merging a batch with whole-second, fractional, naive and UTC-aware timestamp keys leaves exactly one row per key.
 - Composite keys mixing datetime and other columns work (row-value comparison from DUCKLKD-18).
+- Added during the fix: DATE and TIME keys merge too. They had no cast at all and failed the merge with a binder error (same root cause).
 - A regression test reproduces the duplicate on the old code.
 - A note on cleaning up duplicates already present in existing tables, since this fix stops new ones but doesn't remove old ones.
 
 ## Evidence
 
-Reproduced on a local DuckLake (DuckDB 1.5.2) while testing DUCKLKD-18: the `::VARCHAR` comparison matched 0 rows for naive and UTC-aware, whole-second and fractional timestamps; native `IN` raises a binder error (TIMESTAMP vs VARCHAR); `IN (SELECT CAST(ts AS TIMESTAMP) ...)` matched both rows. Fix branches from `xflow_dev`, which already contains DUCKLKD-18.
+Squash-merged into `xflow_dev` as `4466be0` through fork PR #45 (branch `bug/DUCKLKD-19_timestamp-merge-keys`, deleted after merge). For each DATETIME, DATE or TIME key, the staged side is cast to the column's type, which is the cast `INSERT` applies; the table side is compared natively. `merge_into_table` takes `temporal_key_types` (column → type) instead of `date_type_keys`, built by the sink from the DuckLake schema.
+
+Old behaviour reproduced: DATETIME keys duplicated on every re-merge (naive whole-second, fractional and UTC-aware values); DATE and TIME keys failed with `Binder Error: Cannot compare values of type DATE and VARCHAR in IN/ANY/ALL clause`. New SQL checked on a local DuckLake (DuckDB 1.5.2): three re-merges with a composite temporal + id key leave one row per key with the latest values, unpartitioned and partitioned by `year(k)`, `month(k)` and `k`. New `TestTemporalMergeKeys` (5 re-merge cases plus a sink test); `xflow_dev` suite: 89 passed. No new ruff or mypy findings.
+
+Cleanup for duplicates already in existing tables, verified on a DuckLake copy partitioned by `year(k)`; keeps the latest row per key by `rowid` (insertion order). Run it on a copy first:
+
+```sql
+BEGIN;
+DELETE FROM lake.schema.tbl
+WHERE rowid NOT IN (SELECT max(rowid) FROM lake.schema.tbl GROUP BY <key columns>);
+COMMIT;
+```
+
+Upstream PR: not opened.

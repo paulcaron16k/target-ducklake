@@ -68,7 +68,7 @@ git push
 gh pr create --repo definite-app/target-ducklake --base main --head paulcaron16k:general/DUCKLKD-<n>_<slug>
 ```
 
-Always pass `--repo`: the local `gh` default is the fork. A story that depends on an earlier one (listed in `docs/issue_fixes.md`) is offered after it, or cherry-picked together with it.
+Always pass `--repo`: the local `gh` default is the fork. Reword the cherry-picked commit (`git cherry-pick --edit`) to drop the DUCKLKD key, the fork PR number and the `Fixes` line, since they mean nothing upstream. A story that depends on an earlier one (listed in `docs/issue_fixes.md`) is offered after it, or cherry-picked together with it.
 
 | Offer upstream | Keep in the fork |
 | --- | --- |
@@ -120,7 +120,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-16](https://github.com/paulcaron16k/target-ducklake-definite/issues/16) Preserve decimal precision | `general/DUCKLKD-16_decimal-precision` (`c9ba9ca`) | — | In fork, PR not opened |
 | [DUCKLKD-17](https://github.com/paulcaron16k/target-ducklake-definite/issues/17) Keep last record per key | `general/DUCKLKD-17_dedup-keep-last` (`a75308d`) | — | In fork, PR not opened |
 | [DUCKLKD-18](https://github.com/paulcaron16k/target-ducklake-definite/issues/18) Match composite keys per column | `general/DUCKLKD-18_composite-key-merge` (`48b523d`) | — | In fork, PR not opened |
-| [DUCKLKD-19](https://github.com/paulcaron16k/target-ducklake-definite/issues/19) Timestamp merge keys never match | `bug/DUCKLKD-19_timestamp-merge-keys` | — | Proposed |
+| [DUCKLKD-19](https://github.com/paulcaron16k/target-ducklake-definite/issues/19) Temporal merge keys never match | squash `4466be0` (fork PR #45) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
