@@ -49,12 +49,39 @@ Every story starts from the current `xflow_dev`, so it's built and tested agains
 2. Branch from the latest integration state: `git fetch fork && git checkout -b story/DUCKLKD-<n>_<slug> fork/xflow_dev`. Use `bug/` instead of `story/` for a bug.
 3. Make the change with unit tests. Keep the commit free of fork-only files (`docs/`, `.github/`), so it can be cherry-picked upstream cleanly.
 4. Verify: `uv run --python 3.12 pytest tests/ -v`, ruff and mypy compared against upstream's baseline, `pre-commit run`.
-5. `git push`, then open the pull request: `gh pr create --base xflow_dev --title "DUCKLKD-<n> <title>" --body "Fixes #<n> ..."`. The fork is the `gh` default, so `#<n>` is our issue.
-6. Review, then **squash merge**. The squash commit takes the PR title and body; the branch is deleted automatically.
-7. Close the issue with `gh agile move <n> --status Done --evidence "..." --close`, citing the squash commit.
-8. Record the merge order and any dependency in `docs/issue_fixes.md`, as a separate docs commit on `xflow_dev`.
+5. `git push`, then open the pull request: `gh pr create --base xflow_dev --title "DUCKLKD-<n> <title>" --body "Fixes #<n> ..."`. The fork is the `gh` default, so `#<n>` is our issue. Move the issue to In Review.
+6. **Independent review by Sonnet** (next section). The reviewer posts its findings on the PR.
+7. Address every finding under the rules for review-driven changes, and reply to each on the PR. If code changed, Sonnet re-reviews the new commits; repeat until nothing blocking remains.
+8. You approve, then **squash merge**. The squash commit takes the PR title and body; the branch is deleted automatically.
+9. Close the issue with `gh agile move <n> --status Done --evidence "..." --close`, citing the squash commit and the review outcome.
+10. Record the merge order and any dependency in `docs/issue_fixes.md`, as a separate docs commit on `xflow_dev`.
 
 Bug or story: an existing function that is clearly not correct is a bug (`type:bug`); a function that could be better or does not exist is a story.
+
+## Independent review by Sonnet
+
+Every PR into `xflow_dev` is reviewed by Claude Sonnet 5.5 (`claude-sonnet-5-5`) before you approve it. The code is written by a different model, so the reviewer doesn't share the author's reasoning or blind spots. It runs as a separate agent and sees only what a human reviewer would: the PR diff and description, the issue's Intent and Acceptance, the repo at `xflow_dev`, and `CLAUDE.md`.
+
+What it checks:
+
+- **Correctness:** bugs, edge cases and failure paths in the changed code.
+- **Acceptance:** every Acceptance item is met and covered by a test.
+- **Tests:** the new tests would fail without the change, and assert the behaviour rather than the implementation.
+- **Regressions:** other load methods, catalog types, storage types and existing tables still behave as before.
+- **Unintended consequences:** data already in tables, performance, secrets in logs or errors, behaviour of callers of changed functions.
+- **Hygiene:** no fork-only files in the commit, and no new ruff or mypy findings against the baseline.
+
+It posts one PR review comment (`gh pr review --comment`). Findings are numbered, each with a severity (**blocking**, **should fix** or **nit**), a `file:line`, a concrete failure scenario and the test that would catch it. If it finds nothing, it says so. The reviewer never pushes code, approves or merges.
+
+**Rules for changes made in response to a review:**
+
+1. **Reproduce first.** Write a test (or record a check) that fails because of the finding before changing code. If it can't be reproduced, reply with the evidence instead of changing anything.
+2. **Keep it minimal.** Change only what the finding needs, as its own commit on the PR branch: `review: <finding #> <summary>`.
+3. **Re-verify everything.** Full test suite, ruff and mypy against the baseline, `pre-commit`, and any real-DuckLake check the PR description relies on.
+4. **Look for unintended consequences.** Re-read the callers of every changed function, confirm each Acceptance item still holds, and confirm the PR's earlier evidence still holds (tests still fail on the old code).
+5. **Re-review.** Sonnet reviews the new commits before you approve; repeat until nothing blocking remains.
+6. **Keep the record current.** Update the PR description and the issue's Evidence if behaviour changed.
+7. **Declining a finding** needs a reply on the PR with reasoning and evidence; you make the final call.
 
 ## Offering a fix upstream
 
