@@ -894,6 +894,162 @@ class TestSqlDatatypeHints:
         assert schema.field("f").type == pa.float64()
         assert schema.field("n").type == pa.decimal128(38, 9)
 
+    def _column_types(self, prop: dict) -> tuple[str, pa.DataType]:
+        """The DDL type and staging type a stream property gets, as in the sink."""
+        flat = flatten_schema({"type": "object", "properties": {"c": prop}})
+        ddl = DuckLakeConnector(self.CONFIG).json_to_ducklake_schema(flat)[0]["type"]
+        return ddl, flatten_schema_to_pyarrow_schema(flat).field("c").type
+
+    @pytest.mark.parametrize(
+        ("prop", "expected"),
+        [
+            (
+                {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "x-sql-datatype": "uuid",
+                },
+                ("UUID", pa.string()),
+            ),
+            (
+                {
+                    "anyOf": [{"type": "null"}, {"type": "number"}],
+                    "x-sql-datatype": "numeric(12,4)",
+                },
+                ("DECIMAL(12, 4)", pa.decimal128(12, 4)),
+            ),
+            (
+                {
+                    "anyOf": [
+                        {"type": "null"},
+                        {"type": "number", "x-sql-datatype": "numeric(12,4)"},
+                    ]
+                },
+                ("DECIMAL(12, 4)", pa.decimal128(12, 4)),
+            ),
+            (
+                # The branch's own hint wins over the wrapper's.
+                {
+                    "anyOf": [
+                        {"type": "number", "x-sql-datatype": "real"},
+                        {"type": "null"},
+                    ],
+                    "x-sql-datatype": "numeric(12,4)",
+                },
+                ("REAL", pa.float64()),
+            ),
+            (
+                # An empty branch hint is no hint, so the wrapper's applies.
+                {
+                    "anyOf": [
+                        {"type": "string", "x-sql-datatype": None},
+                        {"type": "null"},
+                    ],
+                    "x-sql-datatype": "uuid",
+                },
+                ("UUID", pa.string()),
+            ),
+            (
+                # Only the hint is carried; a wrapper format changes nothing.
+                {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "format": "date-time",
+                },
+                ("VARCHAR", pa.string()),
+            ),
+        ],
+        ids=[
+            "outer-uuid",
+            "outer-decimal-null-first",
+            "inner-decimal",
+            "inner-wins",
+            "empty-inner-hint",
+            "outer-format-not-carried",
+        ],
+    )
+    def test_hint_on_anyof_property(self, prop: dict, expected: tuple):
+        """A hint on an anyOf property sets both the DDL and the staging type."""
+        assert self._column_types(prop) == expected
+
+    def test_anyof_wrapper_hint_does_not_change_callers_schema(self):
+        """The wrapper's hint goes into a copy, not into the caller's branch."""
+        prop = {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "x-sql-datatype": "uuid",
+        }
+        flat = flatten_schema({"type": "object", "properties": {"c": prop}})
+        assert flat["c"]["x-sql-datatype"] == "uuid"
+        assert "x-sql-datatype" not in prop["anyOf"][0]
+
+    def test_unsupported_hint_on_anyof_property_falls_back(self):
+        """An unsupported wrapper hint keeps the default mapping, with a warning."""
+        prop = {
+            "anyOf": [{"type": "number"}, {"type": "null"}],
+            "x-sql-datatype": "money",
+        }
+        with pytest.warns(UserWarning, match="does not support the x-sql-datatype"):
+            types = self._column_types(prop)
+        assert types == ("DECIMAL(38, 9)", pa.decimal128(38, 9))
+
+    @pytest.mark.parametrize(
+        ("hint", "expected"),
+        [
+            ("decimal(5,5)", ("DECIMAL(5, 5)", pa.decimal128(5, 5))),
+            ("decimal(5,0)", ("DECIMAL(5, 0)", pa.decimal128(5, 0))),
+            ("decimal(1,0)", ("DECIMAL(1, 0)", pa.decimal128(1, 0))),
+        ],
+        ids=["scale-equals-precision", "zero-scale", "precision-one"],
+    )
+    def test_decimal_hint_edges_are_valid(self, hint: str, expected: tuple):
+        """The boundaries of a valid decimal hint are honoured exactly."""
+        ddl, staging = self._column_types({"type": "number", "x-sql-datatype": hint})
+        assert (ddl, staging) == expected
+        duckdb.connect().execute(f"CREATE TABLE t (c {ddl})")
+
+    @pytest.mark.parametrize(
+        ("prop", "expected"),
+        [
+            (
+                {"type": "number", "x-sql-datatype": "decimal(0,0)"},
+                ("DECIMAL(38, 9)", pa.decimal128(38, 9)),
+            ),
+            (
+                {"type": "number", "x-sql-datatype": "decimal(5,10)"},
+                ("DECIMAL(38, 9)", pa.decimal128(38, 9)),
+            ),
+            (
+                {"type": "string", "x-sql-datatype": "numeric(0,0)"},
+                ("VARCHAR", pa.string()),
+            ),
+        ],
+        ids=["zero-precision", "scale-above-precision", "string-zero-precision"],
+    )
+    def test_invalid_decimal_hint_falls_back(self, prop: dict, expected: tuple):
+        """An impossible decimal hint keeps the default mapping, with a warning."""
+        with pytest.warns(UserWarning, match="does not support the x-sql-datatype"):
+            ddl, staging = self._column_types(prop)
+        assert (ddl, staging) == expected
+        duckdb.connect().execute(f"CREATE TABLE t (c {ddl})")
+
+    def test_sink_starts_with_zero_precision_decimal_hint(self):
+        """A decimal(0,0) hint no longer crashes building the sink's staging schema."""
+        target = Mock()
+        target.config = self.CONFIG
+        schema = {
+            "type": "object",
+            "properties": {
+                "amount": {"type": "number", "x-sql-datatype": "decimal(0,0)"}
+            },
+        }
+        with pytest.warns(UserWarning, match="does not support the x-sql-datatype"):
+            sink = ducklakeSink(
+                target=target,
+                stream_name="t",
+                schema=schema,
+                key_properties=[],
+                connector=DuckLakeConnector(self.CONFIG),
+            )
+        assert sink.pyarrow_schema.field("amount").type == pa.decimal128(38, 9)
+
     def test_hinted_types_load_end_to_end(self, tmp_path: Path):
         """Hinted columns are created by the real DDL and load SDK-parsed values."""
         props = {

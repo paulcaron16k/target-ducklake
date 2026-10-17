@@ -9,6 +9,8 @@ import json
 from datetime import date, datetime
 from decimal import Decimal
 
+from target_ducklake.type_hints import sql_datatype_hint
+
 TIMESTAMP_COLUMN_NAMES = {
     "timestamp",
     "created_at",
@@ -103,6 +105,19 @@ def flatten_record(
     return dict(items)
 
 
+def _with_wrapper_hint(prop: dict, branch: dict) -> dict:
+    """Carry an anyOf property's own x-sql-datatype hint into its chosen branch.
+
+    The hint describes the column whichever branch is chosen; a hint on the
+    branch itself wins, and an empty one counts as no hint. Only the hint is
+    carried over, so no other key on the wrapper (such as ``format``) changes
+    the column's type.
+    """
+    if sql_datatype_hint(prop) and not sql_datatype_hint(branch):
+        return {**branch, "x-sql-datatype": prop["x-sql-datatype"]}
+    return branch
+
+
 # pylint: disable=dangerous-default-value,invalid-name
 def flatten_schema(
     d, parent_key=[], sep="__", level=0, max_level=0, auto_cast_timestamps=False
@@ -157,7 +172,7 @@ def flatten_schema(
                 entry["type"] = list(set(["null", entry["type"]]))
             elif isinstance(entry["type"], list):
                 entry["type"] = list(set(["null"] + entry["type"]))  # type: ignore
-            items.append((new_key, entry))
+            items.append((new_key, _with_wrapper_hint(v, entry)))
         elif len(v.values()) > 0:
             if list(v.values())[0][0]["type"] == "string":
                 list(v.values())[0][0]["type"] = ["null", "string"]
