@@ -937,8 +937,25 @@ class TestSqlDatatypeHints:
                 },
                 ("REAL", pa.float64()),
             ),
+            (
+                # An empty branch hint is no hint, so the wrapper's applies.
+                {
+                    "anyOf": [
+                        {"type": "string", "x-sql-datatype": None},
+                        {"type": "null"},
+                    ],
+                    "x-sql-datatype": "uuid",
+                },
+                ("UUID", pa.string()),
+            ),
         ],
-        ids=["outer-uuid", "outer-decimal-null-first", "inner-decimal", "inner-wins"],
+        ids=[
+            "outer-uuid",
+            "outer-decimal-null-first",
+            "inner-decimal",
+            "inner-wins",
+            "empty-inner-hint",
+        ],
     )
     def test_hint_on_anyof_property(self, prop: dict, expected: tuple):
         """A hint on an anyOf property sets both the DDL and the staging type."""

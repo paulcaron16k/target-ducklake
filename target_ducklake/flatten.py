@@ -9,6 +9,8 @@ import json
 from datetime import date, datetime
 from decimal import Decimal
 
+from target_ducklake.type_hints import sql_datatype_hint
+
 TIMESTAMP_COLUMN_NAMES = {
     "timestamp",
     "created_at",
@@ -107,10 +109,11 @@ def _with_wrapper_hint(prop: dict, branch: dict) -> dict:
     """Carry an anyOf property's own x-sql-datatype hint into its chosen branch.
 
     The hint describes the column whichever branch is chosen; a hint on the
-    branch itself wins. Only the hint is carried over, so no other key on the
-    wrapper (such as ``format``) changes the column's type.
+    branch itself wins, and an empty one counts as no hint. Only the hint is
+    carried over, so no other key on the wrapper (such as ``format``) changes
+    the column's type.
     """
-    if "x-sql-datatype" in prop and "x-sql-datatype" not in branch:
+    if sql_datatype_hint(prop) and not sql_datatype_hint(branch):
         return {**branch, "x-sql-datatype": prop["x-sql-datatype"]}
     return branch
 
