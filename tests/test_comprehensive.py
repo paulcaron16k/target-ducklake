@@ -817,6 +817,222 @@ class TestTemporalMergeKeys:
         assert kwargs["temporal_key_types"] == {"ts": "DATETIME", "d": "DATE"}
 
 
+class TestSqlDatatypeHints:
+    """x-sql-datatype hints give columns the source database's own types."""
+
+    CONFIG: ClassVar[dict[str, str]] = {
+        "catalog_url": "test.db",
+        "data_path": "/tmp/test",
+        "storage_type": "local",
+    }
+
+    @staticmethod
+    def _ddl_type(prop: dict) -> str:
+        return str(JSONSchemaToDuckLake().to_sql_type(prop))
+
+    @pytest.mark.parametrize(
+        ("json_type", "hint", "expected"),
+        [
+            ("integer", "smallint", "SMALLINT"),
+            ("integer", "int2", "SMALLINT"),
+            ("integer", "integer", "INTEGER"),
+            ("integer", "int", "INTEGER"),
+            ("integer", "int4", "INTEGER"),
+            ("integer", "bigint", "BIGINT"),
+            ("integer", "int8", "BIGINT"),
+            ("integer", "BIGINT", "BIGINT"),
+            ("number", "real", "REAL"),
+            ("number", "float4", "REAL"),
+            ("number", "float", "DOUBLE"),
+            ("number", "float8", "DOUBLE"),
+            ("number", "double", "DOUBLE"),
+            ("number", "Double  Precision", "DOUBLE"),
+            ("number", "float(24)", "REAL"),
+            ("number", "float(53)", "DOUBLE"),
+            ("number", "decimal(10,2)", "DECIMAL(10, 2)"),
+            ("number", "NUMERIC( 20, 4 )", "DECIMAL(20, 4)"),
+            ("string", "numeric(18,2)", "DECIMAL(18, 2)"),
+            ("number", "decimal(50,40)", "DECIMAL(38, 38)"),
+            ("string", "timestamp", "TIMESTAMP"),
+            ("string", "timestamp without time zone", "TIMESTAMP"),
+            ("string", "timestamp_ntz", "TIMESTAMP"),
+            ("string", "timestamptz", "TIMESTAMPTZ"),
+            ("string", "timestamp with time zone", "TIMESTAMPTZ"),
+            ("string", "timestamp_tz", "TIMESTAMPTZ"),
+            ("string", "timestamp_ltz", "TIMESTAMPTZ"),
+            ("string", "date", "DATE"),
+            ("string", "time", "TIME"),
+            ("string", "time without time zone", "TIME"),
+            ("string", "uuid", "UUID"),
+            ("string", "uniqueidentifier", "UUID"),
+            ("string", "json", "JSON"),
+            ("string", "jsonb", "JSON"),
+        ],
+    )
+    def test_supported_hint(self, json_type: str, hint: str, expected: str):
+        """Each supported hint maps to its DuckDB type, ignoring case and spacing."""
+        prop = {"type": ["null", json_type], "x-sql-datatype": hint}
+        assert self._ddl_type(prop) == expected
+
+    @pytest.mark.parametrize(
+        ("prop", "expected"),
+        [
+            ({"type": ["null", "string"], "x-sql-datatype": "geography"}, "VARCHAR"),
+            ({"type": "integer", "x-sql-datatype": "tinyint"}, "BIGINT"),
+            # DuckLake's Parquet files drop a TIMETZ offset, so text is safer.
+            ({"type": "string", "x-sql-datatype": "timetz"}, "VARCHAR"),
+            ({"type": "string", "x-sql-datatype": "time with time zone"}, "VARCHAR"),
+            (
+                {"type": "string", "format": "date-time", "x-sql-datatype": "datetime"},
+                "DATETIME",
+            ),
+        ],
+    )
+    def test_unknown_hint_falls_back(self, prop: dict, expected: str):
+        """An unsupported hint keeps today's mapping and the SDK's warning."""
+        with pytest.warns(UserWarning, match="does not support the x-sql-datatype"):
+            assert self._ddl_type(prop) == expected
+
+    def test_no_hint_keeps_existing_mapping(self):
+        """Properties without a hint map exactly as before."""
+        assert self._ddl_type({"type": "number"}) == "DECIMAL(38, 9)"
+        assert self._ddl_type({"type": "integer"}) == "BIGINT"
+        assert self._ddl_type({"type": "string", "format": "date-time"}) == "DATETIME"
+
+    def test_staging_matches_ddl(self):
+        """Decimal hints stage at the hinted precision; float hints stage as float64."""
+        schema = flatten_schema_to_pyarrow_schema(
+            {
+                "d": {"type": "number", "x-sql-datatype": "numeric(12,4)"},
+                "f": {"type": "number", "x-sql-datatype": "double precision"},
+                "n": {"type": "number"},
+            }
+        )
+        assert schema.field("d").type == pa.decimal128(12, 4)
+        assert schema.field("f").type == pa.float64()
+        assert schema.field("n").type == pa.decimal128(38, 9)
+
+    def test_hinted_types_load_end_to_end(self, tmp_path: Path):
+        """Hinted columns are created by the real DDL and load SDK-parsed values."""
+        props = {
+            "id": {"type": "integer", "x-sql-datatype": "smallint"},
+            "small_f": {"type": "number", "x-sql-datatype": "real"},
+            "tiny_d": {"type": "number", "x-sql-datatype": "float8"},
+            "amount": {"type": "string", "x-sql-datatype": "numeric(12,4)"},
+            "at": {
+                "type": "string",
+                "format": "date-time",
+                "x-sql-datatype": "timestamptz",
+            },
+            "uid": {"type": "string", "x-sql-datatype": "uuid"},
+            "doc": {"type": "string", "x-sql-datatype": "jsonb"},
+        }
+        connector = DuckLakeConnector(self.CONFIG)
+        columns = connector.json_to_ducklake_schema(props)
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        con.execute("CREATE SCHEMA ducklake_catalog.s")
+
+        record = {
+            "id": 7,
+            "small_f": Decimal("1.5"),
+            "tiny_d": Decimal("1.5E-12"),
+            "amount": "1234.5678",
+            "at": datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc),
+            "uid": "6f1c2a3e-1b2c-4d5e-8f90-123456789abc",
+            "doc": '{"a": 1}',
+        }
+        batch = tmp_path / "batch.parquet"
+        table = create_pyarrow_table([record], flatten_schema_to_pyarrow_schema(props))
+        pq.write_table(table, batch)
+
+        with patch.object(
+            connector, "execute", side_effect=lambda sql: con.execute(sql)
+        ):
+            connector._create_empty_table("s", "t", columns)
+            connector.insert_into_table(
+                file_location=str(batch),
+                target_schema_name="s",
+                table_name="t",
+                file_columns=list(props),
+                target_table_columns=list(props),
+            )
+
+        types = dict(
+            con.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_name = 't'"
+            ).fetchall()
+        )
+        assert types == {
+            "id": "SMALLINT",
+            "small_f": "FLOAT",
+            "tiny_d": "DOUBLE",
+            "amount": "DECIMAL(12,4)",
+            "at": "TIMESTAMP WITH TIME ZONE",
+            "uid": "UUID",
+            "doc": "JSON",
+        }
+        row = con.execute(
+            'SELECT id, small_f, tiny_d, amount, epoch("at"), '
+            "uid::VARCHAR, doc::VARCHAR "
+            "FROM ducklake_catalog.s.t"
+        ).fetchone()
+        assert row == (
+            7,
+            1.5,
+            1.5e-12,
+            Decimal("1234.5678"),
+            1704103200.0,
+            "6f1c2a3e-1b2c-4d5e-8f90-123456789abc",
+            '{"a": 1}',
+        )
+
+    def test_hinted_timestamptz_key_remerges(self, tmp_path: Path):
+        """A timestamptz-hinted merge key is cast like other temporal keys."""
+        props = {
+            "at": {
+                "type": "string",
+                "format": "date-time",
+                "x-sql-datatype": "timestamptz",
+            },
+            "v": {"type": ["null", "string"]},
+        }
+        connector = DuckLakeConnector(self.CONFIG)
+        key_type = connector.json_to_ducklake_schema(props)[0]["type"]
+        assert key_type == "TIMESTAMPTZ"
+        con = duckdb.connect()
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        con.execute("CREATE SCHEMA ducklake_catalog.s")
+        con.execute('CREATE TABLE ducklake_catalog.s.t ("at" TIMESTAMPTZ, v VARCHAR)')
+        pyarrow_schema = flatten_schema_to_pyarrow_schema(props)
+        value = datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc)
+
+        with patch.object(
+            connector, "execute", side_effect=lambda sql: con.execute(sql)
+        ):
+            for version in ("first", "second"):
+                batch = tmp_path / f"{version}.parquet"
+                pq.write_table(
+                    create_pyarrow_table([{"at": value, "v": version}], pyarrow_schema),
+                    batch,
+                )
+                connector.merge_into_table(
+                    file_location=str(batch),
+                    target_schema_name="s",
+                    table_name="t",
+                    file_columns=["at", "v"],
+                    target_table_columns=["at", "v"],
+                    key_properties=["at"],
+                    temporal_key_types={"at": key_type},
+                )
+
+        assert con.execute("SELECT v FROM ducklake_catalog.s.t").fetchall() == [
+            ("second",)
+        ]
+
+
 class TestErrorHandling:
     """Test error handling scenarios."""
 

@@ -5,6 +5,8 @@ from decimal import ROUND_HALF_EVEN, Context, Decimal
 
 import pyarrow as pa
 
+from target_ducklake.type_hints import decimal_hint, is_float_hint
+
 FIELD_TYPE_TO_PYARROW = {
     "BOOLEAN": pa.bool_(),
     "STRING": pa.string(),
@@ -33,15 +35,18 @@ logger = logging.getLogger(__name__)
 
 
 def number_precision_and_scale(jsonschema: dict) -> tuple[int, int]:
-    """Return the (precision, scale) used for a JSON Schema "number" property.
+    """Return the (precision, scale) used for a decimal column.
 
     Shared by the DuckLake column DDL and the parquet staging schema so both
-    always agree. Uses the schema's ``precision``/``scale`` when present
+    always agree. An ``x-sql-datatype`` of ``decimal(p,s)`` or ``numeric(p,s)``
+    wins; otherwise the schema's ``precision``/``scale`` are used when present
     (precision capped at 38, scale defaulting to 9 and never exceeding the
     precision), otherwise DECIMAL(38, 9).
     """
-    precision = jsonschema.get("precision")
-    scale = jsonschema.get("scale")
+    precision, scale = decimal_hint(jsonschema) or (
+        jsonschema.get("precision"),
+        jsonschema.get("scale"),
+    )
     if precision is None:
         return DECIMAL_MAX_PRECISION, DECIMAL_DEFAULT_SCALE
     precision = min(precision, DECIMAL_MAX_PRECISION)
@@ -67,7 +72,11 @@ def _field_type_to_pyarrow_field(
     if "NULL" in types_uppercase:
         types_uppercase.remove("NULL")
     input_type = next(iter(types_uppercase)) if types_uppercase else ""
-    if input_type == "NUMBER":
+    if input_type == "NUMBER" and is_float_hint(input_types):
+        # A REAL or DOUBLE column: decimal staging would round away digits
+        # beyond its scale (1.5e-12 would arrive as 0).
+        pyarrow_type = pa.float64()
+    elif input_type == "NUMBER":
         # Stage numbers as decimals, not float64, so values keep their exact digits
         # on the way into the DECIMAL column.
         pyarrow_type = pa.decimal128(*number_precision_and_scale(input_types))
