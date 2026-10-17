@@ -948,6 +948,14 @@ class TestSqlDatatypeHints:
                 },
                 ("UUID", pa.string()),
             ),
+            (
+                # Only the hint is carried; a wrapper format changes nothing.
+                {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "format": "date-time",
+                },
+                ("VARCHAR", pa.string()),
+            ),
         ],
         ids=[
             "outer-uuid",
@@ -955,11 +963,47 @@ class TestSqlDatatypeHints:
             "inner-decimal",
             "inner-wins",
             "empty-inner-hint",
+            "outer-format-not-carried",
         ],
     )
     def test_hint_on_anyof_property(self, prop: dict, expected: tuple):
         """A hint on an anyOf property sets both the DDL and the staging type."""
         assert self._column_types(prop) == expected
+
+    def test_anyof_wrapper_hint_does_not_change_callers_schema(self):
+        """The wrapper's hint goes into a copy, not into the caller's branch."""
+        prop = {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "x-sql-datatype": "uuid",
+        }
+        flat = flatten_schema({"type": "object", "properties": {"c": prop}})
+        assert flat["c"]["x-sql-datatype"] == "uuid"
+        assert "x-sql-datatype" not in prop["anyOf"][0]
+
+    def test_unsupported_hint_on_anyof_property_falls_back(self):
+        """An unsupported wrapper hint keeps the default mapping, with a warning."""
+        prop = {
+            "anyOf": [{"type": "number"}, {"type": "null"}],
+            "x-sql-datatype": "money",
+        }
+        with pytest.warns(UserWarning, match="does not support the x-sql-datatype"):
+            types = self._column_types(prop)
+        assert types == ("DECIMAL(38, 9)", pa.decimal128(38, 9))
+
+    @pytest.mark.parametrize(
+        ("hint", "expected"),
+        [
+            ("decimal(5,5)", ("DECIMAL(5, 5)", pa.decimal128(5, 5))),
+            ("decimal(5,0)", ("DECIMAL(5, 0)", pa.decimal128(5, 0))),
+            ("decimal(1,0)", ("DECIMAL(1, 0)", pa.decimal128(1, 0))),
+        ],
+        ids=["scale-equals-precision", "zero-scale", "precision-one"],
+    )
+    def test_decimal_hint_edges_are_valid(self, hint: str, expected: tuple):
+        """The boundaries of a valid decimal hint are honoured exactly."""
+        ddl, staging = self._column_types({"type": "number", "x-sql-datatype": hint})
+        assert (ddl, staging) == expected
+        duckdb.connect().execute(f"CREATE TABLE t (c {ddl})")
 
     @pytest.mark.parametrize(
         ("prop", "expected"),
