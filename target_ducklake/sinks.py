@@ -14,7 +14,7 @@ import pyarrow.parquet as pq
 from singer_sdk import Target
 from singer_sdk.sinks import SQLSink
 
-from target_ducklake.connector import TEMPORAL_KEY_TYPES, DuckLakeConnector
+from target_ducklake.connector import DuckLakeConnector
 from target_ducklake.flatten import (
     flatten_record,
     flatten_schema,
@@ -24,6 +24,7 @@ from target_ducklake.parquet_utils import (
     concat_tables,
     flatten_schema_to_pyarrow_schema,
 )
+from target_ducklake.type_hints import TEMPORAL_TYPES
 
 
 class ducklakeSink(SQLSink):
@@ -362,7 +363,7 @@ class ducklakeSink(SQLSink):
             temporal_key_types = {
                 col["name"]: col["type"]
                 for col in self.ducklake_schema
-                if col["type"] in TEMPORAL_KEY_TYPES
+                if col["type"] in TEMPORAL_TYPES
             }
             self.connector.merge_into_table(
                 file_location=temp_file_path,

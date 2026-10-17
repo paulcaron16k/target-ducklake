@@ -10,17 +10,14 @@ from typing import Any
 import duckdb
 from singer_sdk.connectors import SQLConnector
 from singer_sdk.connectors.sql import JSONSchemaToSQL
-from sqlalchemy.types import BIGINT, DECIMAL, INTEGER, JSON
+from sqlalchemy.types import BIGINT, DECIMAL, INTEGER, JSON, TypeEngine, UserDefinedType
 
 from target_ducklake.parquet_utils import number_precision_and_scale
+from target_ducklake.type_hints import decimal_hint, hinted_type
 
 logger = logging.getLogger(__name__)
 
 PARTITION_GRANULARITIES = ["year", "month", "day", "hour"]
-
-# DuckLake column types (from json_to_ducklake_schema) whose staged values are
-# strings and must be cast before a merge can compare them with the table.
-TEMPORAL_KEY_TYPES = ("DATETIME", "DATE", "TIME")
 
 # Integer type widths for deciding safe in-place widening (e.g. INTEGER -> BIGINT).
 _INT_TYPE_RANK = {
@@ -51,8 +48,39 @@ class DuckLakeConnectorError(Exception):
     """Custom exception for DuckLake connector errors."""
 
 
+class DuckDBType(UserDefinedType):
+    """A column type rendered exactly as its DuckDB name, e.g. ``TIMESTAMPTZ``.
+
+    SQLAlchemy's generic types lose detail when rendered: ``TIMESTAMP(timezone=True)``
+    renders as plain ``TIMESTAMP``.
+    """
+
+    cache_ok = True
+
+    def __init__(self, name: str) -> None:
+        """Store the DuckDB type name."""
+        self.name = name
+
+    def get_col_spec(self, **_kw: Any) -> str:
+        """Return the DuckDB type name."""
+        return self.name
+
+
 class JSONSchemaToDuckLake(JSONSchemaToSQL):
     """Convert JSON Schema types to DuckLake compatible types."""
+
+    def to_sql_type(self, schema: dict) -> TypeEngine:
+        """Convert a property schema, honouring its ``x-sql-datatype`` hint first.
+
+        A supported hint (see ``type_hints``) gives the source column's own type;
+        an unsupported one falls back to the JSON Schema type and format, with
+        the SDK's warning.
+        """
+        if decimal_hint(schema) is not None:
+            return DECIMAL(*number_precision_and_scale(schema))
+        if (type_name := hinted_type(schema)) is not None:
+            return DuckDBType(type_name)
+        return super().to_sql_type(schema)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -613,8 +641,9 @@ class DuckLakeConnector(SQLConnector):
         We first delete rows in the target table that match the source (based on key_properties),
         then insert all rows from the source file.
 
-        ``temporal_key_types`` maps each DATETIME, DATE or TIME key column to its
-        type, so the staged string values can be cast before comparison.
+        ``temporal_key_types`` maps each date or time key column (see
+        ``type_hints.TEMPORAL_TYPES``) to its type, so the staged string values can
+        be cast before comparison.
 
         Note: MERGE INTO is not used due to issues with partitioned tables.
         See: https://github.com/duckdb/ducklake/issues/643
