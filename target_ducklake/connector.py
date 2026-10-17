@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 PARTITION_GRANULARITIES = ["year", "month", "day", "hour"]
 
+# DuckLake column types (from json_to_ducklake_schema) whose staged values are
+# strings and must be cast before a merge can compare them with the table.
+TEMPORAL_KEY_TYPES = ("DATETIME", "DATE", "TIME")
+
 # Integer type widths for deciding safe in-place widening (e.g. INTEGER -> BIGINT).
 _INT_TYPE_RANK = {
     "TINYINT": 1,
@@ -568,30 +572,31 @@ class DuckLakeConnector(SQLConnector):
 
     @staticmethod
     def _build_key_columns_sql(
-        key_properties: list[str], date_type_keys: list[str | None]
-    ) -> str:
-        """Build the comma-separated key column list used to match merge keys.
+        key_properties: list[str], temporal_key_types: dict[str, str]
+    ) -> tuple[str, str]:
+        """Build the key column lists used to match merge keys.
 
-        Used as a row value on both sides of the DELETE, e.g.
-        ``("tenant", "id") IN (SELECT "tenant", "id" FROM ...)``.
+        Returns the table side and the staged-file side of a row-value
+        comparison, e.g.
+        ``("tenant", "ts") IN (SELECT "tenant", CAST("ts" AS DATETIME) FROM ...)``.
 
         Each key column is compared on its own, so composite keys can't collide.
         Concatenating them (``tenant || id``) made ('1', '23') match ('12', '3').
-        Datetime keys are cast to VARCHAR because DuckDB can't compare the
-        TIMESTAMP table column with the staged string column in an IN clause.
+
+        Temporal keys are staged as strings, and DuckDB can't compare a
+        TIMESTAMP, DATE or TIME column with a string in an IN clause. The staged
+        side is cast to the column's type, the same cast INSERT applies, so the
+        values compare exactly. Casting both sides to VARCHAR instead never
+        matched: the table renders '2024-01-01 10:00:00', the staged value
+        '2024-01-01 10:00:00.000000'.
         """
-        key_columns = []
+        table_columns, file_columns = [], []
         for key_name in key_properties:
-            if key_name in date_type_keys:
-                logger.info(
-                    f"DATETIME primary key detected (column: {key_name}), casting "
-                    "to VARCHAR for merge query (will remain date-time type in "
-                    "final table)"
-                )
-                key_columns.append(f'"{key_name}"::VARCHAR')
-            else:
-                key_columns.append(f'"{key_name}"')
-        return ", ".join(key_columns)
+            column = f'"{key_name}"'
+            table_columns.append(column)
+            key_type = temporal_key_types.get(key_name)
+            file_columns.append(f"CAST({column} AS {key_type})" if key_type else column)
+        return ", ".join(table_columns), ", ".join(file_columns)
 
     def merge_into_table(
         self,
@@ -601,18 +606,23 @@ class DuckLakeConnector(SQLConnector):
         file_columns: list[str],
         target_table_columns: list[str],
         key_properties: list[str],
-        date_type_keys: list[str | None] = [],
+        temporal_key_types: dict[str, str] | None = None,
     ):
         """Merge data from a parquet file into the table using DELETE+INSERT.
 
         We first delete rows in the target table that match the source (based on key_properties),
         then insert all rows from the source file.
 
+        ``temporal_key_types`` maps each DATETIME, DATE or TIME key column to its
+        type, so the staged string values can be cast before comparison.
+
         Note: MERGE INTO is not used due to issues with partitioned tables.
         See: https://github.com/duckdb/ducklake/issues/643
         """
         columns_sql = self._build_columns_sql(file_columns, target_table_columns)
-        key_columns_sql = self._build_key_columns_sql(key_properties, date_type_keys)
+        table_key_sql, file_key_sql = self._build_key_columns_sql(
+            key_properties, temporal_key_types or {}
+        )
         if len(key_properties) > 1:
             logger.info(
                 f"Multiple key properties detected: {key_properties}, "
@@ -624,7 +634,7 @@ class DuckLakeConnector(SQLConnector):
         combined_sql = f"""
         BEGIN TRANSACTION;
         DELETE FROM {table_ref} 
-        WHERE ({key_columns_sql}) IN (SELECT {key_columns_sql} FROM '{file_location}');
+        WHERE ({table_key_sql}) IN (SELECT {file_key_sql} FROM '{file_location}');
         INSERT INTO {table_ref} 
         SELECT {columns_sql} FROM '{file_location}';
         COMMIT;

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import Mock, patch
@@ -641,7 +643,7 @@ class TestMergeKeyMatching:
     def _merge_sql(
         self,
         key_properties: list[str],
-        date_type_keys: list[str | None] | None = None,
+        temporal_key_types: dict[str, str] | None = None,
     ) -> str:
         connector = DuckLakeConnector(self.CONFIG)
         with patch.object(connector, "execute") as mock_execute:
@@ -652,7 +654,7 @@ class TestMergeKeyMatching:
                 file_columns=["tenant", "id", "v"],
                 target_table_columns=["tenant", "id", "v"],
                 key_properties=key_properties,
-                date_type_keys=date_type_keys or [],
+                temporal_key_types=temporal_key_types,
             )
         return mock_execute.call_args[0][0]
 
@@ -670,16 +672,20 @@ class TestMergeKeyMatching:
         sql = self._merge_sql(["id"])
         assert """WHERE ("id") IN (SELECT "id" FROM 'batch.parquet')""" in sql
 
-    def test_datetime_key_cast_preserved(self):
-        """Datetime keys keep their VARCHAR cast, now per column."""
-        sql = self._merge_sql(["tenant", "ts"], date_type_keys=["ts"])
-        expected = '("tenant", "ts"::VARCHAR) IN (SELECT "tenant", "ts"::VARCHAR'
+    def test_temporal_keys_cast_staged_side(self):
+        """Temporal keys cast only the staged side, to the column's type."""
+        sql = self._merge_sql(["tenant", "ts", "d"], {"ts": "DATETIME", "d": "DATE"})
+        expected = (
+            '("tenant", "ts", "d") IN '
+            '(SELECT "tenant", CAST("ts" AS DATETIME), CAST("d" AS DATE) FROM'
+        )
         assert expected in sql
+        assert "::VARCHAR" not in sql
 
     def test_does_not_mutate_key_properties(self):
         """The caller's key list is left unchanged."""
         keys = ["tenant", "ts"]
-        self._merge_sql(keys, date_type_keys=["ts"])
+        self._merge_sql(keys, {"ts": "DATETIME"})
         assert keys == ["tenant", "ts"]
 
     def test_composite_key_collision_keeps_unrelated_rows(self, tmp_path):
@@ -723,6 +729,92 @@ class TestMergeKeyMatching:
             ("12", "3", "new"),
             ("a", "1", "updated"),
         ]
+
+
+class TestTemporalMergeKeys:
+    """Re-merging a batch keyed on a TIMESTAMP, DATE or TIME leaves one row per key."""
+
+    CONFIG: ClassVar[dict[str, str]] = {
+        "catalog_url": "test.db",
+        "data_path": "/tmp/test",
+        "storage_type": "local",
+    }
+
+    @pytest.mark.parametrize(
+        ("json_format", "column_type", "value"),
+        [
+            # Naive values on purpose: taps send zone-less timestamps.
+            ("date-time", "DATETIME", datetime(2024, 1, 1, 10, 0, 0)),  # noqa: DTZ001
+            ("date-time", "DATETIME", datetime(2024, 1, 1, 10, 0, 0, 500000)),  # noqa: DTZ001
+            ("date-time", "DATETIME", datetime(2024, 1, 1, 10, tzinfo=timezone.utc)),
+            ("date", "DATE", date(2024, 1, 1)),
+            ("time", "TIME", time(10, 0, 0)),
+        ],
+    )
+    def test_remerge_replaces_row(
+        self, tmp_path: Path, json_format: str, column_type: str, value: object
+    ):
+        """The second merge of the same key replaces the first row."""
+        flat_schema = {
+            "k": {"type": ["null", "string"], "format": json_format},
+            "v": {"type": ["null", "string"]},
+        }
+        connector = DuckLakeConnector(self.CONFIG)
+        assert connector.json_to_ducklake_schema(flat_schema)[0]["type"] == column_type
+
+        con = duckdb.connect()
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        con.execute("CREATE SCHEMA ducklake_catalog.s")
+        con.execute(f"CREATE TABLE ducklake_catalog.s.t (k {column_type}, v VARCHAR)")
+        pyarrow_schema = flatten_schema_to_pyarrow_schema(flat_schema)
+
+        with patch.object(
+            connector, "execute", side_effect=lambda sql: con.execute(sql)
+        ):
+            for version in ("first", "second"):
+                # Values arrive parsed, as the singer-sdk delivers them.
+                batch = tmp_path / f"{version}.parquet"
+                table = create_pyarrow_table(
+                    [{"k": value, "v": version}], pyarrow_schema
+                )
+                pq.write_table(table, batch)
+                connector.merge_into_table(
+                    file_location=str(batch),
+                    target_schema_name="s",
+                    table_name="t",
+                    file_columns=["k", "v"],
+                    target_table_columns=["k", "v"],
+                    key_properties=["k"],
+                    temporal_key_types={"k": column_type},
+                )
+
+        rows = con.execute("SELECT v FROM ducklake_catalog.s.t").fetchall()
+        assert rows == [("second",)]
+
+    def test_sink_passes_temporal_key_types(self):
+        """The sink tells the merge which keys are DATETIME, DATE or TIME."""
+        sink: Any = SimpleNamespace(
+            write_temp_file=Mock(return_value="batch.parquet"),
+            ducklake_schema=[
+                {"name": "id", "type": "BIGINT"},
+                {"name": "ts", "type": "DATETIME"},
+                {"name": "d", "type": "DATE"},
+                {"name": "name", "type": "VARCHAR"},
+            ],
+            _table_columns=["id", "ts", "d", "name"],
+            key_properties=["id", "ts"],
+            load_method="merge",
+            should_overwrite_table=False,
+            connector=Mock(),
+            target_schema="s",
+            target_table="t",
+            logger=Mock(),
+            _get_memory_usage_mb=Mock(return_value=0.0),
+        )
+        with patch("target_ducklake.sinks.os.remove"):
+            ducklakeSink.process_batch(sink, {})
+        kwargs = sink.connector.merge_into_table.call_args.kwargs
+        assert kwargs["temporal_key_types"] == {"ts": "DATETIME", "d": "DATE"}
 
 
 class TestErrorHandling:

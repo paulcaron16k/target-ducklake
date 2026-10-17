@@ -14,7 +14,7 @@ import pyarrow.parquet as pq
 from singer_sdk import Target
 from singer_sdk.sinks import SQLSink
 
-from target_ducklake.connector import DuckLakeConnector
+from target_ducklake.connector import TEMPORAL_KEY_TYPES, DuckLakeConnector
 from target_ducklake.flatten import (
     flatten_record,
     flatten_schema,
@@ -359,9 +359,11 @@ class ducklakeSink(SQLSink):
 
         # If load method is merge, we merge the data
         elif self.load_method == "merge":
-            date_type_pks = [
-                col["name"] for col in self.ducklake_schema if col["type"] == "DATETIME"
-            ]
+            temporal_key_types = {
+                col["name"]: col["type"]
+                for col in self.ducklake_schema
+                if col["type"] in TEMPORAL_KEY_TYPES
+            }
             self.connector.merge_into_table(
                 file_location=temp_file_path,
                 target_schema_name=self.target_schema,
@@ -369,7 +371,7 @@ class ducklakeSink(SQLSink):
                 file_columns=file_columns,
                 target_table_columns=table_columns,
                 key_properties=list(self.key_properties),
-                date_type_keys=list(date_type_pks),
+                temporal_key_types=temporal_key_types,
             )
 
         # delete file after insert
