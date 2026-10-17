@@ -600,29 +600,33 @@ class DuckLakeConnector(SQLConnector):
 
     @staticmethod
     def _build_key_columns_sql(
-        key_properties: list[str], temporal_key_types: dict[str, str]
+        key_properties: list[str], key_column_types: dict[str, str]
     ) -> tuple[str, str]:
         """Build the key column lists used to match merge keys.
 
         Returns the table side and the staged-file side of a row-value
-        comparison, e.g.
-        ``("tenant", "ts") IN (SELECT "tenant", CAST("ts" AS DATETIME) FROM ...)``.
+        comparison, e.g. ``("tenant", "ts") IN (SELECT CAST("tenant" AS VARCHAR),
+        CAST("ts" AS TIMESTAMP) FROM ...)``.
 
         Each key column is compared on its own, so composite keys can't collide.
         Concatenating them (``tenant || id``) made ('1', '23') match ('12', '3').
 
-        Temporal keys are staged as strings, and DuckDB can't compare a
-        TIMESTAMP, DATE or TIME column with a string in an IN clause. The staged
-        side is cast to the column's type, the same cast INSERT applies, so the
-        values compare exactly. Casting both sides to VARCHAR instead never
-        matched: the table renders '2024-01-01 10:00:00', the staged value
-        '2024-01-01 10:00:00.000000'.
+        Each staged key is cast to the table column's actual type, the same cast
+        INSERT applies, so a staged value compares equal to the row it produced:
+        - Staged strings can't be compared with a TIMESTAMP, DATE, TIME or UUID
+          column in an IN clause at all (binder error).
+        - A REAL column holds 0.1 as 0.10000000149; uncast, the staged float64
+          0.1 never matches it.
+        - Casting to the stream's declared type instead fails for existing
+          tables whose column type differs, e.g. a TIMESTAMP column for a
+          stream that now declares timestamptz.
+        A key with no known type is compared uncast.
         """
         table_columns, file_columns = [], []
         for key_name in key_properties:
             column = f'"{key_name}"'
             table_columns.append(column)
-            key_type = temporal_key_types.get(key_name)
+            key_type = key_column_types.get(key_name)
             file_columns.append(f"CAST({column} AS {key_type})" if key_type else column)
         return ", ".join(table_columns), ", ".join(file_columns)
 
@@ -634,23 +638,23 @@ class DuckLakeConnector(SQLConnector):
         file_columns: list[str],
         target_table_columns: list[str],
         key_properties: list[str],
-        temporal_key_types: dict[str, str] | None = None,
+        key_column_types: dict[str, str] | None = None,
     ):
         """Merge data from a parquet file into the table using DELETE+INSERT.
 
         We first delete rows in the target table that match the source (based on key_properties),
         then insert all rows from the source file.
 
-        ``temporal_key_types`` maps each date or time key column (see
-        ``type_hints.TEMPORAL_TYPES``) to its type, so the staged string values can
-        be cast before comparison.
+        ``key_column_types`` maps each key column to the table's actual column
+        type (as read from the table), so staged key values can be cast to it
+        before comparison.
 
         Note: MERGE INTO is not used due to issues with partitioned tables.
         See: https://github.com/duckdb/ducklake/issues/643
         """
         columns_sql = self._build_columns_sql(file_columns, target_table_columns)
         table_key_sql, file_key_sql = self._build_key_columns_sql(
-            key_properties, temporal_key_types or {}
+            key_properties, key_column_types or {}
         )
         if len(key_properties) > 1:
             logger.info(

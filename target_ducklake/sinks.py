@@ -24,7 +24,6 @@ from target_ducklake.parquet_utils import (
     concat_tables,
     flatten_schema_to_pyarrow_schema,
 )
-from target_ducklake.type_hints import TEMPORAL_TYPES
 
 
 class ducklakeSink(SQLSink):
@@ -198,6 +197,29 @@ class ducklakeSink(SQLSink):
             partition_fields=self.partition_fields,
             overwrite_table=self.should_overwrite_table,
         )
+        # Read on the first merge only; append and overwrite never need them.
+        self._key_types: dict[str, str] | None = None
+
+    def _key_column_types(self) -> dict[str, str]:
+        """Map each key property to its table column's actual type.
+
+        Merge keys are cast to these types. They are read from the table, once
+        per sink, because an existing table's types can differ from this
+        stream's declared types.
+        """
+        if self._key_types is None:
+            column_types = self.connector.get_table_column_types(
+                self.target_schema, self.target_table
+            )
+            # DuckDB matches identifiers case-insensitively, and the singer-sdk
+            # lowercases key_properties while columns keep the property's case.
+            by_name = {name.lower(): typ for name, typ in column_types.items()}
+            self._key_types = {
+                key: by_name[key.lower()]
+                for key in self.key_properties
+                if key.lower() in by_name
+            }
+        return self._key_types
 
     def process_record(self, record: dict, context: dict) -> None:
         """Process the record and flatten if necessary."""
@@ -360,11 +382,6 @@ class ducklakeSink(SQLSink):
 
         # If load method is merge, we merge the data
         elif self.load_method == "merge":
-            temporal_key_types = {
-                col["name"]: col["type"]
-                for col in self.ducklake_schema
-                if col["type"] in TEMPORAL_TYPES
-            }
             self.connector.merge_into_table(
                 file_location=temp_file_path,
                 target_schema_name=self.target_schema,
@@ -372,7 +389,7 @@ class ducklakeSink(SQLSink):
                 file_columns=file_columns,
                 target_table_columns=table_columns,
                 key_properties=list(self.key_properties),
-                temporal_key_types=temporal_key_types,
+                key_column_types=self._key_column_types(),
             )
 
         # delete file after insert

@@ -643,7 +643,7 @@ class TestMergeKeyMatching:
     def _merge_sql(
         self,
         key_properties: list[str],
-        temporal_key_types: dict[str, str] | None = None,
+        key_column_types: dict[str, str] | None = None,
     ) -> str:
         connector = DuckLakeConnector(self.CONFIG)
         with patch.object(connector, "execute") as mock_execute:
@@ -654,7 +654,7 @@ class TestMergeKeyMatching:
                 file_columns=["tenant", "id", "v"],
                 target_table_columns=["tenant", "id", "v"],
                 key_properties=key_properties,
-                temporal_key_types=temporal_key_types,
+                key_column_types=key_column_types,
             )
         return mock_execute.call_args[0][0]
 
@@ -672,12 +672,14 @@ class TestMergeKeyMatching:
         sql = self._merge_sql(["id"])
         assert """WHERE ("id") IN (SELECT "id" FROM 'batch.parquet')""" in sql
 
-    def test_temporal_keys_cast_staged_side(self):
-        """Temporal keys cast only the staged side, to the column's type."""
-        sql = self._merge_sql(["tenant", "ts", "d"], {"ts": "DATETIME", "d": "DATE"})
+    def test_keys_cast_to_table_types(self):
+        """Each staged key is cast to its table column type; the table side isn't."""
+        sql = self._merge_sql(
+            ["tenant", "ts", "d"], {"tenant": "VARCHAR", "ts": "TIMESTAMP", "d": "DATE"}
+        )
         expected = (
-            '("tenant", "ts", "d") IN '
-            '(SELECT "tenant", CAST("ts" AS DATETIME), CAST("d" AS DATE) FROM'
+            '("tenant", "ts", "d") IN (SELECT CAST("tenant" AS VARCHAR), '
+            'CAST("ts" AS TIMESTAMP), CAST("d" AS DATE) FROM'
         )
         assert expected in sql
         assert "::VARCHAR" not in sql
@@ -685,7 +687,7 @@ class TestMergeKeyMatching:
     def test_does_not_mutate_key_properties(self):
         """The caller's key list is left unchanged."""
         keys = ["tenant", "ts"]
-        self._merge_sql(keys, {"ts": "DATETIME"})
+        self._merge_sql(keys, {"ts": "TIMESTAMP"})
         assert keys == ["tenant", "ts"]
 
     def test_composite_key_collision_keeps_unrelated_rows(self, tmp_path):
@@ -785,36 +787,11 @@ class TestTemporalMergeKeys:
                     file_columns=["k", "v"],
                     target_table_columns=["k", "v"],
                     key_properties=["k"],
-                    temporal_key_types={"k": column_type},
+                    key_column_types={"k": column_type},
                 )
 
         rows = con.execute("SELECT v FROM ducklake_catalog.s.t").fetchall()
         assert rows == [("second",)]
-
-    def test_sink_passes_temporal_key_types(self):
-        """The sink tells the merge which keys are DATETIME, DATE or TIME."""
-        sink: Any = SimpleNamespace(
-            write_temp_file=Mock(return_value="batch.parquet"),
-            ducklake_schema=[
-                {"name": "id", "type": "BIGINT"},
-                {"name": "ts", "type": "DATETIME"},
-                {"name": "d", "type": "DATE"},
-                {"name": "name", "type": "VARCHAR"},
-            ],
-            _table_columns=["id", "ts", "d", "name"],
-            key_properties=["id", "ts"],
-            load_method="merge",
-            should_overwrite_table=False,
-            connector=Mock(),
-            target_schema="s",
-            target_table="t",
-            logger=Mock(),
-            _get_memory_usage_mb=Mock(return_value=0.0),
-        )
-        with patch("target_ducklake.sinks.os.remove"):
-            ducklakeSink.process_batch(sink, {})
-        kwargs = sink.connector.merge_into_table.call_args.kwargs
-        assert kwargs["temporal_key_types"] == {"ts": "DATETIME", "d": "DATE"}
 
 
 class TestSqlDatatypeHints:
@@ -1025,12 +1002,204 @@ class TestSqlDatatypeHints:
                     file_columns=["at", "v"],
                     target_table_columns=["at", "v"],
                     key_properties=["at"],
-                    temporal_key_types={"at": key_type},
+                    key_column_types={"at": key_type},
                 )
 
         assert con.execute("SELECT v FROM ducklake_catalog.s.t").fetchall() == [
             ("second",)
         ]
+
+
+class TestMergeKeyTableTypes:
+    """Re-merging leaves one row per key, whatever the key column's type.
+
+    Drives the real sink lifecycle (setup, then process_batch twice) through a
+    real connector on an in-memory DuckDB catalog, so the key types come from
+    the table exactly as in production.
+    """
+
+    UUID = "6f1c2a3e-1b2c-4d5e-8f90-123456789abc"
+
+    @staticmethod
+    def _catalog() -> duckdb.DuckDBPyConnection:
+        con = duckdb.connect()
+        # A non-UTC session zone, so TIMESTAMP vs TIMESTAMPTZ mix-ups show.
+        con.execute("SET TimeZone = 'America/New_York'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        return con
+
+    def _load_twice(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        tmp_path: Path,
+        key_prop: dict,
+        value: object,
+        key_properties: list[str],
+    ) -> list[tuple]:
+        """Run setup and two merges of the same key; return the rows left.
+
+        The first key property is the column typed by ``key_prop``.
+        """
+        key_name = key_properties[0]
+        config = {
+            "catalog_url": "test.db",
+            "data_path": str(tmp_path / "data"),
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging"),
+            "load_method": "merge",
+        }
+        schema = {
+            "type": "object",
+            "properties": {
+                key_name: key_prop,
+                "id": {"type": ["null", "string"]},
+                "v": {"type": ["null", "string"]},
+            },
+        }
+        target = Mock()
+        target.config = config
+        connector = DuckLakeConnector(config)
+        with patch.object(
+            connector, "execute", side_effect=lambda sql: con.execute(sql)
+        ):
+            sink = ducklakeSink(
+                target=target,
+                stream_name="t",
+                schema=schema,
+                key_properties=key_properties,
+                connector=connector,
+            )
+            sink.setup()
+            for version in ("first", "second"):
+                # Values arrive parsed, as the singer-sdk delivers them.
+                record = {key_name: value, "id": "a", "v": version}
+                sink.process_batch({"records": [record]})
+        return con.execute(
+            "SELECT id, v FROM ducklake_catalog.s.t ORDER BY id"
+        ).fetchall()
+
+    @pytest.mark.parametrize("key_shape", ["single", "composite"])
+    @pytest.mark.parametrize(
+        ("key_prop", "value"),
+        [
+            ({"type": "string"}, "a"),
+            ({"type": "boolean"}, True),
+            ({"type": "integer"}, 5),
+            ({"type": "integer", "x-sql-datatype": "int"}, 5),
+            ({"type": "integer", "x-sql-datatype": "smallint"}, 5),
+            ({"type": "number", "x-sql-datatype": "numeric(10,2)"}, Decimal("1.25")),
+            ({"type": "number", "x-sql-datatype": "real"}, Decimal("0.1")),
+            ({"type": "number", "x-sql-datatype": "double"}, Decimal("0.1")),
+            ({"type": "string", "format": "uuid"}, UUID),
+            ({"type": "string", "x-sql-datatype": "uuid"}, UUID),
+            ({"type": "string", "format": "date"}, date(2024, 1, 1)),
+            ({"type": "string", "format": "time"}, time(10, 0, 0)),
+            (
+                {"type": "string", "format": "date-time"},
+                datetime(2024, 1, 1, 10, 0, 0),  # noqa: DTZ001
+            ),
+            (
+                {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-sql-datatype": "timestamptz",
+                },
+                datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc),
+            ),
+        ],
+        ids=[
+            "varchar",
+            "boolean",
+            "bigint",
+            "integer",
+            "smallint",
+            "decimal",
+            "real",
+            "double",
+            "uuid-format",
+            "uuid-hint",
+            "date",
+            "time",
+            "timestamp",
+            "timestamptz",
+        ],
+    )
+    def test_remerge_leaves_one_row(
+        self, tmp_path: Path, key_prop: dict, value: object, key_shape: str
+    ):
+        """The second merge replaces the first row, for every key column type."""
+        keys = ["k", "id"] if key_shape == "composite" else ["k"]
+        rows = self._load_twice(self._catalog(), tmp_path, key_prop, value, keys)
+        assert rows == [("a", "second")]
+
+    def test_upper_case_key_name(self, tmp_path: Path):
+        """A key named in upper case is still cast to its column's type.
+
+        The singer-sdk lowercases key_properties ("UID" -> "uid") while the
+        column keeps the property's case ("UID"); DuckDB matches both.
+        """
+        rows = self._load_twice(
+            self._catalog(),
+            tmp_path,
+            {"type": "string", "format": "uuid"},
+            self.UUID,
+            ["UID"],
+        )
+        assert rows == [("a", "second")]
+
+    def test_append_reads_table_metadata_once(self, tmp_path: Path):
+        """Only merges need the key types; append streams don't pay for them."""
+        con = self._catalog()
+        queries: list[str] = []
+
+        def execute(sql: str) -> duckdb.DuckDBPyConnection:
+            queries.append(sql)
+            return con.execute(sql)
+
+        config = {
+            "catalog_url": "test.db",
+            "data_path": str(tmp_path / "data"),
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging"),
+            "load_method": "append",
+        }
+        target = Mock()
+        target.config = config
+        connector = DuckLakeConnector(config)
+        schema = {"type": "object", "properties": {"k": {"type": "string"}}}
+        with patch.object(connector, "execute", side_effect=execute):
+            sink = ducklakeSink(
+                target=target,
+                stream_name="t",
+                schema=schema,
+                key_properties=["k"],
+                connector=connector,
+            )
+            sink.setup()
+            sink.process_batch({"records": [{"k": "a"}]})
+        assert sum("PRAGMA TABLE_INFO" in sql for sql in queries) == 1
+
+    def test_existing_table_type_differs_from_stream(self, tmp_path: Path):
+        """A TIMESTAMP table keyed by a stream now hinting timestamptz still merges.
+
+        The staged key must be cast to the table's TIMESTAMP, not the declared
+        TIMESTAMPTZ: under a non-UTC session time zone the two disagree.
+        """
+        con = self._catalog()
+        con.execute("CREATE SCHEMA ducklake_catalog.s")
+        con.execute(
+            "CREATE TABLE ducklake_catalog.s.t (k TIMESTAMP, id VARCHAR, v VARCHAR)"
+        )
+        key_prop = {
+            "type": "string",
+            "format": "date-time",
+            "x-sql-datatype": "timestamptz",
+        }
+        value = datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc)
+        rows = self._load_twice(con, tmp_path, key_prop, value, ["k"])
+        assert rows == [("a", "second")]
 
 
 class TestErrorHandling:

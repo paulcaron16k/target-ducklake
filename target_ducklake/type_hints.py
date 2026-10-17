@@ -76,10 +76,6 @@ _HINT_TYPES = {**_INTEGER_HINTS, **_FLOAT_HINTS, **_TEMPORAL_HINTS, **_OTHER_HIN
 # exact numeric; a tap reading a catalog emits whichever the source declared.
 _DECIMAL_HINT = re.compile(r"^(?:decimal|numeric)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)$")
 
-# The DuckDB types a temporal hint can produce, plus the SDK's own DATETIME.
-# Their staged values are strings, so a merge must cast them before comparing.
-TEMPORAL_TYPES = frozenset({"DATETIME", *_TEMPORAL_HINTS.values()})
-
 
 def sql_datatype_hint(jsonschema: dict[str, Any]) -> str:
     """Return the property's ``x-sql-datatype``, lowercased with spaces collapsed.
