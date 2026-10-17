@@ -1,6 +1,6 @@
 # taken from https://github.com/Automattic/target-parquet/blob/master/target_parquet/utils/parquet.py
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_EVEN, Context, Decimal
 
 import pyarrow as pa
@@ -155,15 +155,21 @@ def _to_decimal(value: object, scale: int) -> Decimal | None:
 def _to_staged_value(value: object) -> object:
     """Prepare a value for a non-decimal column.
 
-    - A timezone-aware datetime becomes ISO text carrying its own offset
-      ('2024-01-01 10:00:00+02:00'). pyarrow renders a named zone that way
-      itself, but looks a fixed offset such as +02:00 up as a zone name and
-      fails; the text keeps the instant for TIMESTAMPTZ columns, and a
-      TIMESTAMP column keeps the wall-clock time, as for named zones.
+    - A datetime with a fixed non-UTC offset (the singer-sdk parses
+      '...+02:00' into ``timezone(timedelta(hours=2))``) becomes text in the
+      exact form pyarrow already gives named zones,
+      '2024-01-01 10:00:00.000000+0200'. pyarrow looks a fixed offset up as a
+      zone name and fails the batch ("Cannot locate timezone '+02:00'"). UTC,
+      named zones and naive values are left to pyarrow, so their staged text
+      is unchanged.
     - A Decimal becomes a float (the previous behaviour).
     """
-    if isinstance(value, datetime) and value.tzinfo is not None:
-        return value.isoformat(sep=" ")
+    if (
+        isinstance(value, datetime)
+        and isinstance(value.tzinfo, timezone)
+        and value.utcoffset() != timedelta(0)
+    ):
+        return value.strftime("%Y-%m-%d %H:%M:%S.%f%z")
     if isinstance(value, Decimal):
         return float(value)
     return value

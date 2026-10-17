@@ -1319,6 +1319,19 @@ class TestTimezoneOffsets:
         con = duckdb.connect()
         con.execute("SET TimeZone = 'UTC'")
         con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        self._load_into(con, tmp_path, records, convert_tz_to_utc=convert_tz_to_utc)
+        return con
+
+    @staticmethod
+    def _load_into(
+        con: duckdb.DuckDBPyConnection,
+        tmp_path: Path,
+        records: list[dict],
+        *,
+        convert_tz_to_utc: bool = False,
+        key_properties: tuple[str, ...] = ("id",),
+    ) -> None:
+        """Merge each record as its own batch through the real sink."""
         config = {
             "catalog_url": "test.db",
             "data_path": str(tmp_path / "data"),
@@ -1347,13 +1360,12 @@ class TestTimezoneOffsets:
                 target=target,
                 stream_name="t",
                 schema=schema,
-                key_properties=["id"],
+                key_properties=list(key_properties),
                 connector=connector,
             )
             sink.setup()
             for record in records:
                 sink.process_batch({"records": [record]})
-        return con
 
     @pytest.mark.parametrize("offset", ["+02:00", "-07:00", "+05:30"])
     @pytest.mark.parametrize("convert", ["keep-offset", "convert-to-utc"])
@@ -1378,6 +1390,37 @@ class TestTimezoneOffsets:
             expected_wall_clock.strftime("%Y-%m-%d %H:%M:%S"),
             value.timestamp(),
         )
+
+    def test_utc_text_unchanged_for_existing_varchar_key(self, tmp_path: Path):
+        """A VARCHAR key written by earlier versions still matches a UTC value.
+
+        Earlier versions staged a UTC datetime as '2024-01-01 10:00:00.000000Z'.
+        A table whose column is VARCHAR (created before the stream declared
+        date-time) must keep getting that exact text, or merges miss old rows.
+        """
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        con.execute("CREATE SCHEMA ducklake_catalog.s")
+        con.execute(
+            "CREATE TABLE ducklake_catalog.s.t "
+            '(id VARCHAR, "at" VARCHAR, at_tz VARCHAR)'
+        )
+        con.execute(
+            "INSERT INTO ducklake_catalog.s.t VALUES "
+            "('a', '2024-01-01 10:00:00.000000Z', '2024-01-01 10:00:00.000000Z')"
+        )
+        value = datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc)
+        self._load_into(
+            con,
+            tmp_path,
+            [{"id": "a", "at": value, "at_tz": value}],
+            key_properties=("at",),
+        )
+        rows = con.execute(
+            'SELECT id, "at" FROM ducklake_catalog.s.t ORDER BY "at"'
+        ).fetchall()
+        assert rows == [("a", "2024-01-01 10:00:00.000000Z")]
 
     def test_fixed_offset_key_remerges(self, tmp_path: Path):
         """A key built from an offset timestamp is replaced on re-merge."""
