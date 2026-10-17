@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -1297,6 +1297,101 @@ class TestMergeKeyTableTypes:
         value = datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc)
         rows = self._load_twice(con, tmp_path, key_prop, value, ["k"])
         assert rows == [("a", "second")]
+
+
+class TestTimezoneOffsets:
+    """Timestamps with any fixed UTC offset load, with or without convert_tz_to_utc.
+
+    The singer-sdk parses '2024-01-01T10:00:00+02:00' into a datetime with a
+    fixed-offset tzinfo; those records are fed to the real sink here.
+    """
+
+    OFFSETS: ClassVar[dict[str, timedelta]] = {
+        "+02:00": timedelta(hours=2),
+        "-07:00": timedelta(hours=-7),
+        "+05:30": timedelta(hours=5, minutes=30),
+    }
+
+    def _load(
+        self, tmp_path: Path, records: list[dict], *, convert_tz_to_utc: bool
+    ) -> duckdb.DuckDBPyConnection:
+        """Merge each record as its own batch on key ``id``; return the catalog."""
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        config = {
+            "catalog_url": "test.db",
+            "data_path": str(tmp_path / "data"),
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging"),
+            "load_method": "merge",
+            "convert_tz_to_utc": convert_tz_to_utc,
+        }
+        target = Mock()
+        target.config = config
+        connector = DuckLakeConnector(config)
+        date_time = {"type": "string", "format": "date-time"}
+        schema = {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "at": date_time,
+                "at_tz": {**date_time, "x-sql-datatype": "timestamptz"},
+            },
+        }
+        with patch.object(
+            connector, "execute", side_effect=lambda sql: con.execute(sql)
+        ):
+            sink = ducklakeSink(
+                target=target,
+                stream_name="t",
+                schema=schema,
+                key_properties=["id"],
+                connector=connector,
+            )
+            sink.setup()
+            for record in records:
+                sink.process_batch({"records": [record]})
+        return con
+
+    @pytest.mark.parametrize("offset", ["+02:00", "-07:00", "+05:30"])
+    @pytest.mark.parametrize("convert", ["keep-offset", "convert-to-utc"])
+    def test_fixed_offset_loads(self, tmp_path: Path, offset: str, convert: str):
+        """Fixed offsets stage and load; TIMESTAMPTZ always holds the instant.
+
+        A plain DATETIME column keeps the wall-clock time unless
+        convert_tz_to_utc converts it to UTC first, as for named zones.
+        """
+        value = datetime(2024, 1, 1, 10, 0, tzinfo=timezone(self.OFFSETS[offset]))
+        con = self._load(
+            tmp_path,
+            [{"id": "a", "at": value, "at_tz": value}],
+            convert_tz_to_utc=convert == "convert-to-utc",
+        )
+        row = con.execute(
+            'SELECT "at"::VARCHAR, epoch(at_tz) FROM ducklake_catalog.s.t'
+        ).fetchone()
+        utc = value.astimezone(timezone.utc).replace(tzinfo=None)
+        expected_wall_clock = utc if convert == "convert-to-utc" else value
+        assert row == (
+            expected_wall_clock.strftime("%Y-%m-%d %H:%M:%S"),
+            value.timestamp(),
+        )
+
+    def test_fixed_offset_key_remerges(self, tmp_path: Path):
+        """A key built from an offset timestamp is replaced on re-merge."""
+        value = datetime(2024, 1, 1, 10, 0, tzinfo=timezone(timedelta(hours=2)))
+        con = self._load(
+            tmp_path,
+            [
+                {"id": "a", "at": value, "at_tz": value},
+                {"id": "a", "at": value, "at_tz": value},
+            ],
+            convert_tz_to_utc=False,
+        )
+        count = con.execute("SELECT count(*) FROM ducklake_catalog.s.t").fetchone()
+        assert count == (1,)
 
 
 class TestErrorHandling:

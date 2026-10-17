@@ -286,7 +286,11 @@ class Targetducklake(SQLTarget):
             default=False,
             title="Convert TZ to UTC",
             description=(
-                "When True, automatically converts timezone of timestamp-like fields to UTC."
+                "When True, converts timezone-aware date-time values to UTC before "
+                "loading, so a timestamp column without time zone stores the UTC "
+                "time. When False, such a column stores each value's local "
+                "wall-clock time (its offset is dropped). A timestamptz column "
+                "stores the correct instant either way."
             ),
         ),
         th.Property(

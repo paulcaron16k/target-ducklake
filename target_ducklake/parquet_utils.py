@@ -115,11 +115,7 @@ def flatten_schema_to_pyarrow_schema(flatten_schema_dictionary: dict) -> pa.Sche
 
 
 def _normalize_datetime(value):
-    """Normalize datetime objects to UTC timezone for PyArrow compatibility.
-
-    PyArrow doesn't recognize custom timezone strings like 'UTC-07:00'.
-    This function converts datetime objects with any timezone to UTC.
-    """
+    """Convert a timezone-aware datetime to UTC (used with convert_tz_to_utc)."""
     if isinstance(value, datetime) and value.tzinfo is not None:
         # Convert to UTC timezone
         return value.astimezone(timezone.utc)
@@ -156,12 +152,28 @@ def _to_decimal(value: object, scale: int) -> Decimal | None:
     return value.quantize(Decimal(1).scaleb(-scale), context=_DECIMAL_CONTEXT)
 
 
+def _to_staged_value(value: object) -> object:
+    """Prepare a value for a non-decimal column.
+
+    - A timezone-aware datetime becomes ISO text carrying its own offset
+      ('2024-01-01 10:00:00+02:00'). pyarrow renders a named zone that way
+      itself, but looks a fixed offset such as +02:00 up as a zone name and
+      fails; the text keeps the instant for TIMESTAMPTZ columns, and a
+      TIMESTAMP column keeps the wall-clock time, as for named zones.
+    - A Decimal becomes a float (the previous behaviour).
+    """
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return value.isoformat(sep=" ")
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
+
+
 def _coerce_column(values: list, field: pa.Field) -> list:
     """Coerce Python values so pyarrow can build the column with the field's type."""
     if pa.types.is_decimal(field.type):
         return [_to_decimal(v, field.type.scale) for v in values]
-    # Non-number columns keep the previous behaviour: Decimals become floats.
-    return [float(v) if isinstance(v, Decimal) else v for v in values]
+    return [_to_staged_value(v) for v in values]
 
 
 def create_pyarrow_table(
@@ -169,12 +181,17 @@ def create_pyarrow_table(
 ) -> pa.Table:
     """Create a pyarrow Table from a python list of dict."""
     data = {
-        field.name: _coerce_column([row.get(field.name) for row in list_dict], field)
+        field.name: [row.get(field.name) for row in list_dict]
         for field in pyarrow_schema
     }
-    # Normalize datetime values to UTC timezone for PyArrow compatibility
+    # With convert_tz_to_utc, move aware datetimes to UTC before they are
+    # formatted as text below.
     normalized_data = _normalize_data_for_pyarrow(data, datetime_fields)
-    return pa.table(normalized_data).cast(pyarrow_schema)
+    coerced = {
+        field.name: _coerce_column(normalized_data[field.name], field)
+        for field in pyarrow_schema
+    }
+    return pa.table(coerced).cast(pyarrow_schema)
 
 
 def concat_tables(
