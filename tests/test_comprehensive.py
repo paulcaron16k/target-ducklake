@@ -556,6 +556,10 @@ class TestDecimalPrecision:
             ({"type": "number", "x-sql-datatype": "decimal(65,30)"}, (38, 9)),
             ({"type": "number", "x-sql-datatype": "numeric(60,10)"}, (38, 9)),
             ({"type": "number", "precision": 50}, (38, 9)),
+            ({"type": "number", "x-sql-datatype": "numeric(39,0)"}, (38, 0)),
+            ({"type": "number", "x-sql-datatype": "numeric(39,39)"}, (38, 38)),
+            # No integer digits declared, so none are kept.
+            ({"type": "number", "precision": 50, "scale": 60}, (38, 38)),
         ],
         ids=[
             "hint-keeps-integer-digits",
@@ -564,6 +568,9 @@ class TestDecimalPrecision:
             "mysql-max-keeps-default-scale",
             "integer-digits-beyond-38",
             "precision-only",
+            "integer-only",
+            "fraction-only",
+            "keys-scale-above-precision",
         ],
     )
     def test_precision_above_38_keeps_integer_digits(
@@ -577,7 +584,7 @@ class TestDecimalPrecision:
         """A hint that fits DuckDB is used exactly, without a warning."""
         jsonschema = {"type": "number", "x-sql-datatype": "numeric(38,38)"}
         assert number_precision_and_scale(jsonschema) == (38, 38)
-        assert not [w for w in recwarn if "38-digit" in str(w.message)]
+        assert not recwarn.list
 
     @pytest.mark.filterwarnings("ignore:.*38-digit DECIMAL")
     def test_capped_hint_loads_values_through_duckdb(self, tmp_path: Path):
@@ -596,6 +603,7 @@ class TestDecimalPrecision:
         con.execute(f"CREATE TABLE t (amount {ddl})")
         con.execute(f"INSERT INTO t SELECT amount FROM '{path}'")
         assert ddl == "DECIMAL(38, 33)"
+        assert schema.field("amount").type == pa.decimal128(38, 33)
         assert [r[0] for r in con.execute("SELECT amount FROM t").fetchall()] == values
 
 
