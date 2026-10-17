@@ -180,6 +180,9 @@ def flatten_schema(
 
     for k, prop in d["properties"].items():
         new_key = flatten_key(k, parent_key, sep)
+        if not isinstance(prop, dict):  # a boolean schema: true allows any value
+            items.append((new_key, UNTYPED_COLUMN))
+            continue
         # some schemas from airbyte sources have description field which is not needed and causes issues
         # (left out of a copy, so the caller's schema keeps it)
         v = {key: value for key, value in prop.items() if key != "description"}

@@ -541,6 +541,11 @@ class TestUntypedAndChoiceProperties:
         assert schema == original
         assert sorted(flatten_schema(schema)["u2"]["type"]) == ["null", "object"]
 
+    def test_boolean_property_schema_becomes_json_column(self):
+        """A boolean schema (true: any value) is a JSON column, not a crash."""
+        flat = flatten_schema({"type": "object", "properties": {"c": True}})
+        assert flat == {"c": self.JSON_COLUMN}
+
     def test_output_unchanged_for_schemas_that_loaded_before(self):
         """Every kind of property that flattened before still flattens the same."""
         schema = {
