@@ -658,19 +658,23 @@ class TestMergeKeyMatching:
             )
         return mock_execute.call_args[0][0]
 
-    def test_composite_key_uses_row_value(self):
+    def test_composite_key_matches_each_column(self):
         """Composite keys compare column by column instead of concatenating."""
         sql = self._merge_sql(["tenant", "id"])
         assert (
-            """WHERE ("tenant", "id") IN (SELECT "tenant", "id" FROM 'batch.parquet')"""
+            """USING (SELECT "tenant" AS "tenant", "id" AS "id" FROM 'batch.parquet')"""
             in sql
         )
+        assert (
+            'WHERE "target"."tenant" IS NOT DISTINCT FROM "staged"."tenant" '
+            'AND "target"."id" IS NOT DISTINCT FROM "staged"."id"'
+        ) in sql
         assert "||" not in sql
 
     def test_single_key(self):
-        """A single key still produces a simple IN comparison."""
+        """A single key produces a single NULL-safe comparison."""
         sql = self._merge_sql(["id"])
-        assert """WHERE ("id") IN (SELECT "id" FROM 'batch.parquet')""" in sql
+        assert 'WHERE "target"."id" IS NOT DISTINCT FROM "staged"."id";' in sql
 
     def test_keys_cast_to_table_types(self):
         """Each staged key is cast to its table column type; the table side isn't."""
@@ -678,8 +682,8 @@ class TestMergeKeyMatching:
             ["tenant", "ts", "d"], {"tenant": "VARCHAR", "ts": "TIMESTAMP", "d": "DATE"}
         )
         expected = (
-            '("tenant", "ts", "d") IN (SELECT CAST("tenant" AS VARCHAR), '
-            'CAST("ts" AS TIMESTAMP), CAST("d" AS DATE) FROM'
+            'USING (SELECT CAST("tenant" AS VARCHAR) AS "tenant", '
+            'CAST("ts" AS TIMESTAMP) AS "ts", CAST("d" AS DATE) AS "d" FROM'
         )
         assert expected in sql
         assert "::VARCHAR" not in sql
@@ -1147,6 +1151,99 @@ class TestMergeKeyTableTypes:
             ["UID"],
         )
         assert rows == [("a", "second")]
+
+    @pytest.mark.parametrize("key_shape", ["single", "composite"])
+    def test_null_key_value_matches_null(self, tmp_path: Path, key_shape: str):
+        """A NULL key value is replaced on re-merge, as the in-batch dedup does."""
+        keys = ["k", "id"] if key_shape == "composite" else ["k"]
+        key_prop = {"type": ["null", "string"]}
+        rows = self._load_twice(self._catalog(), tmp_path, key_prop, None, keys)
+        assert rows == [("a", "second")]
+
+    def _merge_batches(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        tmp_path: Path,
+        batches: list[list[dict]],
+    ) -> list[tuple]:
+        """Merge each batch on the composite key (k, id); return all rows."""
+        config = {
+            "catalog_url": "test.db",
+            "data_path": str(tmp_path / "data"),
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging"),
+            "load_method": "merge",
+        }
+        target = Mock()
+        target.config = config
+        connector = DuckLakeConnector(config)
+        nullable_string = {"type": ["null", "string"]}
+        schema = {
+            "type": "object",
+            "properties": {
+                "k": nullable_string,
+                "id": nullable_string,
+                "v": nullable_string,
+            },
+        }
+        with patch.object(
+            connector, "execute", side_effect=lambda sql: con.execute(sql)
+        ):
+            sink = ducklakeSink(
+                target=target,
+                stream_name="t",
+                schema=schema,
+                key_properties=["k", "id"],
+                connector=connector,
+            )
+            sink.setup()
+            for batch in batches:
+                sink.process_batch({"records": batch})
+        return con.execute(
+            "SELECT k, id, v FROM ducklake_catalog.s.t ORDER BY k NULLS FIRST, id, v"
+        ).fetchall()
+
+    def test_null_keys_stay_distinct_from_other_keys(self, tmp_path: Path):
+        """(NULL, a), (NULL, b) and (x, a) are three different composite keys."""
+        rows = self._merge_batches(
+            self._catalog(),
+            tmp_path,
+            [
+                [
+                    {"k": None, "id": "a", "v": "first"},
+                    {"k": None, "id": "b", "v": "first"},
+                    {"k": "x", "id": "a", "v": "first"},
+                ],
+                [{"k": None, "id": "a", "v": "second"}],
+            ],
+        )
+        assert rows == [
+            (None, "a", "second"),
+            (None, "b", "first"),
+            ("x", "a", "first"),
+        ]
+
+    def test_existing_null_key_duplicates_collapse(self, tmp_path: Path):
+        """Duplicate NULL-key rows left by the old merge collapse on the next merge.
+
+        This is the NULL-matches-NULL rule applied to existing data: the next
+        batch carrying that key replaces every copy of it.
+        """
+        con = self._catalog()
+        con.execute("CREATE SCHEMA ducklake_catalog.s")
+        con.execute(
+            "CREATE TABLE ducklake_catalog.s.t (k VARCHAR, id VARCHAR, v VARCHAR)"
+        )
+        con.execute(
+            "INSERT INTO ducklake_catalog.s.t VALUES "
+            "(NULL, 'a', 'copy1'), (NULL, 'a', 'copy2'), (NULL, 'a', 'copy3'), "
+            "('x', 'a', 'untouched')"
+        )
+        rows = self._merge_batches(
+            con, tmp_path, [[{"k": None, "id": "a", "v": "new"}]]
+        )
+        assert rows == [(None, "a", "new"), ("x", "a", "untouched")]
 
     def test_append_reads_table_metadata_once(self, tmp_path: Path):
         """Only merges need the key types; append streams don't pay for them."""
