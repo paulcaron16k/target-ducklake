@@ -14,8 +14,9 @@ Each entry mirrors its issue on the [Target DuckLake (Definite fork)](https://gi
 | [DUCKLKD-48](https://github.com/paulcaron16k/target-ducklake-definite/issues/48) | Merge keys are compared using the stream's declared type, not the table's column type | `bug/DUCKLKD-48_merge-key-table-types` (deleted after merge) | `xflow_dev` | DUCKLKD-18, DUCKLKD-19, DUCKLKD-21 | Done (squash `09a6e91` in `xflow_dev`); no upstream PR |
 | [DUCKLKD-49](https://github.com/paulcaron16k/target-ducklake-definite/issues/49) | NULL key values never match, so re-merging duplicates those rows | `bug/DUCKLKD-49_null-merge-keys` (deleted after merge) | `xflow_dev` | DUCKLKD-48 | Done (squash `8f83caf` in `xflow_dev`); no upstream PR |
 | [DUCKLKD-47](https://github.com/paulcaron16k/target-ducklake-definite/issues/47) | Timestamps with a non-UTC offset fail staging unless convert_tz_to_utc is set | `bug/DUCKLKD-47_non-utc-offsets` (deleted after merge) | `xflow_dev` | DUCKLKD-21 (timestamptz tests), DUCKLKD-48 | Done (squash `f06c733` in `xflow_dev`); no upstream PR |
+| [DUCKLKD-50](https://github.com/paulcaron16k/target-ducklake-definite/issues/50) | x-sql-datatype hints on anyOf properties are lost; invalid decimal hints produce invalid DDL | `bug/DUCKLKD-50_anyof-and-invalid-decimal-hints` (deleted after merge) | `xflow_dev` | DUCKLKD-21 | Done (squash `0bb2fe7` in `xflow_dev`); no upstream PR |
 
-**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`). DUCKLKD-21 (`683bd73`) extends `number_precision_and_scale` from DUCKLKD-16 and the temporal key set from DUCKLKD-19, so upstream it must follow both. DUCKLKD-48 (`09a6e91`) replaces DUCKLKD-19's temporal-only cast with a cast of every key to the table's actual type, so upstream it follows DUCKLKD-18, 19 and 21; offering DUCKLKD-19 without DUCKLKD-48 would reintroduce the UUID and REAL key failures. DUCKLKD-49 (`8f83caf`) rewrites the same DELETE as a NULL-safe `USING` join and renames DUCKLKD-48's helper, so upstream it follows DUCKLKD-48.
+**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`). DUCKLKD-21 (`683bd73`) extends `number_precision_and_scale` from DUCKLKD-16 and the temporal key set from DUCKLKD-19, so upstream it must follow both. DUCKLKD-48 (`09a6e91`) replaces DUCKLKD-19's temporal-only cast with a cast of every key to the table's actual type, so upstream it follows DUCKLKD-18, 19 and 21; offering DUCKLKD-19 without DUCKLKD-48 would reintroduce the UUID and REAL key failures. DUCKLKD-49 (`8f83caf`) rewrites the same DELETE as a NULL-safe `USING` join and renames DUCKLKD-48's helper, so upstream it follows DUCKLKD-48. DUCKLKD-50 (`0bb2fe7`) changes `decimal_hint` in `type_hints.py`, which DUCKLKD-21 introduces, and makes `flatten.py` import that module, so upstream it follows DUCKLKD-21.
 
 **Verification baseline.** Upstream `main` already has 556 ruff findings, 4 files the formatter would change, and 2 mypy errors in `sinks.py`. "No new findings" below means none added by the fix, compared against that baseline. Tests run with `uv run --python 3.12 pytest tests/` (the default Python 3.14 has no wheel for the pinned pyarrow 20; tracked as [DUCKLKD-32](https://github.com/paulcaron16k/target-ducklake-definite/issues/32)).
 
@@ -244,5 +245,56 @@ Meaning, documented in the README and the config schema: without `convert_tz_to_
 Independent Sonnet review, four rounds. Round 1: no blocking; should-fix findings reproduced and fixed (UTC text had changed to `+00:00`, breaking existing VARCHAR keys; unchanged behaviour wasn't tested); re-verification of that fix then caught a regression of mine (a batch mixing a fixed offset with other zones raised `ArrowTypeError`), fixed by rendering such columns as a whole. Round 2: no blocking; year-range overflow and seconds offsets fixed, wording corrected. Round 3: no blocking or should-fix; the overflow-fallback test added, a sub-second-offset nit declined. Round 4: no findings.
 
 Found, not fixed (pre-existing, filed): [DUCKLKD-55](https://github.com/paulcaron16k/target-ducklake-definite/issues/55) `convert_tz_to_utc` ignores unparsed date-time strings; [DUCKLKD-57](https://github.com/paulcaron16k/target-ducklake-definite/issues/57) without the setting, a mixed-zone column's wall-clock time depends on batch order. Also pre-existing and unchanged: with the setting on, a value whose UTC time leaves Python's year range fails the conversion.
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-50 x-sql-datatype hints on anyOf properties are lost; invalid decimal hints produce invalid DDL
+
+## Intent
+
+Found by the independent Sonnet review of PR #46 (DUCKLKD-21) on 2026-10-17, findings 4 and 7. A hint on the outer object of an anyOf property was dropped by `flatten_schema`, which keeps only the chosen non-null branch, so the column got its default type: VARCHAR instead of UUID, DECIMAL(38,9) instead of DECIMAL(12,4). `decimal_hint` accepted precisions and scales DuckDB's DECIMAL can't represent. `decimal(5,10)` was silently clamped to DECIMAL(5,5). `numeric(0,0)` on a number crashed sink creation (pyarrow precision 0); on a string it rendered the invalid DDL `DECIMAL(0, 0)`.
+
+## Acceptance
+
+- A hint on an anyOf property, outer or in the non-null branch, sets the column type and the staging type.
+- decimal/numeric hints with precision < 1 or scale > precision fall back to the default mapping with a warning instead of producing invalid or silently changed DDL.
+- Regression tests fail on the old code.
+
+## Evidence
+
+Squash-merged into `xflow_dev` as `0bb2fe7` through fork PR #58 (branch `bug/DUCKLKD-50_anyof-and-invalid-decimal-hints`, deleted after merge).
+- **Wrapper hint.** `flatten._with_wrapper_hint` copies the wrapper's `x-sql-datatype` into the chosen branch, unless the branch has a non-empty hint of its own, which wins. Only the hint is copied, so a wrapper `format` still leaves the column VARCHAR, and the caller's schema is not changed by the copy.
+- **Decimal validation.** `decimal_hint` returns None unless `precision >= 1 and scale <= precision`, so the column keeps its default mapping and the SDK warns. Precision above 38 is still capped later.
+
+Tests and verification:
+- `TestSqlDatatypeHints` has new cases:
+  - outer, inner, inner-wins and empty-inner hints;
+  - the wrapper `format` guard;
+  - the caller's schema left unchanged;
+  - an unsupported wrapper hint;
+  - three impossible decimal hints, and the valid edges `decimal(5,5)`, `decimal(5,0)`, `decimal(1,0)`;
+  - sink creation with `decimal(0,0)`.
+
+  The original fix's tests give 6 failures on the pre-PR code; the inner-hint cases already passed and are pinned.
+- `xflow_dev` suite: 202 passed. No new ruff, format or mypy findings; `flatten_schema` complexity is unchanged.
+- On a local DuckLake through the sink:
+  - an outer-hinted UUID key created a UUID column and re-merged to one row;
+  - outer `numeric(12,4)` stored exact values;
+  - `decimal(0,0)` fell back to DECIMAL(38,9).
+- An existing table created before this fix (VARCHAR, DECIMAL(38,9)) keeps its types and keeps merging once the hints apply. Only new tables get the hinted types.
+
+Independent Sonnet review, two rounds:
+- **Round 1:** no blocking findings.
+  - Fixed: an empty branch hint hid the wrapper's (`e076a69`, failing test first); missing tests (`82f598c`); docstring wording (`b78057f`).
+  - Verified on real DuckLake, no change: existing tables keep loading.
+  - Declined, out of scope or file convention: the hint/JSON-type mismatch, the `anyOf` crash and in-place mutation, and the test lint convention.
+- **Round 2:** nothing blocking; two optional test nits declined.
+
+Found, not fixed (pre-existing, filed):
+- [DUCKLKD-59](https://github.com/paulcaron16k/target-ducklake-definite/issues/59): a decimal hint above precision 38 caps the scale with it, so `numeric(50,45)` becomes DECIMAL(38,38) and any value of 1 or more fails.
+- [DUCKLKD-60](https://github.com/paulcaron16k/target-ducklake-definite/issues/60): `flatten_schema` crashes on an all-null or untyped anyOf branch and mutates the caller's schema.
+- [DUCKLKD-61](https://github.com/paulcaron16k/target-ducklake-definite/issues/61): a hint that conflicts with the JSON type gives different DDL and staging types.
 
 Upstream PR: not opened.
