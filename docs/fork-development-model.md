@@ -149,6 +149,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-18](https://github.com/paulcaron16k/target-ducklake-definite/issues/18) Match composite keys per column | `general/DUCKLKD-18_composite-key-merge` (`48b523d`) | — | In fork, PR not opened |
 | [DUCKLKD-19](https://github.com/paulcaron16k/target-ducklake-definite/issues/19) Temporal merge keys never match | squash `4466be0` (fork PR #45) | — | In fork, PR not opened |
 | [DUCKLKD-21](https://github.com/paulcaron16k/target-ducklake-definite/issues/21) Honour x-sql-datatype hints | squash `683bd73` (fork PR #46) | — | In fork, PR not opened |
+| [DUCKLKD-48](https://github.com/paulcaron16k/target-ducklake-definite/issues/48) Merge keys cast to the table's column types | squash `09a6e91` (fork PR #52) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 

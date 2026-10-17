@@ -11,8 +11,9 @@ Each entry mirrors its issue on the [Target DuckLake (Definite fork)](https://gi
 | [DUCKLKD-18](https://github.com/paulcaron16k/target-ducklake-definite/issues/18) | Composite merge keys collide and delete unrelated rows | `general/DUCKLKD-18_composite-key-merge` | `origin/main` `e9dc3f3` | — | Done (in `xflow_dev`); no upstream PR |
 | [DUCKLKD-19](https://github.com/paulcaron16k/target-ducklake-definite/issues/19) | Merges keyed on a timestamp never match, so every run duplicates rows | `bug/DUCKLKD-19_timestamp-merge-keys` (deleted after merge) | `xflow_dev` | DUCKLKD-18 | Done (squash `4466be0` in `xflow_dev`); no upstream PR |
 | [DUCKLKD-21](https://github.com/paulcaron16k/target-ducklake-definite/issues/21) | Honour x-sql-datatype hints in type mapping | `story/DUCKLKD-21_x-sql-datatype-hints` (deleted after merge) | `xflow_dev` | DUCKLKD-16, DUCKLKD-19 | Done (squash `683bd73` in `xflow_dev`); no upstream PR |
+| [DUCKLKD-48](https://github.com/paulcaron16k/target-ducklake-definite/issues/48) | Merge keys are compared using the stream's declared type, not the table's column type | `bug/DUCKLKD-48_merge-key-table-types` (deleted after merge) | `xflow_dev` | DUCKLKD-18, DUCKLKD-19, DUCKLKD-21 | Done (squash `09a6e91` in `xflow_dev`); no upstream PR |
 
-**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`). DUCKLKD-21 (`683bd73`) extends `number_precision_and_scale` from DUCKLKD-16 and the temporal key set from DUCKLKD-19, so upstream it must follow both.
+**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`). DUCKLKD-21 (`683bd73`) extends `number_precision_and_scale` from DUCKLKD-16 and the temporal key set from DUCKLKD-19, so upstream it must follow both. DUCKLKD-48 (`09a6e91`) replaces DUCKLKD-19's temporal-only cast with a cast of every key to the table's actual type, so upstream it follows DUCKLKD-18, 19 and 21; offering DUCKLKD-19 without DUCKLKD-48 would reintroduce the UUID and REAL key failures.
 
 **Verification baseline.** Upstream `main` already has 556 ruff findings, 4 files the formatter would change, and 2 mypy errors in `sinks.py`. "No new findings" below means none added by the fix, compared against that baseline. Tests run with `uv run --python 3.12 pytest tests/` (the default Python 3.14 has no wheel for the pinned pyarrow 20; tracked as [DUCKLKD-32](https://github.com/paulcaron16k/target-ducklake-definite/issues/32)).
 
@@ -107,6 +108,8 @@ On a local DuckLake, the current comparison matched **zero** rows, for both whol
 
 ## Evidence
 
+> **Superseded in part by [DUCKLKD-48](https://github.com/paulcaron16k/target-ducklake-definite/issues/48):** `temporal_key_types` and the temporal-only cast described below were replaced by `key_column_types`, which casts every key to the table's actual column type.
+
 Squash-merged into `xflow_dev` as `4466be0` through fork PR #45 (branch `bug/DUCKLKD-19_timestamp-merge-keys`, deleted after merge). For each DATETIME, DATE or TIME key, the staged side is cast to the column's type, which is the cast `INSERT` applies; the table side is compared natively. `merge_into_table` takes `temporal_key_types` (column → type) instead of `date_type_keys`, built by the sink from the DuckLake schema.
 
 Old behaviour reproduced: DATETIME keys duplicated on every re-merge (naive whole-second, fractional and UTC-aware values); DATE and TIME keys failed with `Binder Error: Cannot compare values of type DATE and VARCHAR in IN/ANY/ALL clause`. New SQL checked on a local DuckLake (DuckDB 1.5.2): three re-merges with a composite temporal + id key leave one row per key with the latest values, unpartitioned and partitioned by `year(k)`, `month(k)` and `k`. New `TestTemporalMergeKeys` (5 re-merge cases plus a sink test); `xflow_dev` suite: 89 passed. No new ruff or mypy findings.
@@ -137,6 +140,8 @@ Database taps declare each source column's own type in `x-sql-datatype` (smallin
 
 ## Evidence
 
+> **Superseded in part by [DUCKLKD-48](https://github.com/paulcaron16k/target-ducklake-definite/issues/48):** the shared temporal key set (`TEMPORAL_TYPES`) mentioned below was removed; merge keys are now cast to the table's actual column types. The independent review of this PR found the UUID-key regression fixed there.
+
 Squash-merged into `xflow_dev` as `683bd73` through fork PR #46 (branch `story/DUCKLKD-21_x-sql-datatype-hints`, deleted after merge). A new `type_hints.py` holds the vocabulary and is used by both the DDL (`JSONSchemaToDuckLake.to_sql_type`) and the parquet staging, so they can't disagree:
 
 | Hint (case and spacing ignored) | DuckDB type |
@@ -155,5 +160,31 @@ Decimal hints stage at the hinted precision; float hints stage as float64 (decim
 Deliberately unsupported: `timetz` (on a local DuckLake, `10:00+02` was stored as `10:00+00`: the Parquet write drops the offset without converting), `datetime` (MySQL's meaning is the opposite of ISO's), `tinyint` (MySQL booleans) and binary hints (base64 needs a decode on insert). An unqualified `float` maps to DOUBLE, unlike target-iceberg. Existing tables keep their column types except through the existing safe widenings.
 
 `TestSqlDatatypeHints` has 43 cases; 36 fail on the old code (the 7 fallback and no-hint cases pass by design). `xflow_dev` suite: 132 passed. No new ruff or mypy findings; `type_hints.py` fully clean. Verified on a local DuckLake (DuckDB 1.5.2): every hinted type created, partitioned by `year("at")`, and a composite (`id`, `timestamptz`) re-merge left one row with exact values. Found, not fixed: non-UTC offsets fail staging unless `convert_tz_to_utc` is set, filed as [DUCKLKD-47](https://github.com/paulcaron16k/target-ducklake-definite/issues/47).
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-48 Merge keys are compared using the stream's declared type, not the table's column type
+
+## Intent
+
+Found by the independent Sonnet review of PR #46 (DUCKLKD-21) on 2026-10-17 and reproduced on `xflow_dev`. The merge DELETE cast staged keys only for temporal types, and to the type the stream declares rather than the column type the table actually has. UUID key columns (from an `x-sql-datatype: uuid` hint, a DUCKLKD-21 regression, or the SDK's own `format: uuid`, pre-existing) failed every merge with `Cannot compare values of type UUID and VARCHAR in IN/ANY/ALL clause`. REAL keys never matched (table `0.10000000149` vs staged float64 `0.1`), so every run duplicated the row. An existing TIMESTAMP column whose stream now hints `timestamptz` was cast to TIMESTAMPTZ; with timezone-aware values and a non-UTC session TimeZone each run duplicated the row.
+
+## Acceptance
+
+- Every staged merge key is cast to the target table's actual column type, read from the table.
+- Re-merging leaves one row per key for VARCHAR, BIGINT, INTEGER, SMALLINT, DECIMAL, REAL, DOUBLE, UUID, DATE, TIME, TIMESTAMP and TIMESTAMPTZ keys, alone and composite.
+- Existing tables whose column type differs from the stream's hint merge correctly, including under a non-UTC session TimeZone.
+- Regression tests reproduce the crash and the duplicates on the old code by assertion, not by TypeError.
+- No new ruff or mypy findings.
+
+## Evidence
+
+Squash-merged into `xflow_dev` as `09a6e91` through fork PR #52 (branch `bug/DUCKLKD-48_merge-key-table-types`, deleted after merge). The sink reads the table's column types once, on the first merge (`_key_column_types()`), matches key names case-insensitively (the singer-sdk lowercases `key_properties` while columns keep the property's case), and passes `key_column_types` to `merge_into_table`, which casts every staged key to its column's type: the same cast `INSERT` applies. `type_hints.TEMPORAL_TYPES` was removed.
+
+`TestMergeKeyTableTypes` has 31 cases through the real sink lifecycle (`setup()` plus two `process_batch()` calls on an in-memory catalog, session TimeZone `America/New_York`): 13 key types single and composite, an upper-case key, an existing TIMESTAMP table with a `timestamptz` hint, and the append query count. 8 regression cases fail on the pre-PR code: REAL x2 and the existing table by duplicate-row assertion; `uuid` format x2, `uuid` hint x2 and the upper-case key by the binder error. `xflow_dev` suite: 162 passed; no new ruff, format or mypy findings. On a local DuckLake (non-UTC session, composite keys), REAL, UUID, an upper-case UUID key, TIMESTAMPTZ partitioned by `year(k)`, DATE by `month(k)` and DECIMAL with identity partitioning each left one row per key after three merges.
+
+Independent Sonnet review: no blocking findings; two should-fix findings reproduced and fixed in their own commits (`3f9e8f5` case-insensitive key matching, `f6171d7` key types read only when merging); three nits (mock test removed, matrix run under a non-UTC zone with a BOOLEAN key, docs/format note needing no PR change). Follow-up review of those commits: no blocking or should-fix findings; one nit declined with reasoning on the PR. Found and filed: [DUCKLKD-53](https://github.com/paulcaron16k/target-ducklake-definite/issues/53), `prepare_table` matching column names case-sensitively.
 
 Upstream PR: not opened.
