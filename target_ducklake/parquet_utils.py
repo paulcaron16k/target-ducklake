@@ -64,8 +64,9 @@ def _capped_to_38(precision: int, scale: int) -> tuple[int, int]:
     which can't hold 1. They are never dropped below ``min(scale, 9)``, the
     default scale, so a money column keeps its cents (``numeric(40,2)`` gives
     DECIMAL(38, 2)) and a capped type never keeps fewer fraction digits than
-    the DECIMAL(38, 9) default. Integer digits beyond what is left can't be
-    represented; such values fail the load, as they would in DECIMAL(38, 9).
+    the DECIMAL(38, 9) default. A value with more integer digits than are left
+    fails the batch at staging (``decimal.InvalidOperation`` in
+    ``_to_decimal``), as it would with DECIMAL(38, 9).
     """
     integer_digits = precision - scale
     fraction_floor = min(scale, DECIMAL_DEFAULT_SCALE)
