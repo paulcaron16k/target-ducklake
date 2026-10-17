@@ -1,6 +1,6 @@
 # taken from https://github.com/Automattic/target-parquet/blob/master/target_parquet/utils/parquet.py
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_EVEN, Context, Decimal
 
 import pyarrow as pa
@@ -115,11 +115,7 @@ def flatten_schema_to_pyarrow_schema(flatten_schema_dictionary: dict) -> pa.Sche
 
 
 def _normalize_datetime(value):
-    """Normalize datetime objects to UTC timezone for PyArrow compatibility.
-
-    PyArrow doesn't recognize custom timezone strings like 'UTC-07:00'.
-    This function converts datetime objects with any timezone to UTC.
-    """
+    """Convert a timezone-aware datetime to UTC (used with convert_tz_to_utc)."""
     if isinstance(value, datetime) and value.tzinfo is not None:
         # Convert to UTC timezone
         return value.astimezone(timezone.utc)
@@ -156,11 +152,68 @@ def _to_decimal(value: object, scale: int) -> Decimal | None:
     return value.quantize(Decimal(1).scaleb(-scale), context=_DECIMAL_CONTEXT)
 
 
+def _has_fixed_offset(value: object) -> bool:
+    """Whether a value is a datetime with a fixed, non-zero UTC offset.
+
+    The singer-sdk parses '...+02:00' into ``timezone(timedelta(hours=2))``.
+    pyarrow looks such an offset up as a zone name and fails the whole batch
+    ("Cannot locate timezone '+02:00'").
+    """
+    return (
+        isinstance(value, datetime)
+        and isinstance(value.tzinfo, timezone)
+        and value.utcoffset() != timedelta(0)
+    )
+
+
+def _datetime_text(value: datetime) -> str:
+    """Render a datetime as ISO text that DuckDB reads exactly.
+
+    Naive: '2024-01-01 10:00:00.000000'; UTC: '...000000Z'; any other zone or
+    offset: its own local time and offset, '...000000+02:00' (with seconds,
+    '+02:00:30', when the offset has them). A named zone's local time that
+    doesn't exist (a DST gap) is normalised through UTC first, as pyarrow does;
+    fixed offsets have no gaps, so they skip that round trip, which would
+    overflow at the edges of the year range.
+    """
+    if value.tzinfo is None:
+        return _wall_clock_text(value)
+    if value.tzinfo is timezone.utc:
+        return _wall_clock_text(value) + "Z"
+    local = value
+    if not isinstance(value.tzinfo, timezone):
+        try:
+            local = value.astimezone(timezone.utc).astimezone(value.tzinfo)
+        except OverflowError:
+            local = value
+    return _wall_clock_text(local) + _offset_text(local.utcoffset())
+
+
+def _wall_clock_text(value: datetime) -> str:
+    """'YYYY-MM-DD HH:MM:SS.ffffff' with a zero-padded year (strftime's %Y isn't)."""
+    return value.replace(tzinfo=None).isoformat(sep=" ", timespec="microseconds")
+
+
+def _offset_text(offset: timedelta | None) -> str:
+    """'+HH:MM', or '+HH:MM:SS' when the offset has seconds (DuckDB reads both)."""
+    seconds = int((offset or timedelta(0)).total_seconds())
+    sign = "-" if seconds < 0 else "+"
+    hours, rest = divmod(abs(seconds), 3600)
+    minutes, secs = divmod(rest, 60)
+    text = f"{sign}{hours:02d}:{minutes:02d}"
+    return f"{text}:{secs:02d}" if secs else text
+
+
 def _coerce_column(values: list, field: pa.Field) -> list:
     """Coerce Python values so pyarrow can build the column with the field's type."""
     if pa.types.is_decimal(field.type):
         return [_to_decimal(v, field.type.scale) for v in values]
-    # Non-number columns keep the previous behaviour: Decimals become floats.
+    if any(_has_fixed_offset(v) for v in values):
+        # pyarrow can't build this column, so render every datetime in it as
+        # text, each in its own offset. Columns without fixed offsets are left
+        # to pyarrow, so what loaded before stages byte-for-byte the same.
+        values = [_datetime_text(v) if isinstance(v, datetime) else v for v in values]
+    # Decimals in non-number columns become floats (the previous behaviour).
     return [float(v) if isinstance(v, Decimal) else v for v in values]
 
 
@@ -169,12 +222,17 @@ def create_pyarrow_table(
 ) -> pa.Table:
     """Create a pyarrow Table from a python list of dict."""
     data = {
-        field.name: _coerce_column([row.get(field.name) for row in list_dict], field)
+        field.name: [row.get(field.name) for row in list_dict]
         for field in pyarrow_schema
     }
-    # Normalize datetime values to UTC timezone for PyArrow compatibility
+    # With convert_tz_to_utc, move aware datetimes to UTC before they are
+    # formatted as text below.
     normalized_data = _normalize_data_for_pyarrow(data, datetime_fields)
-    return pa.table(normalized_data).cast(pyarrow_schema)
+    coerced = {
+        field.name: _coerce_column(normalized_data[field.name], field)
+        for field in pyarrow_schema
+    }
+    return pa.table(coerced).cast(pyarrow_schema)
 
 
 def concat_tables(

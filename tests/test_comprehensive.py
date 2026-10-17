@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import Mock, patch
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pyarrow as pa
@@ -1297,6 +1298,307 @@ class TestMergeKeyTableTypes:
         value = datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc)
         rows = self._load_twice(con, tmp_path, key_prop, value, ["k"])
         assert rows == [("a", "second")]
+
+
+class TestTimezoneOffsets:
+    """Timestamps with any fixed UTC offset load, with or without convert_tz_to_utc.
+
+    The singer-sdk parses '2024-01-01T10:00:00+02:00' into a datetime with a
+    fixed-offset tzinfo; those records are fed to the real sink here.
+    """
+
+    OFFSETS: ClassVar[dict[str, timedelta]] = {
+        "+02:00": timedelta(hours=2),
+        "-07:00": timedelta(hours=-7),
+        "+05:30": timedelta(hours=5, minutes=30),
+    }
+
+    def _load(
+        self, tmp_path: Path, records: list[dict], *, convert_tz_to_utc: bool
+    ) -> duckdb.DuckDBPyConnection:
+        """Merge each record as its own batch on key ``id``; return the catalog."""
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        self._load_into(
+            con,
+            tmp_path,
+            [[record] for record in records],
+            convert_tz_to_utc=convert_tz_to_utc,
+        )
+        return con
+
+    @staticmethod
+    def _load_into(
+        con: duckdb.DuckDBPyConnection,
+        tmp_path: Path,
+        batches: list[list[dict]],
+        *,
+        convert_tz_to_utc: bool = False,
+        key_properties: tuple[str, ...] = ("id",),
+    ) -> None:
+        """Merge each batch of records through the real sink."""
+        config = {
+            "catalog_url": "test.db",
+            "data_path": str(tmp_path / "data"),
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging"),
+            "load_method": "merge",
+            "convert_tz_to_utc": convert_tz_to_utc,
+        }
+        target = Mock()
+        target.config = config
+        connector = DuckLakeConnector(config)
+        date_time = {"type": "string", "format": "date-time"}
+        schema = {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "at": date_time,
+                "at_tz": {**date_time, "x-sql-datatype": "timestamptz"},
+            },
+        }
+        with patch.object(
+            connector, "execute", side_effect=lambda sql: con.execute(sql)
+        ):
+            sink = ducklakeSink(
+                target=target,
+                stream_name="t",
+                schema=schema,
+                key_properties=list(key_properties),
+                connector=connector,
+            )
+            sink.setup()
+            for batch in batches:
+                sink.process_batch({"records": batch})
+
+    @pytest.mark.parametrize("offset", ["+02:00", "-07:00", "+05:30"])
+    @pytest.mark.parametrize("convert", ["keep-offset", "convert-to-utc"])
+    def test_fixed_offset_loads(self, tmp_path: Path, offset: str, convert: str):
+        """Fixed offsets stage and load; TIMESTAMPTZ always holds the instant.
+
+        A plain DATETIME column keeps the wall-clock time unless
+        convert_tz_to_utc converts it to UTC first, as for named zones.
+        """
+        value = datetime(2024, 1, 1, 10, 0, tzinfo=timezone(self.OFFSETS[offset]))
+        con = self._load(
+            tmp_path,
+            [{"id": "a", "at": value, "at_tz": value}],
+            convert_tz_to_utc=convert == "convert-to-utc",
+        )
+        row = con.execute(
+            'SELECT "at"::VARCHAR, epoch(at_tz) FROM ducklake_catalog.s.t'
+        ).fetchone()
+        utc = value.astimezone(timezone.utc).replace(tzinfo=None)
+        expected_wall_clock = utc if convert == "convert-to-utc" else value
+        assert row == (
+            expected_wall_clock.strftime("%Y-%m-%d %H:%M:%S"),
+            value.timestamp(),
+        )
+
+    @pytest.mark.parametrize("convert", ["keep-offset", "convert-to-utc"])
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            # expected = (wall clock, wall clock with convert_tz_to_utc, instant).
+            # Naive: loaded as given; TIMESTAMPTZ reads it in the session zone.
+            (
+                datetime(2024, 1, 1, 10, 0),  # noqa: DTZ001
+                (
+                    "2024-01-01 10:00:00",
+                    "2024-01-01 10:00:00",
+                    "2024-01-01 15:00:00+00",
+                ),
+            ),
+            (
+                datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc),
+                (
+                    "2024-01-01 10:00:00",
+                    "2024-01-01 10:00:00",
+                    "2024-01-01 10:00:00+00",
+                ),
+            ),
+            (
+                datetime(2024, 1, 1, 10, 0, tzinfo=ZoneInfo("Europe/Paris")),
+                (
+                    "2024-01-01 10:00:00",
+                    "2024-01-01 09:00:00",
+                    "2024-01-01 09:00:00+00",
+                ),
+            ),
+        ],
+        ids=["naive", "utc", "europe-paris"],
+    )
+    def test_values_that_loaded_before_are_unchanged(
+        self,
+        tmp_path: Path,
+        value: datetime,
+        expected: tuple[str, str, str],
+        convert: str,
+    ):
+        """Naive, UTC and named-zone values load as they did before the fix.
+
+        Runs under a non-UTC session time zone, which DuckDB uses to read
+        naive text into TIMESTAMPTZ.
+        """
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'America/New_York'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        self._load_into(
+            con,
+            tmp_path,
+            [[{"id": "a", "at": value, "at_tz": value}]],
+            convert_tz_to_utc=convert == "convert-to-utc",
+        )
+        con.execute("SET TimeZone = 'UTC'")
+        row = con.execute(
+            'SELECT "at"::VARCHAR, at_tz::VARCHAR FROM ducklake_catalog.s.t'
+        ).fetchone()
+        wall_clock, utc_wall_clock, instant = expected
+        stored = utc_wall_clock if convert == "convert-to-utc" else wall_clock
+        assert row == (stored, instant)
+
+    @pytest.mark.parametrize("convert", ["keep-offset", "convert-to-utc"])
+    def test_batch_mixing_fixed_offsets_with_other_zones(
+        self, tmp_path: Path, convert: str
+    ):
+        """One batch with fixed-offset, UTC, named-zone and naive values loads.
+
+        Each value keeps its own instant; a plain column holds each value's
+        own wall-clock time unless convert_tz_to_utc converts it to UTC.
+        """
+        values = {
+            "fixed": datetime(2024, 1, 1, 10, 0, tzinfo=timezone(timedelta(hours=2))),
+            "utc": datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc),
+            "paris": datetime(2024, 1, 1, 10, 0, tzinfo=ZoneInfo("Europe/Paris")),
+            "naive": datetime(2024, 1, 1, 10, 0),  # noqa: DTZ001
+        }
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        # One batch holding all of them, as a tap would send.
+        batch = [{"id": k, "at": v, "at_tz": v} for k, v in values.items()]
+        self._load_into(
+            con, tmp_path, [batch], convert_tz_to_utc=convert == "convert-to-utc"
+        )
+        rows = {
+            r[0]: r[1:]
+            for r in con.execute(
+                'SELECT id, "at"::VARCHAR, at_tz::VARCHAR FROM ducklake_catalog.s.t'
+            ).fetchall()
+        }
+        keep = convert == "keep-offset"
+        fixed_wall_clock = "2024-01-01 10:00:00" if keep else "2024-01-01 08:00:00"
+        paris_wall_clock = "2024-01-01 10:00:00" if keep else "2024-01-01 09:00:00"
+        assert rows == {
+            "fixed": (fixed_wall_clock, "2024-01-01 08:00:00+00"),
+            "utc": ("2024-01-01 10:00:00", "2024-01-01 10:00:00+00"),
+            "paris": (paris_wall_clock, "2024-01-01 09:00:00+00"),
+            "naive": ("2024-01-01 10:00:00", "2024-01-01 10:00:00+00"),
+        }
+
+    @pytest.mark.parametrize(
+        ("value", "wall_clock"),
+        [
+            (
+                datetime(
+                    9999, 12, 31, 23, 59, 59, tzinfo=timezone(timedelta(hours=-7))
+                ),
+                "9999-12-31 23:59:59",
+            ),
+            (
+                datetime(1, 1, 1, 0, 0, tzinfo=timezone(timedelta(hours=2))),
+                "0001-01-01 00:00:00",
+            ),
+            (
+                datetime(
+                    2024, 1, 1, 10, 0, tzinfo=timezone(timedelta(hours=2, seconds=30))
+                ),
+                "2024-01-01 10:00:00",
+            ),
+            (
+                # Local mean time: Paris was +00:09:21 in year 2.
+                datetime(2, 1, 1, 10, 0, tzinfo=ZoneInfo("Europe/Paris")),
+                "0002-01-01 10:00:00",
+            ),
+            (
+                # Its UTC time is in year 0, so the DST normalisation overflows.
+                datetime(1, 1, 1, 0, 0, tzinfo=ZoneInfo("Europe/Paris")),
+                "0001-01-01 00:00:00",
+            ),
+        ],
+        ids=[
+            "year-9999",
+            "year-1",
+            "seconds-offset",
+            "lmt-named-zone",
+            "named-zone-overflow",
+        ],
+    )
+    def test_edge_values_in_fixed_offset_column(self, value: datetime, wall_clock: str):
+        """Edge years and offsets with seconds stage, and DuckDB reads them exactly."""
+        fixed = datetime(2024, 1, 1, 10, 0, tzinfo=timezone(timedelta(hours=2)))
+        schema = pa.schema([pa.field("ts", pa.string())])
+        staged = create_pyarrow_table([{"ts": fixed}, {"ts": value}], schema)
+        text = staged.column("ts")[1].as_py()
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'UTC'")
+        row = con.execute(
+            "SELECT CAST($1 AS TIMESTAMP)::VARCHAR, epoch(CAST($1 AS TIMESTAMPTZ))",
+            [text],
+        ).fetchone()
+        # Computed via the offset: converting to UTC would overflow datetime.
+        offset = value.utcoffset()
+        assert offset is not None
+        local = value.replace(tzinfo=None) - datetime(1970, 1, 1)  # noqa: DTZ001
+        epoch = (local - offset).total_seconds()
+        assert row == (wall_clock, epoch)
+
+    def test_utc_text_unchanged_for_existing_varchar_key(self, tmp_path: Path):
+        """A VARCHAR key written by earlier versions still matches a UTC value.
+
+        Earlier versions staged a UTC datetime as '2024-01-01 10:00:00.000000Z'.
+        A table whose column is VARCHAR (created before the stream declared
+        date-time) must keep getting that exact text, or merges miss old rows.
+        """
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        con.execute("CREATE SCHEMA ducklake_catalog.s")
+        con.execute(
+            "CREATE TABLE ducklake_catalog.s.t "
+            '(id VARCHAR, "at" VARCHAR, at_tz VARCHAR)'
+        )
+        con.execute(
+            "INSERT INTO ducklake_catalog.s.t VALUES "
+            "('a', '2024-01-01 10:00:00.000000Z', '2024-01-01 10:00:00.000000Z')"
+        )
+        value = datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc)
+        self._load_into(
+            con,
+            tmp_path,
+            [[{"id": "a", "at": value, "at_tz": value}]],
+            key_properties=("at",),
+        )
+        rows = con.execute(
+            'SELECT id, "at" FROM ducklake_catalog.s.t ORDER BY "at"'
+        ).fetchall()
+        assert rows == [("a", "2024-01-01 10:00:00.000000Z")]
+
+    def test_fixed_offset_key_remerges(self, tmp_path: Path):
+        """A key built from an offset timestamp is replaced on re-merge."""
+        value = datetime(2024, 1, 1, 10, 0, tzinfo=timezone(timedelta(hours=2)))
+        con = self._load(
+            tmp_path,
+            [
+                {"id": "a", "at": value, "at_tz": value},
+                {"id": "a", "at": value, "at_tz": value},
+            ],
+            convert_tz_to_utc=False,
+        )
+        count = con.execute("SELECT count(*) FROM ducklake_catalog.s.t").fetchone()
+        assert count == (1,)
 
 
 class TestErrorHandling:
