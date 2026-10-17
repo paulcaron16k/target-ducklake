@@ -13,6 +13,7 @@ Each entry mirrors its issue on the [Target DuckLake (Definite fork)](https://gi
 | [DUCKLKD-21](https://github.com/paulcaron16k/target-ducklake-definite/issues/21) | Honour x-sql-datatype hints in type mapping | `story/DUCKLKD-21_x-sql-datatype-hints` (deleted after merge) | `xflow_dev` | DUCKLKD-16, DUCKLKD-19 | Done (squash `683bd73` in `xflow_dev`); no upstream PR |
 | [DUCKLKD-48](https://github.com/paulcaron16k/target-ducklake-definite/issues/48) | Merge keys are compared using the stream's declared type, not the table's column type | `bug/DUCKLKD-48_merge-key-table-types` (deleted after merge) | `xflow_dev` | DUCKLKD-18, DUCKLKD-19, DUCKLKD-21 | Done (squash `09a6e91` in `xflow_dev`); no upstream PR |
 | [DUCKLKD-49](https://github.com/paulcaron16k/target-ducklake-definite/issues/49) | NULL key values never match, so re-merging duplicates those rows | `bug/DUCKLKD-49_null-merge-keys` (deleted after merge) | `xflow_dev` | DUCKLKD-48 | Done (squash `8f83caf` in `xflow_dev`); no upstream PR |
+| [DUCKLKD-47](https://github.com/paulcaron16k/target-ducklake-definite/issues/47) | Timestamps with a non-UTC offset fail staging unless convert_tz_to_utc is set | `bug/DUCKLKD-47_non-utc-offsets` (deleted after merge) | `xflow_dev` | DUCKLKD-21 (timestamptz tests), DUCKLKD-48 | Done (squash `f06c733` in `xflow_dev`); no upstream PR |
 
 **Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`). DUCKLKD-21 (`683bd73`) extends `number_precision_and_scale` from DUCKLKD-16 and the temporal key set from DUCKLKD-19, so upstream it must follow both. DUCKLKD-48 (`09a6e91`) replaces DUCKLKD-19's temporal-only cast with a cast of every key to the table's actual type, so upstream it follows DUCKLKD-18, 19 and 21; offering DUCKLKD-19 without DUCKLKD-48 would reintroduce the UUID and REAL key failures. DUCKLKD-49 (`8f83caf`) rewrites the same DELETE as a NULL-safe `USING` join and renames DUCKLKD-48's helper, so upstream it follows DUCKLKD-48.
 
@@ -214,5 +215,34 @@ Squash-merged into `xflow_dev` as `8f83caf` through fork PR #54 (branch `bug/DUC
 Four new tests through the real sink lifecycle (NULL single and composite keys, NULL keys distinct from other keys, existing NULL-key duplicates collapsing) all fail on the old merge SQL by duplicate-row assertion. `xflow_dev` suite: 166 passed; no new ruff, format or mypy findings. On a local DuckLake (non-UTC session, composite keys): NULL VARCHAR with identity partitioning, NULL UUID, REAL, an upper-case UUID key, TIMESTAMPTZ by `year(k)` and DATE by `month(k)` each left one row per key after three merges; the reviewer additionally broke nothing with keys named `target`/`staged`, NULLs in partition columns, 2M-row tables and failed casts.
 
 Independent Sonnet review: no blocking findings; finding 1 (auto-close) not reproduced, its process point kept (issue closed only after this docs commit); finding 2 deferred to [DUCKLKD-31](https://github.com/paulcaron16k/target-ducklake-definite/issues/31); finding 3 accepted (`50944fe`, collapse pinned by a test); finding 4 declined; finding 5 accepted (performance claim corrected to no regression). Follow-up review: no blocking or should-fix findings; two description nits fixed.
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-47 Timestamps with a non-UTC offset fail staging unless convert_tz_to_utc is set
+
+## Intent
+
+Found verifying DUCKLKD-21 on 2026-10-17. The singer-sdk parses date-time strings into timezone-aware datetimes; one with a fixed non-UTC offset such as `+02:00` made `create_pyarrow_table` fail the whole batch with `ArrowInvalid: Cannot locate timezone '+02:00'`, because pyarrow looks a fixed offset up as a zone name. Only `convert_tz_to_utc` avoided it, so with the default setting any tap emitting offsets other than `Z`/`+00:00` couldn't load.
+
+## Acceptance
+
+- A batch with timezone-aware values of any fixed offset (+02:00, -07:00, +05:30) stages and loads with convert_tz_to_utc false and true.
+- TIMESTAMPTZ columns store the correct instant; behaviour for naive values and DATETIME columns is documented and unchanged in meaning.
+- A regression test reproduces the ArrowInvalid on the old code.
+- No new ruff or mypy findings.
+
+## Evidence
+
+Squash-merged into `xflow_dev` as `f06c733` through fork PR #56 (branch `bug/DUCKLKD-47_non-utc-offsets`, deleted after merge). A batch column that holds any datetime with a fixed non-UTC offset (`datetime.timezone`, offset != 0) has every datetime rendered as ISO text DuckDB reads exactly, each in its own offset (UTC `...000000Z`; others `...+02:00`, or `+02:00:30` with seconds; naive without zone; a named zone's DST gap normalised through UTC; fixed offsets skip that round trip so year-range edges don't overflow). Columns without fixed offsets are left to pyarrow, so batches that loaded before stage byte-identically (0 differences over 6,000 random batches here and 16,000 cases in the reviewer's run). `convert_tz_to_utc` conversion runs before the rendering.
+
+Meaning, documented in the README and the config schema: without `convert_tz_to_utc`, a timestamp column without time zone stores each value's local wall-clock time (offset dropped); with it, the UTC time; a `timestamptz` column (via `x-sql-datatype`) stores the correct instant either way; naive values load as given and a `timestamptz` column reads them in the session time zone.
+
+`TestTimezoneOffsets` has 21 cases through the real sink lifecycle: three offsets in both modes into plain and `timestamptz` columns, a re-merge on an offset key, a batch mixing fixed-offset/UTC/Europe-Paris/naive values, unchanged naive/UTC/named-zone loading under session `America/New_York`, a VARCHAR key written by earlier versions, and five edge values (years 9999 and 1, a seconds offset, a local-mean-time named zone, and a named-zone value whose UTC normalisation overflows). On the pre-PR code 9 fail (the fixed-offset cases with the setting off, with the reported `ArrowInvalid`, and the edge cases); the compatibility cases pass on both. `xflow_dev` suite: 187 passed; no new ruff, format or mypy findings. On a local DuckLake (non-UTC session, `year(at_tz)` partition, `(id, at_tz)` key), mixed and edge-value batches merged to one row per key with correct instants in both modes.
+
+Independent Sonnet review, four rounds. Round 1: no blocking; should-fix findings reproduced and fixed (UTC text had changed to `+00:00`, breaking existing VARCHAR keys; unchanged behaviour wasn't tested); re-verification of that fix then caught a regression of mine (a batch mixing a fixed offset with other zones raised `ArrowTypeError`), fixed by rendering such columns as a whole. Round 2: no blocking; year-range overflow and seconds offsets fixed, wording corrected. Round 3: no blocking or should-fix; the overflow-fallback test added, a sub-second-offset nit declined. Round 4: no findings.
+
+Found, not fixed (pre-existing, filed): [DUCKLKD-55](https://github.com/paulcaron16k/target-ducklake-definite/issues/55) `convert_tz_to_utc` ignores unparsed date-time strings; [DUCKLKD-57](https://github.com/paulcaron16k/target-ducklake-definite/issues/57) without the setting, a mixed-zone column's wall-clock time depends on batch order. Also pre-existing and unchanged: with the setting on, a value whose UTC time leaves Python's year range fails the conversion.
 
 Upstream PR: not opened.

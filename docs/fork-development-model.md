@@ -151,6 +151,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-21](https://github.com/paulcaron16k/target-ducklake-definite/issues/21) Honour x-sql-datatype hints | squash `683bd73` (fork PR #46) | — | In fork, PR not opened |
 | [DUCKLKD-48](https://github.com/paulcaron16k/target-ducklake-definite/issues/48) Merge keys cast to the table's column types | squash `09a6e91` (fork PR #52) | — | In fork, PR not opened |
 | [DUCKLKD-49](https://github.com/paulcaron16k/target-ducklake-definite/issues/49) NULL key values match NULL in merges | squash `8f83caf` (fork PR #54) | — | In fork, PR not opened |
+| [DUCKLKD-47](https://github.com/paulcaron16k/target-ducklake-definite/issues/47) Stage timestamps with any fixed UTC offset | squash `f06c733` (fork PR #56) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
