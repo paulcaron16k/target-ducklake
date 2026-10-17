@@ -599,17 +599,25 @@ class DuckLakeConnector(SQLConnector):
         self.execute(insert_sql)
 
     @staticmethod
-    def _build_key_columns_sql(
+    def _build_key_match_sql(
         key_properties: list[str], key_column_types: dict[str, str]
     ) -> tuple[str, str]:
-        """Build the key column lists used to match merge keys.
+        """Build the SQL that matches merge keys between the table and the batch.
 
-        Returns the table side and the staged-file side of a row-value
-        comparison, e.g. ``("tenant", "ts") IN (SELECT CAST("tenant" AS VARCHAR),
-        CAST("ts" AS TIMESTAMP) FROM ...)``.
+        Returns the staged key columns to select (each cast to the table's
+        type) and the join condition, used as::
+
+            DELETE FROM t AS "target"
+            USING (SELECT CAST("id" AS BIGINT) AS "id" FROM 'batch.parquet') AS "staged"
+            WHERE "target"."id" IS NOT DISTINCT FROM "staged"."id"
 
         Each key column is compared on its own, so composite keys can't collide.
         Concatenating them (``tenant || id``) made ('1', '23') match ('12', '3').
+
+        Keys compare with IS NOT DISTINCT FROM, so a NULL key value matches
+        NULL. The in-batch dedup already treats NULL keys as equal; with ``=``
+        or ``IN`` a NULL-key row was never deleted and every re-merge appended
+        another copy.
 
         Each staged key is cast to the table column's actual type, the same cast
         INSERT applies, so a staged value compares equal to the row it produced:
@@ -622,13 +630,16 @@ class DuckLakeConnector(SQLConnector):
           stream that now declares timestamptz.
         A key with no known type is compared uncast.
         """
-        table_columns, file_columns = [], []
+        staged_columns, conditions = [], []
         for key_name in key_properties:
             column = f'"{key_name}"'
-            table_columns.append(column)
             key_type = key_column_types.get(key_name)
-            file_columns.append(f"CAST({column} AS {key_type})" if key_type else column)
-        return ", ".join(table_columns), ", ".join(file_columns)
+            staged = f"CAST({column} AS {key_type})" if key_type else column
+            staged_columns.append(f"{staged} AS {column}")
+            conditions.append(
+                f'"target".{column} IS NOT DISTINCT FROM "staged".{column}'
+            )
+        return ", ".join(staged_columns), " AND ".join(conditions)
 
     def merge_into_table(
         self,
@@ -653,7 +664,7 @@ class DuckLakeConnector(SQLConnector):
         See: https://github.com/duckdb/ducklake/issues/643
         """
         columns_sql = self._build_columns_sql(file_columns, target_table_columns)
-        table_key_sql, file_key_sql = self._build_key_columns_sql(
+        staged_keys_sql, key_match_sql = self._build_key_match_sql(
             key_properties, key_column_types or {}
         )
         if len(key_properties) > 1:
@@ -666,8 +677,9 @@ class DuckLakeConnector(SQLConnector):
         table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
         combined_sql = f"""
         BEGIN TRANSACTION;
-        DELETE FROM {table_ref} 
-        WHERE ({table_key_sql}) IN (SELECT {file_key_sql} FROM '{file_location}');
+        DELETE FROM {table_ref} AS "target"
+        USING (SELECT {staged_keys_sql} FROM '{file_location}') AS "staged"
+        WHERE {key_match_sql};
         INSERT INTO {table_ref} 
         SELECT {columns_sql} FROM '{file_location}';
         COMMIT;
