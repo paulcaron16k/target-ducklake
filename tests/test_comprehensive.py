@@ -1023,6 +1023,8 @@ class TestMergeKeyTableTypes:
     @staticmethod
     def _catalog() -> duckdb.DuckDBPyConnection:
         con = duckdb.connect()
+        # A non-UTC session zone, so TIMESTAMP vs TIMESTAMPTZ mix-ups show.
+        con.execute("SET TimeZone = 'America/New_York'")
         con.execute("ATTACH ':memory:' AS ducklake_catalog")
         return con
 
@@ -1079,6 +1081,7 @@ class TestMergeKeyTableTypes:
         ("key_prop", "value"),
         [
             ({"type": "string"}, "a"),
+            ({"type": "boolean"}, True),
             ({"type": "integer"}, 5),
             ({"type": "integer", "x-sql-datatype": "int"}, 5),
             ({"type": "integer", "x-sql-datatype": "smallint"}, 5),
@@ -1104,6 +1107,7 @@ class TestMergeKeyTableTypes:
         ],
         ids=[
             "varchar",
+            "boolean",
             "bigint",
             "integer",
             "smallint",
@@ -1182,7 +1186,6 @@ class TestMergeKeyTableTypes:
         TIMESTAMPTZ: under a non-UTC session time zone the two disagree.
         """
         con = self._catalog()
-        con.execute("SET TimeZone = 'America/New_York'")
         con.execute("CREATE SCHEMA ducklake_catalog.s")
         con.execute(
             "CREATE TABLE ducklake_catalog.s.t (k TIMESTAMP, id VARCHAR, v VARCHAR)"
