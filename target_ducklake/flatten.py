@@ -231,9 +231,11 @@ def nullable_choices(schema: dict) -> dict:
     """Return a copy of a stream schema in which anyOf/oneOf properties accept null.
 
     Every DuckLake column this target creates is nullable, and record
-    validation has always accepted null for these properties, so a tap that
-    sends null where its choice list doesn't declare it still loads. Nested
-    object properties are covered too. The given schema is not changed.
+    validation has always accepted null for most of these properties, so a tap
+    that sends null where its choice list doesn't declare it still loads. Any
+    property with anyOf or oneOf accepts null, whatever else it declares, at
+    any depth of nested object properties. Only null is added; other values
+    validate as before. The given schema is not changed.
     """
     if "properties" not in schema:
         return schema

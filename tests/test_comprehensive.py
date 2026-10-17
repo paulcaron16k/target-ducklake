@@ -600,6 +600,8 @@ class TestUntypedAndChoiceProperties:
                 "type": "object",
                 "properties": {"n": {"anyOf": [{"type": "string"}]}},
             },
+            # A type beside the choice list doesn't stop null being accepted.
+            {"type": "string", "anyOf": [{"maxLength": 3}]},
         ],
         ids=[
             "anyof-no-null",
@@ -607,6 +609,7 @@ class TestUntypedAndChoiceProperties:
             "oneof-with-null",
             "oneof-no-null",
             "nested-anyof",
+            "type-and-anyof",
         ],
     )
     def test_sink_validator_accepts_null_for_choices(self, prop: dict):
