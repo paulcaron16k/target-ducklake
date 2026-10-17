@@ -482,7 +482,6 @@ class TestDecimalPrecision:
         [
             ({"type": ["null", "number"]}, (38, 9)),
             ({"type": "number", "precision": 10, "scale": 2}, (10, 2)),
-            ({"type": "number", "precision": 50}, (38, 9)),
             ({"type": "number", "precision": 5}, (5, 5)),
         ],
     )
@@ -547,6 +546,57 @@ class TestDecimalPrecision:
         con.execute("CREATE TABLE t (amount DECIMAL(38, 9))")
         con.execute(f"INSERT INTO t SELECT amount FROM '{path}'")
         assert con.execute("SELECT amount FROM t").fetchone()[0] == self.BIG
+
+    @pytest.mark.parametrize(
+        ("jsonschema", "expected"),
+        [
+            ({"type": "number", "x-sql-datatype": "numeric(50,45)"}, (38, 33)),
+            ({"type": "number", "precision": 50, "scale": 45}, (38, 33)),
+            ({"type": "number", "x-sql-datatype": "numeric(40,2)"}, (38, 2)),
+            ({"type": "number", "x-sql-datatype": "decimal(65,30)"}, (38, 9)),
+            ({"type": "number", "x-sql-datatype": "numeric(60,10)"}, (38, 9)),
+            ({"type": "number", "precision": 50}, (38, 9)),
+        ],
+        ids=[
+            "hint-keeps-integer-digits",
+            "keys-keep-integer-digits",
+            "small-scale-kept",
+            "mysql-max-keeps-default-scale",
+            "integer-digits-beyond-38",
+            "precision-only",
+        ],
+    )
+    def test_precision_above_38_keeps_integer_digits(
+        self, jsonschema: dict, expected: tuple
+    ):
+        """Capping to 38 drops fraction digits first, down to min(scale, 9)."""
+        with pytest.warns(UserWarning, match="exceeds DuckDB's 38-digit DECIMAL"):
+            assert number_precision_and_scale(jsonschema) == expected
+
+    def test_precision_within_38_is_unchanged(self, recwarn: pytest.WarningsRecorder):
+        """A hint that fits DuckDB is used exactly, without a warning."""
+        jsonschema = {"type": "number", "x-sql-datatype": "numeric(38,38)"}
+        assert number_precision_and_scale(jsonschema) == (38, 38)
+        assert not [w for w in recwarn if "38-digit" in str(w.message)]
+
+    @pytest.mark.filterwarnings("ignore:.*38-digit DECIMAL")
+    def test_capped_hint_loads_values_through_duckdb(self, tmp_path: Path):
+        """A numeric(50,45) column loads values of 1 or more, read back exactly."""
+        props = {"amount": {"type": "number", "x-sql-datatype": "numeric(50,45)"}}
+        values = [Decimal("12.5"), Decimal("99999.000000000000000000000000000000001")]
+        ddl = DuckLakeConnector(
+            {"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
+        ).json_to_ducklake_schema(props)[0]["type"]
+        schema = flatten_schema_to_pyarrow_schema(props)
+        table = create_pyarrow_table([{"amount": v} for v in values], schema)
+        path = tmp_path / "batch.parquet"
+        pq.write_table(table, path)
+
+        con = duckdb.connect()
+        con.execute(f"CREATE TABLE t (amount {ddl})")
+        con.execute(f"INSERT INTO t SELECT amount FROM '{path}'")
+        assert ddl == "DECIMAL(38, 33)"
+        assert [r[0] for r in con.execute("SELECT amount FROM t").fetchall()] == values
 
 
 class TestIntegrationScenarios:
@@ -834,7 +884,7 @@ class TestSqlDatatypeHints:
             ("number", "decimal(10,2)", "DECIMAL(10, 2)"),
             ("number", "NUMERIC( 20, 4 )", "DECIMAL(20, 4)"),
             ("string", "numeric(18,2)", "DECIMAL(18, 2)"),
-            ("number", "decimal(50,40)", "DECIMAL(38, 38)"),
+            ("number", "decimal(50,40)", "DECIMAL(38, 28)"),
             ("string", "timestamp", "TIMESTAMP"),
             ("string", "timestamp without time zone", "TIMESTAMP"),
             ("string", "timestamp_ntz", "TIMESTAMP"),
@@ -851,6 +901,7 @@ class TestSqlDatatypeHints:
             ("string", "jsonb", "JSON"),
         ],
     )
+    @pytest.mark.filterwarnings("ignore:.*38-digit DECIMAL")
     def test_supported_hint(self, json_type: str, hint: str, expected: str):
         """Each supported hint maps to its DuckDB type, ignoring case and spacing."""
         prop = {"type": ["null", json_type], "x-sql-datatype": hint}
