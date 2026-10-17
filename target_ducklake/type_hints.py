@@ -88,7 +88,7 @@ def sql_datatype_hint(jsonschema: dict[str, Any]) -> str:
 def decimal_hint(jsonschema: dict[str, Any]) -> tuple[int, int] | None:
     """Return the (precision, scale) of a ``decimal(p,s)``/``numeric(p,s)`` hint.
 
-    A hint no SQL database can declare (precision below 1, or scale above
+    A hint DuckDB's DECIMAL can't represent (precision below 1, or scale above
     precision) returns None, so the column keeps its default mapping and the
     SDK warns that the hint isn't supported, instead of the type being
     invalid (``DECIMAL(0, 0)``) or silently changed (``DECIMAL(5, 10)`` to
