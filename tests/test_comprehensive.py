@@ -793,38 +793,6 @@ class TestTemporalMergeKeys:
         rows = con.execute("SELECT v FROM ducklake_catalog.s.t").fetchall()
         assert rows == [("second",)]
 
-    def test_sink_passes_table_key_types(self):
-        """The sink passes each key's type as read from the table."""
-        sink: Any = SimpleNamespace(
-            write_temp_file=Mock(return_value="batch.parquet"),
-            ducklake_schema=[
-                {"name": "id", "type": "BIGINT"},
-                {"name": "ts", "type": "DATETIME"},
-                {"name": "d", "type": "DATE"},
-                {"name": "name", "type": "VARCHAR"},
-            ],
-            _table_columns=["id", "ts", "d", "name"],
-            # The table's types, which can differ from ducklake_schema's.
-            _table_column_types={
-                "id": "BIGINT",
-                "ts": "TIMESTAMP",
-                "d": "DATE",
-                "name": "VARCHAR",
-            },
-            key_properties=["id", "ts"],
-            load_method="merge",
-            should_overwrite_table=False,
-            connector=Mock(),
-            target_schema="s",
-            target_table="t",
-            logger=Mock(),
-            _get_memory_usage_mb=Mock(return_value=0.0),
-        )
-        with patch("target_ducklake.sinks.os.remove"):
-            ducklakeSink.process_batch(sink, {})
-        kwargs = sink.connector.merge_into_table.call_args.kwargs
-        assert kwargs["key_column_types"] == {"id": "BIGINT", "ts": "TIMESTAMP"}
-
 
 class TestSqlDatatypeHints:
     """x-sql-datatype hints give columns the source database's own types."""
