@@ -153,6 +153,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-49](https://github.com/paulcaron16k/target-ducklake-definite/issues/49) NULL key values match NULL in merges | squash `8f83caf` (fork PR #54) | — | In fork, PR not opened |
 | [DUCKLKD-47](https://github.com/paulcaron16k/target-ducklake-definite/issues/47) Stage timestamps with any fixed UTC offset | squash `f06c733` (fork PR #56) | — | In fork, PR not opened |
 | [DUCKLKD-50](https://github.com/paulcaron16k/target-ducklake-definite/issues/50) Honour hints on anyOf properties; reject impossible decimal hints | squash `0bb2fe7` (fork PR #58) | — | In fork, PR not opened |
+| [DUCKLKD-59](https://github.com/paulcaron16k/target-ducklake-definite/issues/59) Cap decimals above 38 digits without losing integer digits | squash `ac91dc2` (fork PR #62) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 

@@ -15,8 +15,9 @@ Each entry mirrors its issue on the [Target DuckLake (Definite fork)](https://gi
 | [DUCKLKD-49](https://github.com/paulcaron16k/target-ducklake-definite/issues/49) | NULL key values never match, so re-merging duplicates those rows | `bug/DUCKLKD-49_null-merge-keys` (deleted after merge) | `xflow_dev` | DUCKLKD-48 | Done (squash `8f83caf` in `xflow_dev`); no upstream PR |
 | [DUCKLKD-47](https://github.com/paulcaron16k/target-ducklake-definite/issues/47) | Timestamps with a non-UTC offset fail staging unless convert_tz_to_utc is set | `bug/DUCKLKD-47_non-utc-offsets` (deleted after merge) | `xflow_dev` | DUCKLKD-21 (timestamptz tests), DUCKLKD-48 | Done (squash `f06c733` in `xflow_dev`); no upstream PR |
 | [DUCKLKD-50](https://github.com/paulcaron16k/target-ducklake-definite/issues/50) | x-sql-datatype hints on anyOf properties are lost; invalid decimal hints produce invalid DDL | `bug/DUCKLKD-50_anyof-and-invalid-decimal-hints` (deleted after merge) | `xflow_dev` | DUCKLKD-21 | Done (squash `0bb2fe7` in `xflow_dev`); no upstream PR |
+| [DUCKLKD-59](https://github.com/paulcaron16k/target-ducklake-definite/issues/59) | A decimal hint whose precision exceeds 38 caps the scale with it, leaving no integer digits | `bug/DUCKLKD-59_decimal-precision-cap` (deleted after merge) | `xflow_dev` | DUCKLKD-16, DUCKLKD-21 | Done (squash `ac91dc2` in `xflow_dev`); no upstream PR |
 
-**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`). DUCKLKD-21 (`683bd73`) extends `number_precision_and_scale` from DUCKLKD-16 and the temporal key set from DUCKLKD-19, so upstream it must follow both. DUCKLKD-48 (`09a6e91`) replaces DUCKLKD-19's temporal-only cast with a cast of every key to the table's actual type, so upstream it follows DUCKLKD-18, 19 and 21; offering DUCKLKD-19 without DUCKLKD-48 would reintroduce the UUID and REAL key failures. DUCKLKD-49 (`8f83caf`) rewrites the same DELETE as a NULL-safe `USING` join and renames DUCKLKD-48's helper, so upstream it follows DUCKLKD-48. DUCKLKD-50 (`0bb2fe7`) changes `decimal_hint` in `type_hints.py`, which DUCKLKD-21 introduces, and makes `flatten.py` import that module, so upstream it follows DUCKLKD-21.
+**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`). DUCKLKD-21 (`683bd73`) extends `number_precision_and_scale` from DUCKLKD-16 and the temporal key set from DUCKLKD-19, so upstream it must follow both. DUCKLKD-48 (`09a6e91`) replaces DUCKLKD-19's temporal-only cast with a cast of every key to the table's actual type, so upstream it follows DUCKLKD-18, 19 and 21; offering DUCKLKD-19 without DUCKLKD-48 would reintroduce the UUID and REAL key failures. DUCKLKD-49 (`8f83caf`) rewrites the same DELETE as a NULL-safe `USING` join and renames DUCKLKD-48's helper, so upstream it follows DUCKLKD-48. DUCKLKD-50 (`0bb2fe7`) changes `decimal_hint` in `type_hints.py`, which DUCKLKD-21 introduces, and makes `flatten.py` import that module, so upstream it follows DUCKLKD-21. DUCKLKD-59 (`ac91dc2`) rewrites `number_precision_and_scale` from DUCKLKD-16 and changes a DUCKLKD-21 test expectation, so upstream it follows both.
 
 **Verification baseline.** Upstream `main` already has 556 ruff findings, 4 files the formatter would change, and 2 mypy errors in `sinks.py`. "No new findings" below means none added by the fix, compared against that baseline. Tests run with `uv run --python 3.12 pytest tests/` (the default Python 3.14 has no wheel for the pinned pyarrow 20; tracked as [DUCKLKD-32](https://github.com/paulcaron16k/target-ducklake-definite/issues/32)).
 
@@ -296,5 +297,54 @@ Found, not fixed (pre-existing, filed):
 - [DUCKLKD-59](https://github.com/paulcaron16k/target-ducklake-definite/issues/59): a decimal hint above precision 38 caps the scale with it, so `numeric(50,45)` becomes DECIMAL(38,38) and any value of 1 or more fails.
 - [DUCKLKD-60](https://github.com/paulcaron16k/target-ducklake-definite/issues/60): `flatten_schema` crashes on an all-null or untyped anyOf branch and mutates the caller's schema.
 - [DUCKLKD-61](https://github.com/paulcaron16k/target-ducklake-definite/issues/61): a hint that conflicts with the JSON type gives different DDL and staging types.
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-59 A decimal hint whose precision exceeds 38 caps the scale with it, leaving no integer digits
+
+## Intent
+
+Found by the independent Sonnet review of PR #58 (DUCKLKD-50) on 2026-10-17; reproduced. `number_precision_and_scale` capped the precision at 38, then clamped the scale to it. So `numeric(50,45)`, with 5 integer digits, became DECIMAL(38,38), with none. Any value of 1 or more failed the whole batch: staging raised `decimal.InvalidOperation`, and DuckDB rejected the cast as out of range. The DDL and the staging type share the helper, so both were affected, for hints and for schema `precision`/`scale` keys.
+
+## Acceptance
+
+- When the hinted precision exceeds 38, the capped type keeps the hint's integer digits where it can, dropping scale before integer digits. If the integer digits alone exceed 38, the choice (and a warning) is documented.
+- DDL and staging stay identical.
+- A regression test loads 12.5 into a numeric(50,45) column and fails on the old code.
+- No new ruff or mypy findings.
+
+## Evidence
+
+Squash-merged into `xflow_dev` as `ac91dc2` through fork PR #62 (branch `bug/DUCKLKD-59_decimal-precision-cap`, deleted after merge).
+
+`parquet_utils._capped_to_38` fits any precision above 38 into 38 digits:
+- **Fraction digits are dropped first,** so the integer digits still fit: `numeric(50,45)` gives DECIMAL(38,33).
+- **The scale never drops below `min(scale, 9)`,** the default scale, so a capped type never keeps fewer fraction digits than the DECIMAL(38,9) default. Examples: `numeric(40,2)` keeps DECIMAL(38,2); MySQL's maximum `decimal(65,30)` and `numeric(60,10)` give DECIMAL(38,9). Values with more integer digits than are left fail at staging.
+- **A `UserWarning`** names the declared and the capped type.
+
+This narrows the acceptance's "keep integer digits" on purpose. Applied strictly, it would turn `numeric(40,2)` money into DECIMAL(38,0) and lose the cents. Both reviews judged the floor sound.
+
+A DUCKLKD-21 test had pinned the bug (`decimal(50,40)` → DECIMAL(38,38)); it now expects DECIMAL(38,28).
+
+Tests and verification:
+- New `TestDecimalPrecision` cases:
+  - nine cap cases, for hints and keys, including `numeric(39,0)`, `numeric(39,39)` and keys with scale above precision;
+  - a fitting hint emits no warning;
+  - a DuckDB load test with `12.5` and a 5-integer-digit, 33-fraction-digit value, asserting the staging type equals the DDL type.
+- On the old code, 8 fail, including the reported `InvalidOperation`.
+- `xflow_dev` suite: 212 passed, with no warnings; no new ruff, format or mypy findings.
+- On a local DuckLake, through the sink with a merge and a re-merge: columns DECIMAL(38,33), (38,2) and (38,9); values read back exactly; one row per key.
+
+Independent Sonnet review, two rounds:
+- **Round 1:** no blocking findings.
+  - Fixed: missing edge tests and a staging/DDL assertion (`961a3f7`), and the docstring's failure point (`3cb648d`).
+  - Pinned, no change: keys with scale above precision give (38,38), which is faithful to a declared type with no integer digits.
+  - Declined: the warning naming the column (it would need a signature change), and negative scale from keys (pre-existing).
+  - Held for the owner, then filed as a follow-up: existing tables.
+- **Round 2:** nothing blocking; two test nits declined.
+
+Found, not fixed (filed on the owner's decision): [DUCKLKD-63](https://github.com/paulcaron16k/target-ducklake-definite/issues/63). Staging uses the stream's declared scale, not an existing column's. A table created by upstream `main` as DECIMAL(38,30) from schema keys is now staged at (38,9), so small values lose fraction digits silently; upstream's float staging kept about 16 of them. Values of 1e8 or more, which failed upstream, now load.
 
 Upstream PR: not opened.
