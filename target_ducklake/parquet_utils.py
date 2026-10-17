@@ -1,5 +1,6 @@
 # taken from https://github.com/Automattic/target-parquet/blob/master/target_parquet/utils/parquet.py
 import logging
+import warnings
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_EVEN, Context, Decimal
 
@@ -40,8 +41,8 @@ def number_precision_and_scale(jsonschema: dict) -> tuple[int, int]:
     Shared by the DuckLake column DDL and the parquet staging schema so both
     always agree. An ``x-sql-datatype`` of ``decimal(p,s)`` or ``numeric(p,s)``
     wins; otherwise the schema's ``precision``/``scale`` are used when present
-    (precision capped at 38, scale defaulting to 9 and never exceeding the
-    precision), otherwise DECIMAL(38, 9).
+    (scale defaulting to 9 and never exceeding the precision), otherwise
+    DECIMAL(38, 9). A precision above 38 is capped by ``_capped_to_38``.
     """
     precision, scale = decimal_hint(jsonschema) or (
         jsonschema.get("precision"),
@@ -49,9 +50,36 @@ def number_precision_and_scale(jsonschema: dict) -> tuple[int, int]:
     )
     if precision is None:
         return DECIMAL_MAX_PRECISION, DECIMAL_DEFAULT_SCALE
-    precision = min(precision, DECIMAL_MAX_PRECISION)
-    scale = DECIMAL_DEFAULT_SCALE if scale is None else scale
-    return precision, min(scale, precision)
+    scale = min(DECIMAL_DEFAULT_SCALE if scale is None else scale, precision)
+    if precision > DECIMAL_MAX_PRECISION:
+        return _capped_to_38(precision, scale)
+    return precision, scale
+
+
+def _capped_to_38(precision: int, scale: int) -> tuple[int, int]:
+    """Fit DECIMAL(precision, scale) into DuckDB's 38 digits, with a warning.
+
+    Fraction digits are dropped first, so the integer digits a value needs
+    still fit: ``numeric(50,45)`` becomes DECIMAL(38, 33), not DECIMAL(38, 38),
+    which can't hold 1. They are never dropped below ``min(scale, 9)``, the
+    default scale, so a money column keeps its cents (``numeric(40,2)`` gives
+    DECIMAL(38, 2)) and a capped type never keeps fewer fraction digits than
+    the DECIMAL(38, 9) default. A value with more integer digits than are left
+    fails the batch at staging (``decimal.InvalidOperation`` in
+    ``_to_decimal``), as it would with DECIMAL(38, 9).
+    """
+    integer_digits = precision - scale
+    fraction_floor = min(scale, DECIMAL_DEFAULT_SCALE)
+    capped_scale = min(
+        scale, max(DECIMAL_MAX_PRECISION - integer_digits, fraction_floor)
+    )
+    warnings.warn(
+        f"DECIMAL({precision}, {scale}) exceeds DuckDB's 38-digit DECIMAL; "
+        f"using DECIMAL({DECIMAL_MAX_PRECISION}, {capped_scale}).",
+        UserWarning,
+        stacklevel=3,
+    )
+    return DECIMAL_MAX_PRECISION, capped_scale
 
 
 def _field_type_to_pyarrow_field(
