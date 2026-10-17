@@ -1160,9 +1160,13 @@ class TestMergeKeyTableTypes:
         rows = self._load_twice(self._catalog(), tmp_path, key_prop, None, keys)
         assert rows == [("a", "second")]
 
-    def test_null_keys_stay_distinct_from_other_keys(self, tmp_path: Path):
-        """(NULL, a), (NULL, b) and (x, a) are three different composite keys."""
-        con = self._catalog()
+    def _merge_batches(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        tmp_path: Path,
+        batches: list[list[dict]],
+    ) -> list[tuple]:
+        """Merge each batch on the composite key (k, id); return all rows."""
         config = {
             "catalog_url": "test.db",
             "data_path": str(tmp_path / "data"),
@@ -1174,12 +1178,13 @@ class TestMergeKeyTableTypes:
         target = Mock()
         target.config = config
         connector = DuckLakeConnector(config)
+        nullable_string = {"type": ["null", "string"]}
         schema = {
             "type": "object",
             "properties": {
-                "k": {"type": ["null", "string"]},
-                "id": {"type": ["null", "string"]},
-                "v": {"type": ["null", "string"]},
+                "k": nullable_string,
+                "id": nullable_string,
+                "v": nullable_string,
             },
         }
         with patch.object(
@@ -1193,24 +1198,52 @@ class TestMergeKeyTableTypes:
                 connector=connector,
             )
             sink.setup()
-            sink.process_batch(
-                {
-                    "records": [
-                        {"k": None, "id": "a", "v": "first"},
-                        {"k": None, "id": "b", "v": "first"},
-                        {"k": "x", "id": "a", "v": "first"},
-                    ]
-                }
-            )
-            sink.process_batch({"records": [{"k": None, "id": "a", "v": "second"}]})
-        rows = con.execute(
-            "SELECT k, id, v FROM ducklake_catalog.s.t ORDER BY k NULLS FIRST, id"
+            for batch in batches:
+                sink.process_batch({"records": batch})
+        return con.execute(
+            "SELECT k, id, v FROM ducklake_catalog.s.t ORDER BY k NULLS FIRST, id, v"
         ).fetchall()
+
+    def test_null_keys_stay_distinct_from_other_keys(self, tmp_path: Path):
+        """(NULL, a), (NULL, b) and (x, a) are three different composite keys."""
+        rows = self._merge_batches(
+            self._catalog(),
+            tmp_path,
+            [
+                [
+                    {"k": None, "id": "a", "v": "first"},
+                    {"k": None, "id": "b", "v": "first"},
+                    {"k": "x", "id": "a", "v": "first"},
+                ],
+                [{"k": None, "id": "a", "v": "second"}],
+            ],
+        )
         assert rows == [
             (None, "a", "second"),
             (None, "b", "first"),
             ("x", "a", "first"),
         ]
+
+    def test_existing_null_key_duplicates_collapse(self, tmp_path: Path):
+        """Duplicate NULL-key rows left by the old merge collapse on the next merge.
+
+        This is the NULL-matches-NULL rule applied to existing data: the next
+        batch carrying that key replaces every copy of it.
+        """
+        con = self._catalog()
+        con.execute("CREATE SCHEMA ducklake_catalog.s")
+        con.execute(
+            "CREATE TABLE ducklake_catalog.s.t (k VARCHAR, id VARCHAR, v VARCHAR)"
+        )
+        con.execute(
+            "INSERT INTO ducklake_catalog.s.t VALUES "
+            "(NULL, 'a', 'copy1'), (NULL, 'a', 'copy2'), (NULL, 'a', 'copy3'), "
+            "('x', 'a', 'untouched')"
+        )
+        rows = self._merge_batches(
+            con, tmp_path, [[{"k": None, "id": "a", "v": "new"}]]
+        )
+        assert rows == [(None, "a", "new"), ("x", "a", "untouched")]
 
     def test_append_reads_table_metadata_once(self, tmp_path: Path):
         """Only merges need the key types; append streams don't pay for them."""
