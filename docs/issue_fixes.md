@@ -2,16 +2,16 @@
 
 Fixes developed in this fork ahead of any upstream issue or pull request, in the order they were made. The order matters for conflict resolution: apply them in the order listed, and follow each issue's **Depends on** line.
 
-Each entry mirrors its issue on the [Target DuckLake (Definite fork)](https://github.com/users/paulcaron16k/projects/34) board, where the issue is the source of truth. Branches are named `general/DUCKLKD-<n>_<slug>` and start from upstream `main`. A fix is Done when merged into `xflow_dev`; an upstream pull request is optional.
+Each entry mirrors its issue on the [Target DuckLake (Definite fork)](https://github.com/users/paulcaron16k/projects/34) board, where the issue is the source of truth. Since DUCKLKD-19, each story or bug branches from `xflow_dev` as `story/` or `bug/DUCKLKD-<n>_<slug>` and is squash-merged back through a pull request, so it lands as one commit (see [fork-development-model.md](fork-development-model.md)). DUCKLKD-16 to 18 predate this: their `general/` branches start from upstream `main` and were merged with merge commits. A fix is Done when merged into `xflow_dev`; an upstream pull request is optional and is made by cherry-picking the squash commit onto `origin/main`.
 
 | Key | Issue | Branch | Base | Depends on | Status |
 | --- | --- | --- | --- | --- | --- |
 | [DUCKLKD-16](https://github.com/paulcaron16k/target-ducklake-definite/issues/16) | Numbers lose precision on the way into DECIMAL columns | `general/DUCKLKD-16_decimal-precision` | `origin/main` `e9dc3f3` | — | Done (in `xflow_dev`); no upstream PR |
 | [DUCKLKD-17](https://github.com/paulcaron16k/target-ducklake-definite/issues/17) | In-batch dedup can keep an older version of a row | `general/DUCKLKD-17_dedup-keep-last` | `origin/main` `e9dc3f3` | — | Done (in `xflow_dev`); no upstream PR |
 | [DUCKLKD-18](https://github.com/paulcaron16k/target-ducklake-definite/issues/18) | Composite merge keys collide and delete unrelated rows | `general/DUCKLKD-18_composite-key-merge` | `origin/main` `e9dc3f3` | — | Done (in `xflow_dev`); no upstream PR |
-| [DUCKLKD-19](https://github.com/paulcaron16k/target-ducklake-definite/issues/19) | Merges keyed on a timestamp never match, so every run duplicates rows | not started | `general/DUCKLKD-18_composite-key-merge` | DUCKLKD-18 | In Progress |
+| [DUCKLKD-19](https://github.com/paulcaron16k/target-ducklake-definite/issues/19) | Merges keyed on a timestamp never match, so every run duplicates rows | `bug/DUCKLKD-19_timestamp-merge-keys` | `xflow_dev` | DUCKLKD-18 (already in `xflow_dev`) | In Progress |
 
-**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces, so it must be based on DUCKLKD-18 and merged after it.
+**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branches from `xflow_dev`, which already contains DUCKLKD-18; offered upstream, it must follow DUCKLKD-18.
 
 **Verification baseline.** Upstream `main` already has 556 ruff findings, 4 files the formatter would change, and 2 mypy errors in `sinks.py`. "No new findings" below means none added by the fix, compared against that baseline. Tests run with `uv run --python 3.12 pytest tests/` (the default Python 3.14 has no wheel for the pinned pyarrow 20; tracked as [DUCKLKD-32](https://github.com/paulcaron16k/target-ducklake-definite/issues/32)).
 
@@ -105,4 +105,4 @@ On a local DuckLake, the current comparison matched **zero** rows, for both whol
 
 ## Evidence
 
-Reproduced on a local DuckLake (DuckDB 1.5.2) while testing DUCKLKD-18: the `::VARCHAR` comparison matched 0 rows for naive and UTC-aware, whole-second and fractional timestamps; native `IN` raises a binder error (TIMESTAMP vs VARCHAR); `IN (SELECT CAST(ts AS TIMESTAMP) ...)` matched both rows. Fix to be based on `general/DUCKLKD-18_composite-key-merge`.
+Reproduced on a local DuckLake (DuckDB 1.5.2) while testing DUCKLKD-18: the `::VARCHAR` comparison matched 0 rows for naive and UTC-aware, whole-second and fractional timestamps; native `IN` raises a binder error (TIMESTAMP vs VARCHAR); `IN (SELECT CAST(ts AS TIMESTAMP) ...)` matched both rows. Fix branches from `xflow_dev`, which already contains DUCKLKD-18.
