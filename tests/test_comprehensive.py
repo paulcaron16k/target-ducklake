@@ -1035,9 +1035,12 @@ class TestMergeKeyTableTypes:
         key_prop: dict,
         value: object,
         key_properties: list[str],
-        key_name: str = "k",
     ) -> list[tuple]:
-        """Run setup and two merges of the same key; return the rows left."""
+        """Run setup and two merges of the same key; return the rows left.
+
+        The first key property is the column typed by ``key_prop``.
+        """
+        key_name = key_properties[0]
         config = {
             "catalog_url": "test.db",
             "data_path": str(tmp_path / "data"),
@@ -1142,7 +1145,6 @@ class TestMergeKeyTableTypes:
             {"type": "string", "format": "uuid"},
             self.UUID,
             ["UID"],
-            key_name="UID",
         )
         assert rows == [("a", "second")]
 
