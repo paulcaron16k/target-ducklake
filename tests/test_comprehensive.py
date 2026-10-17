@@ -489,7 +489,8 @@ class TestUntypedAndChoiceProperties:
         """Any value in an untyped property is kept as JSON text."""
         schema = {"type": "object", "properties": {"c": {"$ref": "#/d"}}}
         flat = flatten_schema(schema)
-        values = [5, "abc", {"a": 1}, [1, 2], 1.5, True]
+        at = datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc)
+        values = [5, "abc", {"a": 1}, [1, 2], 1.5, True, None, Decimal("2.5"), at]
         records = [flatten_record({"c": v}, flatten_schema=flat) for v in values]
         path = tmp_path / "batch.parquet"
         pq.write_table(
@@ -500,7 +501,14 @@ class TestUntypedAndChoiceProperties:
         con.execute(f"CREATE TABLE t (c {ddl})")
         con.execute(f"INSERT INTO t SELECT c FROM '{path}'")
         rows = con.execute("SELECT c FROM t").fetchall()
-        assert [json.loads(r[0]) for r in rows] == values
+        # As for every JSON column: None is JSON null, a Decimal a JSON number
+        # and a datetime ISO text.
+        assert [json.loads(r[0]) for r in rows] == [
+            *values[:6],
+            None,
+            2.5,
+            "2024-01-01T10:00:00+00:00",
+        ]
 
     def test_flatten_schema_leaves_input_unchanged(self):
         """Flattening never edits the schema it is given, at any level."""
@@ -522,6 +530,38 @@ class TestUntypedAndChoiceProperties:
         original = copy.deepcopy(schema)
         flatten_schema(schema, max_level=1)
         assert schema == original
+
+    def test_nested_flattening_unchanged(self):
+        """Nested flattening with auto-cast timestamps is as before (old output)."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "created_at": {"type": ["string", "null"], "description": "d"},
+                "parent": {
+                    "type": "object",
+                    "properties": {
+                        "updated_at": {"type": "string"},
+                        "hinted": {
+                            "anyOf": [{"type": "null"}, {"type": "number"}],
+                            "x-sql-datatype": "real",
+                        },
+                        "deep": {
+                            "type": "object",
+                            "properties": {"x": {"type": "integer"}},
+                        },
+                        "tags": {"oneOf": [{"type": "array"}]},
+                    },
+                },
+            },
+        }
+        flat = flatten_schema(schema, max_level=1, auto_cast_timestamps=True)
+        assert {k: _types(v) for k, v in flat.items()} == {
+            "created_at": {"type": ["null", "string"], "format": "date-time"},
+            "parent__deep": {"type": ["null", "object"]},
+            "parent__hinted": {"type": ["null", "number"], "x-sql-datatype": "real"},
+            "parent__tags": {"type": ["array", "null"]},
+            "parent__updated_at": {"type": ["string"]},
+        }
 
     def test_flattened_columns_share_nothing_with_the_input(self):
         """Editing a flattened column changes neither the input nor other columns."""
@@ -578,9 +618,9 @@ class TestUntypedAndChoiceProperties:
             "obj": {"type": ["null", "object"]},
         }
 
-    def _sink(self, prop: dict) -> ducklakeSink:
+    def _sink(self, prop: dict, **config: object) -> ducklakeSink:
         target = Mock()
-        target.config = self.CONFIG
+        target.config = {**self.CONFIG, **config}
         return ducklakeSink(
             target=target,
             stream_name="t",
@@ -618,7 +658,18 @@ class TestUntypedAndChoiceProperties:
         sink = self._sink(prop)
         assert sink.schema["properties"]["c"] == original
         record = {"c": {"n": None}} if "properties" in prop else {"c": None}
-        sink._validator.validate(record)
+        sink._validate_and_parse(record)
+
+    def test_sink_validator_still_rejects_invalid_values_for_choices(self):
+        """Only null is added: a value matching no branch is still rejected."""
+        sink = self._sink({"anyOf": [{"type": "string"}, {"type": "integer"}]})
+        with pytest.raises(InvalidRecord):
+            sink._validate_and_parse({"c": [1]})
+
+    def test_sink_without_record_validation_has_no_validator(self):
+        """validate_records false still turns validation off."""
+        sink = self._sink({"anyOf": [{"type": "string"}]}, validate_records=False)
+        assert sink._validator is None
 
     def test_sink_validator_still_rejects_null_for_plain_types(self):
         """A plain non-nullable type keeps rejecting null, as before."""
