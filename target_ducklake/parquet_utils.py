@@ -152,34 +152,51 @@ def _to_decimal(value: object, scale: int) -> Decimal | None:
     return value.quantize(Decimal(1).scaleb(-scale), context=_DECIMAL_CONTEXT)
 
 
-def _to_staged_value(value: object) -> object:
-    """Prepare a value for a non-decimal column.
+def _has_fixed_offset(value: object) -> bool:
+    """Whether a value is a datetime with a fixed, non-zero UTC offset.
 
-    - A datetime with a fixed non-UTC offset (the singer-sdk parses
-      '...+02:00' into ``timezone(timedelta(hours=2))``) becomes text in the
-      exact form pyarrow already gives named zones,
-      '2024-01-01 10:00:00.000000+0200'. pyarrow looks a fixed offset up as a
-      zone name and fails the batch ("Cannot locate timezone '+02:00'"). UTC,
-      named zones and naive values are left to pyarrow, so their staged text
-      is unchanged.
-    - A Decimal becomes a float (the previous behaviour).
+    The singer-sdk parses '...+02:00' into ``timezone(timedelta(hours=2))``.
+    pyarrow looks such an offset up as a zone name and fails the whole batch
+    ("Cannot locate timezone '+02:00'").
     """
-    if (
+    return (
         isinstance(value, datetime)
         and isinstance(value.tzinfo, timezone)
         and value.utcoffset() != timedelta(0)
-    ):
-        return value.strftime("%Y-%m-%d %H:%M:%S.%f%z")
-    if isinstance(value, Decimal):
-        return float(value)
-    return value
+    )
+
+
+def _datetime_text(value: datetime) -> str:
+    """Render a datetime as text in the form pyarrow gives a single value.
+
+    Naive: '2024-01-01 10:00:00.000000'; UTC: '...000000Z'; any other zone or
+    offset: its own local time and offset, '...000000+0200'. A local time that
+    doesn't exist (a DST gap) is normalised through UTC first, as pyarrow does.
+    """
+    if value.tzinfo is None:
+        return _wall_clock_text(value)
+    if value.tzinfo is timezone.utc:
+        return _wall_clock_text(value) + "Z"
+    local = value.astimezone(timezone.utc).astimezone(value.tzinfo)
+    return _wall_clock_text(local) + local.strftime("%z")
+
+
+def _wall_clock_text(value: datetime) -> str:
+    """'YYYY-MM-DD HH:MM:SS.ffffff' with a zero-padded year (strftime's %Y isn't)."""
+    return value.replace(tzinfo=None).isoformat(sep=" ", timespec="microseconds")
 
 
 def _coerce_column(values: list, field: pa.Field) -> list:
     """Coerce Python values so pyarrow can build the column with the field's type."""
     if pa.types.is_decimal(field.type):
         return [_to_decimal(v, field.type.scale) for v in values]
-    return [_to_staged_value(v) for v in values]
+    if any(_has_fixed_offset(v) for v in values):
+        # pyarrow can't build this column, so render every datetime in it as
+        # text, each in its own offset. Columns without fixed offsets are left
+        # to pyarrow, so what loaded before stages byte-for-byte the same.
+        values = [_datetime_text(v) if isinstance(v, datetime) else v for v in values]
+    # Decimals in non-number columns become floats (the previous behaviour).
+    return [float(v) if isinstance(v, Decimal) else v for v in values]
 
 
 def create_pyarrow_table(

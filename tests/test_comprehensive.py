@@ -1320,19 +1320,24 @@ class TestTimezoneOffsets:
         con = duckdb.connect()
         con.execute("SET TimeZone = 'UTC'")
         con.execute("ATTACH ':memory:' AS ducklake_catalog")
-        self._load_into(con, tmp_path, records, convert_tz_to_utc=convert_tz_to_utc)
+        self._load_into(
+            con,
+            tmp_path,
+            [[record] for record in records],
+            convert_tz_to_utc=convert_tz_to_utc,
+        )
         return con
 
     @staticmethod
     def _load_into(
         con: duckdb.DuckDBPyConnection,
         tmp_path: Path,
-        records: list[dict],
+        batches: list[list[dict]],
         *,
         convert_tz_to_utc: bool = False,
         key_properties: tuple[str, ...] = ("id",),
     ) -> None:
-        """Merge each record as its own batch through the real sink."""
+        """Merge each batch of records through the real sink."""
         config = {
             "catalog_url": "test.db",
             "data_path": str(tmp_path / "data"),
@@ -1365,8 +1370,8 @@ class TestTimezoneOffsets:
                 connector=connector,
             )
             sink.setup()
-            for record in records:
-                sink.process_batch({"records": [record]})
+            for batch in batches:
+                sink.process_batch({"records": batch})
 
     @pytest.mark.parametrize("offset", ["+02:00", "-07:00", "+05:30"])
     @pytest.mark.parametrize("convert", ["keep-offset", "convert-to-utc"])
@@ -1443,7 +1448,7 @@ class TestTimezoneOffsets:
         self._load_into(
             con,
             tmp_path,
-            [{"id": "a", "at": value, "at_tz": value}],
+            [[{"id": "a", "at": value, "at_tz": value}]],
             convert_tz_to_utc=convert == "convert-to-utc",
         )
         con.execute("SET TimeZone = 'UTC'")
@@ -1453,6 +1458,45 @@ class TestTimezoneOffsets:
         wall_clock, utc_wall_clock, instant = expected
         stored = utc_wall_clock if convert == "convert-to-utc" else wall_clock
         assert row == (stored, instant)
+
+    @pytest.mark.parametrize("convert", ["keep-offset", "convert-to-utc"])
+    def test_batch_mixing_fixed_offsets_with_other_zones(
+        self, tmp_path: Path, convert: str
+    ):
+        """One batch with fixed-offset, UTC, named-zone and naive values loads.
+
+        Each value keeps its own instant; a plain column holds each value's
+        own wall-clock time unless convert_tz_to_utc converts it to UTC.
+        """
+        values = {
+            "fixed": datetime(2024, 1, 1, 10, 0, tzinfo=timezone(timedelta(hours=2))),
+            "utc": datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc),
+            "paris": datetime(2024, 1, 1, 10, 0, tzinfo=ZoneInfo("Europe/Paris")),
+            "naive": datetime(2024, 1, 1, 10, 0),  # noqa: DTZ001
+        }
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        # One batch holding all of them, as a tap would send.
+        batch = [{"id": k, "at": v, "at_tz": v} for k, v in values.items()]
+        self._load_into(
+            con, tmp_path, [batch], convert_tz_to_utc=convert == "convert-to-utc"
+        )
+        rows = {
+            r[0]: r[1:]
+            for r in con.execute(
+                'SELECT id, "at"::VARCHAR, at_tz::VARCHAR FROM ducklake_catalog.s.t'
+            ).fetchall()
+        }
+        keep = convert == "keep-offset"
+        fixed_wall_clock = "2024-01-01 10:00:00" if keep else "2024-01-01 08:00:00"
+        paris_wall_clock = "2024-01-01 10:00:00" if keep else "2024-01-01 09:00:00"
+        assert rows == {
+            "fixed": (fixed_wall_clock, "2024-01-01 08:00:00+00"),
+            "utc": ("2024-01-01 10:00:00", "2024-01-01 10:00:00+00"),
+            "paris": (paris_wall_clock, "2024-01-01 09:00:00+00"),
+            "naive": ("2024-01-01 10:00:00", "2024-01-01 10:00:00+00"),
+        }
 
     def test_utc_text_unchanged_for_existing_varchar_key(self, tmp_path: Path):
         """A VARCHAR key written by earlier versions still matches a UTC value.
@@ -1477,7 +1521,7 @@ class TestTimezoneOffsets:
         self._load_into(
             con,
             tmp_path,
-            [{"id": "a", "at": value, "at_tz": value}],
+            [[{"id": "a", "at": value, "at_tz": value}]],
             key_properties=("at",),
         )
         rows = con.execute(
