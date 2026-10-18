@@ -16,8 +16,9 @@ Each entry mirrors its issue on the [Target DuckLake (Definite fork)](https://gi
 | [DUCKLKD-47](https://github.com/paulcaron16k/target-ducklake-definite/issues/47) | Timestamps with a non-UTC offset fail staging unless convert_tz_to_utc is set | `bug/DUCKLKD-47_non-utc-offsets` (deleted after merge) | `xflow_dev` | DUCKLKD-21 (timestamptz tests), DUCKLKD-48 | Done (squash `f06c733` in `xflow_dev`); no upstream PR |
 | [DUCKLKD-50](https://github.com/paulcaron16k/target-ducklake-definite/issues/50) | x-sql-datatype hints on anyOf properties are lost; invalid decimal hints produce invalid DDL | `bug/DUCKLKD-50_anyof-and-invalid-decimal-hints` (deleted after merge) | `xflow_dev` | DUCKLKD-21 | Done (squash `0bb2fe7` in `xflow_dev`); no upstream PR |
 | [DUCKLKD-59](https://github.com/paulcaron16k/target-ducklake-definite/issues/59) | A decimal hint whose precision exceeds 38 caps the scale with it, leaving no integer digits | `bug/DUCKLKD-59_decimal-precision-cap` (deleted after merge) | `xflow_dev` | DUCKLKD-16, DUCKLKD-21 | Done (squash `ac91dc2` in `xflow_dev`); no upstream PR |
+| [DUCKLKD-60](https://github.com/paulcaron16k/target-ducklake-definite/issues/60) | flatten_schema crashes on an all-null or untyped anyOf branch and mutates the caller's schema | `bug/DUCKLKD-60_flatten-anyof-crash` (deleted after merge) | `xflow_dev` | DUCKLKD-50 | Done (squash `5e8461c` in `xflow_dev`); no upstream PR |
 
-**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`). DUCKLKD-21 (`683bd73`) extends `number_precision_and_scale` from DUCKLKD-16 and the temporal key set from DUCKLKD-19, so upstream it must follow both. DUCKLKD-48 (`09a6e91`) replaces DUCKLKD-19's temporal-only cast with a cast of every key to the table's actual type, so upstream it follows DUCKLKD-18, 19 and 21; offering DUCKLKD-19 without DUCKLKD-48 would reintroduce the UUID and REAL key failures. DUCKLKD-49 (`8f83caf`) rewrites the same DELETE as a NULL-safe `USING` join and renames DUCKLKD-48's helper, so upstream it follows DUCKLKD-48. DUCKLKD-50 (`0bb2fe7`) changes `decimal_hint` in `type_hints.py`, which DUCKLKD-21 introduces, and makes `flatten.py` import that module, so upstream it follows DUCKLKD-21. DUCKLKD-59 (`ac91dc2`) rewrites `number_precision_and_scale` from DUCKLKD-16 and changes a DUCKLKD-21 test expectation, so upstream it follows both.
+**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`). DUCKLKD-21 (`683bd73`) extends `number_precision_and_scale` from DUCKLKD-16 and the temporal key set from DUCKLKD-19, so upstream it must follow both. DUCKLKD-48 (`09a6e91`) replaces DUCKLKD-19's temporal-only cast with a cast of every key to the table's actual type, so upstream it follows DUCKLKD-18, 19 and 21; offering DUCKLKD-19 without DUCKLKD-48 would reintroduce the UUID and REAL key failures. DUCKLKD-49 (`8f83caf`) rewrites the same DELETE as a NULL-safe `USING` join and renames DUCKLKD-48's helper, so upstream it follows DUCKLKD-48. DUCKLKD-50 (`0bb2fe7`) changes `decimal_hint` in `type_hints.py`, which DUCKLKD-21 introduces, and makes `flatten.py` import that module, so upstream it follows DUCKLKD-21. DUCKLKD-59 (`ac91dc2`) rewrites `number_precision_and_scale` from DUCKLKD-16 and changes a DUCKLKD-21 test expectation, so upstream it follows both. DUCKLKD-60 (`5e8461c`) rewrites the `anyOf` path in `flatten_schema`, where DUCKLKD-50 added `_with_wrapper_hint`, so upstream it follows DUCKLKD-50; it also overrides `get_validator` in `sinks.py`.
 
 **Verification baseline.** Upstream `main` already has 556 ruff findings, 4 files the formatter would change, and 2 mypy errors in `sinks.py`. "No new findings" below means none added by the fix, compared against that baseline. Tests run with `uv run --python 3.12 pytest tests/` (the default Python 3.14 has no wheel for the pinned pyarrow 20; tracked as [DUCKLKD-32](https://github.com/paulcaron16k/target-ducklake-definite/issues/32)).
 
@@ -346,5 +347,68 @@ Independent Sonnet review, two rounds:
 - **Round 2:** nothing blocking; two test nits declined.
 
 Found, not fixed (filed on the owner's decision): [DUCKLKD-63](https://github.com/paulcaron16k/target-ducklake-definite/issues/63). Staging uses the stream's declared scale, not an existing column's. A table created by upstream `main` as DECIMAL(38,30) from schema keys is now staged at (38,9), so small values lose fraction digits silently; upstream's float staging kept about 16 of them. Values of 1e8 or more, which failed upstream, now load.
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-60 flatten_schema crashes on an all-null or untyped anyOf branch and mutates the caller's schema
+
+## Intent
+
+Found by the independent Sonnet review of PR #58 (DUCKLKD-50) on 2026-10-17; reproduced.
+- **Crashes:** `flatten_schema` failed the stream at sink creation for any property without a usable type:
+  - an all-null `anyOf` raised IndexError;
+  - an `anyOf` whose first non-null branch had no `type` (a `$ref`, a nested `anyOf`, `{}`, a hint only) raised KeyError;
+  - found while reproducing, from the same cause: a property with neither `type` nor `anyOf` (`format` or `$ref` alone) raised TypeError.
+- **Mutation:** it also edited the caller's schema in place, deleting `description` and rewriting the chosen branch's `type` to include null.
+
+## Acceptance
+
+- An all-null anyOf and an untyped branch produce a column with a documented fallback type (or a clear error naming the property) instead of IndexError/KeyError.
+- flatten_schema leaves its input schema unchanged.
+- Regression tests fail on the old code; existing flattening output is unchanged for schemas that loaded before.
+- No new ruff or mypy findings.
+
+## Evidence
+
+Squash-merged into `xflow_dev` as `5e8461c` through fork PR #64 (branch `bug/DUCKLKD-60_flatten-anyof-crash`, deleted after merge).
+
+**Flattening.**
+- A property with no usable type becomes `UNTYPED_COLUMN` (`["null", "object"]`), a JSON column that keeps any value as JSON text. That covers untyped `anyOf` branches, `format` or `$ref` alone, and boolean schemas.
+- An `anyOf` takes its first typed, non-null branch.
+- `flatten_schema` works on copies and returns a deep copy, so nothing reaches the caller's schema.
+- Output is identical for every property that flattened before. The reviewer's differential fuzz over 60,000 random schemas found 0 differences wherever the old code returned; the old code crashed on about 47% of the calls.
+- `flatten_schema` complexity dropped from 19 to 13.
+
+**Validation.** The sink's `self.schema` is what the SDK validates records against, so the old mutation had changed validation:
+- `anyOf`/`oneOf` properties without a null branch accepted null;
+- `oneOf: [string, null]` rejected a valid null, because null then matched two branches.
+
+`ducklakeSink.get_validator` now validates against `nullable_choices(self.schema)`. That is a copy in which every `anyOf`/`oneOf` property also accepts null, at any depth. It accepts everything the old validation accepted, plus the valid `oneOf` nulls; only null is added. `self.schema` stays as the tap sent it.
+
+**Tests and verification.**
+- `TestUntypedAndChoiceProperties` covers:
+  - each untyped shape;
+  - JSON column loads of every value kind;
+  - an input left unchanged and sharing nothing;
+  - compatibility pins at `max_level` 0 and 1 with auto-cast, whose expected output is the old code's;
+  - null acceptance through `_validate_and_parse`;
+  - invalid values still rejected;
+  - `validate_records: false`.
+- On the old code, 16 of the original 18 fail; the 2 compatibility pins pass on both.
+- `xflow_dev` suite: 236 passed. No new ruff, format or mypy findings.
+- On a local DuckLake, through `_validate_and_parse` and the sink with a merge and a re-merge: the `$ref` and all-null `anyOf` columns are JSON; the choice properties' nulls validate; there is one row per key. The old code failed with TypeError.
+
+Independent Sonnet review, two rounds:
+- **Round 1:** no blocking findings.
+  - Fixed: columns shared nested values with the input and `UNTYPED_COLUMN` (`7436ede`, deep copy); boolean property schemas crashed (`d39763c`); test gaps (`ef31aef`).
+  - Documented and pinned (`222800d`): null acceptance for any `anyOf`/`oneOf` property.
+  - Declined, filed as a follow-up: properties still left out.
+- **Round 2:** nothing blocking; three nits declined.
+
+Noted, unchanged: a null in a JSON column is stored as the JSON text `null`, as for every object column.
+
+Found, not fixed (filed): [DUCKLKD-65](https://github.com/paulcaron16k/target-ducklake-definite/issues/65). Properties declared with `oneOf`, `allOf` or `{}` are silently left out of the table, and their values are lost. Only `oneOf` whose first branch is string, array or object keeps a column.
 
 Upstream PR: not opened.
