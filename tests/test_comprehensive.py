@@ -1124,6 +1124,40 @@ class TestExistingNumberColumnStaging:
         assert rows == [Decimal(0), Decimal("2.5")]
         assert "1 value(s) in column 'amount'" in caplog.text
 
+    @pytest.mark.parametrize(
+        ("value", "stored"),
+        [("1.5", "1.5"), ("1" * 33, "1" * 33), ("abc", "abc")],
+        ids=["fraction", "33-digit-integer", "text"],
+    )
+    def test_string_into_existing_text_column_keeps_its_text(
+        self, tmp_path: Path, value: str, stored: str
+    ):
+        """A string property's text lands unchanged in an existing VARCHAR column.
+
+        Its hint (here unsized numeric, which a new table would make DECIMAL)
+        doesn't change what the existing text column receives.
+        """
+        rows, sink = self._load(
+            tmp_path,
+            "amount VARCHAR",
+            {"type": "string", "x-sql-datatype": "numeric"},
+            [value],
+        )
+        assert rows == [stored]
+        assert sink.pyarrow_schema.field("amount").type == pa.string()
+
+    def test_whole_number_decimal_into_existing_integer_column(self, tmp_path: Path):
+        """A bigint unsigned value into an existing BIGINT column loads or fails clearly.
+
+        It is staged as int64, so an out-of-range value names the column.
+        """
+        prop = {"type": "integer", "x-sql-datatype": "bigint unsigned"}
+        rows, sink = self._load(tmp_path / "ok", "amount BIGINT", prop, [5])
+        assert rows == [5]
+        assert sink.pyarrow_schema.field("amount").type == pa.int64()
+        with pytest.raises(ValueError, match="Column 'amount' holds 64-bit integers"):
+            self._load(tmp_path / "big", "amount BIGINT", prop, [2**64 - 1])
+
     def test_non_finite_number_fails_without_a_rounding_report(
         self, caplog: pytest.LogCaptureFixture
     ):
@@ -1670,6 +1704,10 @@ class TestSqlDatatypeHints:
             ("integer", "integer unsigned", "BIGINT"),
             ("integer", "bigint unsigned", "DECIMAL(20, 0)"),
             ("integer", "bigint(20) unsigned", "DECIMAL(20, 0)"),
+            # MySQL's deprecated unsigned decimals and floats.
+            ("number", "decimal(10,2) unsigned", "DECIMAL(10, 2)"),
+            ("number", "double unsigned", "DOUBLE"),
+            ("number", "float unsigned zerofill", "DOUBLE"),
         ],
     )
     def test_more_source_spellings(
@@ -1697,6 +1735,8 @@ class TestSqlDatatypeHints:
             ("string", "character varying(10)"),
             ("string", "char(2)"),
             ("string", "nvarchar(50)"),
+            ("string", "varchar(max)"),
+            ("string", "nvarchar(MAX)"),
             ("string", "citext"),
             ("boolean", "boolean"),
             ("boolean", "bool"),
@@ -1709,6 +1749,23 @@ class TestSqlDatatypeHints:
         prop = {"type": json_type, "x-sql-datatype": hint}
         assert self._ddl_type(prop) == self._ddl_type({"type": json_type})
         assert not recwarn.list
+
+    @pytest.mark.parametrize(
+        ("json_type", "hint"),
+        [
+            ("integer", "text"),
+            ("integer", "boolean"),
+            ("boolean", "text"),
+            ("string", "boolean"),
+        ],
+    )
+    def test_default_hint_on_another_json_type_still_warns(
+        self, json_type: str, hint: str
+    ):
+        """A text or boolean hint is silent only on the JSON type it names."""
+        with pytest.warns(UserWarning, match="does not support the x-sql-datatype"):
+            ddl = self._ddl_type({"type": json_type, "x-sql-datatype": hint})
+        assert ddl == self._ddl_type({"type": json_type})
 
     @pytest.mark.parametrize(
         "hint", ["tinyint", "tinyint(1) unsigned", "timetz", "datetime", "decimal(0)"]

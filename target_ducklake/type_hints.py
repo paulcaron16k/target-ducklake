@@ -116,13 +116,18 @@ _DECIMAL_HINT = re.compile(r"^(?:decimal|numeric)\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*
 # the default decimal mapping: the schema's precision/scale, or DECIMAL(38, 9).
 _UNSIZED_DECIMAL_HINTS = {"decimal", "numeric"}
 
-# Hints whose column is the one the JSON type gives anyway (a string's
-# VARCHAR, a boolean's BOOLEAN). They are accepted without a warning.
-_DEFAULT_TYPE_HINT = re.compile(
-    r"^(?:text|tinytext|mediumtext|longtext|citext|string|boolean|bool"
+# Hints whose column is the one the JSON type gives anyway: a text type on a
+# string property (VARCHAR), a boolean on a boolean property. They are
+# accepted without a warning; on any other JSON type they warn as before.
+_TEXT_TYPE_HINT = re.compile(
+    r"^(?:text|tinytext|mediumtext|longtext|citext|string"
     r"|(?:varchar|character varying|nvarchar|char|character|nchar|bpchar)"
-    r"(?:\s*\(\s*\d+\s*\))?)$"
+    r"(?:\s*\(\s*(?:\d+|max)\s*\))?)$"
 )
+_BOOLEAN_TYPE_HINTS = {"boolean", "bool"}
+
+# MySQL's (deprecated) `unsigned` on a decimal or float changes no type here.
+_UNSIGNED_SUFFIX = re.compile(r"(?:\s+unsigned)?(?:\s+zerofill)?$")
 
 
 def sql_datatype_hint(jsonschema: dict[str, Any]) -> str:
@@ -143,7 +148,7 @@ def decimal_hint(jsonschema: dict[str, Any]) -> tuple[int, int] | None:
     ``DECIMAL(5, 5)``). Precision above 38 is valid and is capped at 38 later.
     """
     hint = sql_datatype_hint(jsonschema)
-    if match := _DECIMAL_HINT.match(hint):
+    if match := _DECIMAL_HINT.match(_UNSIGNED_SUFFIX.sub("", hint, count=1)):
         precision, scale = int(match.group(1)), int(match.group(2) or 0)
         if precision >= 1 and scale <= precision:
             return precision, scale
@@ -156,23 +161,38 @@ def decimal_hint(jsonschema: dict[str, Any]) -> tuple[int, int] | None:
 
 def is_decimal_hint(jsonschema: dict[str, Any]) -> bool:
     """Whether the hint declares a DECIMAL column, sized or not."""
-    return (
-        decimal_hint(jsonschema) is not None
-        or sql_datatype_hint(jsonschema) in _UNSIZED_DECIMAL_HINTS
-    )
+    hint = _UNSIGNED_SUFFIX.sub("", sql_datatype_hint(jsonschema), count=1)
+    return decimal_hint(jsonschema) is not None or hint in _UNSIZED_DECIMAL_HINTS
 
 
 def is_default_type_hint(jsonschema: dict[str, Any]) -> bool:
-    """Whether the hint names the type the JSON type maps to anyway (text, boolean)."""
-    return bool(_DEFAULT_TYPE_HINT.match(sql_datatype_hint(jsonschema)))
+    """Whether the hint names the type the property's JSON type maps to anyway.
+
+    A text type on a string property, or a boolean on a boolean property.
+    """
+    hint = sql_datatype_hint(jsonschema)
+    types = _json_types(jsonschema)
+    if types == ["string"]:
+        return bool(_TEXT_TYPE_HINT.match(hint))
+    return types == ["boolean"] and hint in _BOOLEAN_TYPE_HINTS
+
+
+def _json_types(jsonschema: dict[str, Any]) -> list[str]:
+    """The property's declared JSON types other than null."""
+    types = jsonschema.get("type") or []
+    types = [types] if isinstance(types, str) else types
+    return [t for t in types if t != "null"]
 
 
 def hinted_type(jsonschema: dict[str, Any]) -> str | None:
     """Return the DuckDB type a non-decimal hint maps to, or None if unsupported."""
     hint = _TEMPORAL_PRECISION.sub(r"\1", sql_datatype_hint(jsonschema))
-    if match := _FLOAT_PRECISION_HINT.match(hint):
+    float_hint = _UNSIGNED_SUFFIX.sub("", hint, count=1)
+    if match := _FLOAT_PRECISION_HINT.match(float_hint):
         bits = int(match.group(1))
         return "REAL" if bits <= _MAX_SINGLE_PRECISION_BITS else "DOUBLE"
+    if float_hint in _FLOAT_HINTS:
+        return _FLOAT_HINTS[float_hint]
     if (match := _MYSQL_INTEGER_HINT.match(hint)) and hint not in _HINT_TYPES:
         types = _UNSIGNED_INTEGER_TYPES if match.group(2) else _SIGNED_INTEGER_TYPES
         return types.get(match.group(1))
@@ -202,10 +222,8 @@ def hint_fits_json_type(jsonschema: dict[str, Any], column_type: str) -> bool:
     for ``numeric(12,4)``). A hint that doesn't fit, such as ``uuid`` on an
     integer, would make a column no value of the property can be loaded into.
     """
-    types = jsonschema.get("type") or []
-    types = [types] if isinstance(types, str) else types
     return all(
         column_type in _HINTABLE_COLUMN_TYPES[t]
-        for t in types
+        for t in _json_types(jsonschema)
         if t in _HINTABLE_COLUMN_TYPES
     )
