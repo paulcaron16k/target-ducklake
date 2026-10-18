@@ -886,6 +886,10 @@ class TestStagingFollowsColumnType:
         [
             ("string", "numeric(12,4)", "12.5", "DECIMAL(12, 4)", Decimal("12.5")),
             ("string", "bigint", "42", "BIGINT", 42),
+            # Number text loads as it did through DuckDB's cast.
+            ("string", "bigint", " +12.0 ", "BIGINT", 12),
+            ("string", "integer", "1e2", "INTEGER", 100),
+            ("string", "double", " 1.5 ", "DOUBLE", 1.5),
             ("string", "double", "1.5e-12", "DOUBLE", 1.5e-12),
             ("string", "uuid", UUID, "UUID", uuid.UUID(UUID)),
             ("integer", "numeric(12,4)", 5, "DECIMAL(12, 4)", Decimal(5)),
@@ -965,11 +969,31 @@ class TestStagingFollowsColumnType:
             (
                 {"type": "number", "x-sql-datatype": "bigint"},
                 Decimal("5.5"),
-                pa.ArrowInvalid,
+                ValueError,
             ),
-            ({"type": "string", "x-sql-datatype": "bigint"}, "abc", pa.ArrowInvalid),
+            ({"type": "string", "x-sql-datatype": "bigint"}, "abc", ValueError),
+            ({"type": "string", "x-sql-datatype": "bigint"}, "12.5", ValueError),
+            (
+                {"type": "number", "x-sql-datatype": "bigint"},
+                Decimal("NaN"),
+                ValueError,
+            ),
+            (
+                {"type": "number", "x-sql-datatype": "bigint"},
+                Decimal("Infinity"),
+                ValueError,
+            ),
+            ({"type": "string", "x-sql-datatype": "double"}, "abc", pa.ArrowInvalid),
         ],
-        ids=["string-decimal", "number-bigint-fraction", "string-bigint"],
+        ids=[
+            "string-decimal",
+            "number-bigint-fraction",
+            "string-bigint",
+            "string-bigint-fraction",
+            "number-bigint-nan",
+            "number-bigint-infinity",
+            "string-double",
+        ],
     )
     def test_value_the_column_cannot_hold_fails_the_batch(
         self, prop: dict, value: object, error: type[Exception]

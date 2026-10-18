@@ -1,9 +1,10 @@
 # taken from https://github.com/Automattic/target-parquet/blob/master/target_parquet/utils/parquet.py
 import logging
+import math
 import re
 import warnings
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_HALF_EVEN, Context, Decimal
+from decimal import ROUND_HALF_EVEN, Context, Decimal, InvalidOperation
 
 import pyarrow as pa
 
@@ -224,17 +225,39 @@ def _scalar_text(value: object) -> object:
     return value
 
 
-def _integer_value(value: object) -> object:
-    """An integral Decimal or a bool as an int, so int64 staging keeps every digit.
+def _number_text(value: object) -> object:
+    """Text holding a number as a Decimal, read as DuckDB's cast reads it.
 
-    A Decimal with a fraction is left as it is, so the cast to int64 fails
-    instead of truncating it.
+    Surrounding spaces, a sign, an exponent and trailing zeros are accepted
+    ('+5', ' 7 ', '1e2', '12.0'), so text that loaded through DuckDB's cast
+    when it was staged as text still loads. Anything else is left as it is.
     """
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, Decimal) and value == value.to_integral_value():
-        return int(value)
+    if isinstance(value, str):
+        try:
+            return Decimal(value.strip())
+        except InvalidOperation:
+            pass
     return value
+
+
+def _integer_value(value: object, column: str) -> int | None:
+    """A whole number (int, bool, Decimal, float or number text) as an exact int.
+
+    Raises ValueError naming the column for anything else (a fraction, a
+    non-finite number, text that isn't a number), so the batch fails instead
+    of the value being changed.
+    """
+    number = _number_text(value)
+    if number is None or isinstance(number, int):  # bool is an int
+        return None if number is None else int(number)
+    if (
+        isinstance(number, (Decimal, float))
+        and math.isfinite(number)
+        and number == int(number)
+    ):
+        return int(number)
+    msg = f"Column {column!r} holds whole numbers; {value!r} is not one."
+    raise ValueError(msg)
 
 
 def _coerce_column(values: list, field: pa.Field) -> list:
@@ -242,7 +265,9 @@ def _coerce_column(values: list, field: pa.Field) -> list:
     if pa.types.is_decimal(field.type):
         return [_to_decimal(v, field.type.scale) for v in values]
     if pa.types.is_integer(field.type):
-        return [_integer_value(v) for v in values]
+        return [_integer_value(v, field.name) for v in values]
+    if pa.types.is_floating(field.type):
+        values = [_number_text(v) for v in values]
     if pa.types.is_string(field.type):
         values = [_scalar_text(v) for v in values]
     if any(_has_fixed_offset(v) for v in values):
