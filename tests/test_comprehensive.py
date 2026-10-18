@@ -2576,3 +2576,103 @@ class TestColumnTypeReconciliation:
 
         mock_alter.assert_called_once_with("myschema", "mytable", "legacy_id", "BIGINT")
         mock_add.assert_not_called()
+
+
+class TestCaseInsensitiveColumns:
+    """An existing table whose column names differ only in case still loads.
+
+    DuckDB identifiers are case-insensitive, so the table's "ID" is the
+    stream's "id". Drives the real sink lifecycle on an in-memory catalog.
+    """
+
+    @staticmethod
+    def _load(
+        tmp_path: Path, load_method: str, batches: list[list[dict]]
+    ) -> duckdb.DuckDBPyConnection:
+        con = duckdb.connect()
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        con.execute("CREATE SCHEMA ducklake_catalog.s")
+        # Created by another tool, or an earlier version, with other casing.
+        con.execute(
+            'CREATE TABLE ducklake_catalog.s.t ("ID" BIGINT, "Name" VARCHAR, '
+            '"Legacy" INTEGER)'
+        )
+        con.execute("INSERT INTO ducklake_catalog.s.t VALUES (1, 'old', 7)")
+        config = {
+            "catalog_url": "test.db",
+            "data_path": str(tmp_path / "data"),
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging"),
+            "load_method": load_method,
+        }
+        schema = {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer"},
+                "name": {"type": ["null", "string"]},
+                "legacy": {"type": ["null", "integer"]},
+                "extra": {"type": ["null", "string"]},
+            },
+        }
+        target = Mock()
+        target.config = config
+        connector = DuckLakeConnector(config)
+        with patch.object(
+            connector, "execute", side_effect=lambda sql: con.execute(sql)
+        ):
+            sink = ducklakeSink(
+                target=target,
+                stream_name="t",
+                schema=schema,
+                key_properties=["id"],
+                connector=connector,
+            )
+            sink.setup()
+            for records in batches:
+                sink.process_batch({"records": records})
+        return con
+
+    @pytest.mark.parametrize("load_method", ["merge", "append"])
+    def test_existing_columns_with_other_case_are_not_re_added(
+        self, tmp_path: Path, load_method: str
+    ):
+        """Setup adds only the new column, and values land in the existing ones."""
+        batches = [
+            [{"id": 2, "name": "a", "legacy": 8, "extra": "x"}],
+            [{"id": 2, "name": "b", "legacy": 9, "extra": "y"}],
+        ]
+        con = self._load(tmp_path, load_method, batches)
+        columns = con.execute(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_name = 't' ORDER BY ordinal_position"
+        ).fetchall()
+        assert columns == [
+            ("ID", "BIGINT"),
+            ("Name", "VARCHAR"),
+            ("Legacy", "BIGINT"),  # widened in place for the stream's integer
+            ("extra", "VARCHAR"),
+        ]
+        rows = con.execute("SELECT * FROM ducklake_catalog.s.t ORDER BY ALL").fetchall()
+        if load_method == "merge":
+            assert rows == [(1, "old", 7, None), (2, "b", 9, "y")]
+        else:
+            assert rows == [(1, "old", 7, None), (2, "a", 8, "x"), (2, "b", 9, "y")]
+
+    def test_widening_matches_columns_case_insensitively(self):
+        """A safe widening applies to the existing column whatever its case."""
+        connector = DuckLakeConnector(
+            {"catalog_url": "test.db", "data_path": "/tmp/test"}
+        )
+        with patch.object(connector, "_alter_column_type") as alter:
+            connector._reconcile_column_types(
+                "s", "t", [{"name": "legacy", "type": "BIGINT"}], {"Legacy": "INTEGER"}
+            )
+        alter.assert_called_once_with("s", "t", "Legacy", "BIGINT")
+
+    def test_insert_columns_match_file_columns_case_insensitively(self):
+        """A table column is read from the file column of the same name in any case."""
+        sql = DuckLakeConnector._build_columns_sql(
+            Mock(), file_columns=["id", "name"], target_table_columns=["ID", "Gone"]
+        )
+        assert sql.split(", ") == [' "ID"', "NULL"]
