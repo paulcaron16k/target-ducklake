@@ -17,6 +17,8 @@ from typing import Any
 
 # Integer widths: ISO names plus the intN spellings catalog-reading taps emit.
 # `tinyint` is deliberately absent: MySQL uses tinyint(1) for booleans.
+# MySQL spellings with a display width or `unsigned` are read by
+# `_MYSQL_INTEGER_HINT` below.
 _INTEGER_HINTS = {
     "smallint": "SMALLINT",
     "int2": "SMALLINT",
@@ -52,6 +54,11 @@ _MAX_SINGLE_PRECISION_BITS = 24
 # and keeps its text intact.
 _TEMPORAL_HINTS = {
     "timestamp": "TIMESTAMP",
+    # SQL Server: datetime2 and smalldatetime have no time zone, datetimeoffset
+    # has an offset.
+    "datetime2": "TIMESTAMP",
+    "smalldatetime": "TIMESTAMP",
+    "datetimeoffset": "TIMESTAMPTZ",
     "timestamp without time zone": "TIMESTAMP",
     "timestamp_ntz": "TIMESTAMP",
     "timestamptz": "TIMESTAMPTZ",
@@ -72,9 +79,50 @@ _OTHER_HINTS = {
 
 _HINT_TYPES = {**_INTEGER_HINTS, **_FLOAT_HINTS, **_TEMPORAL_HINTS, **_OTHER_HINTS}
 
+# A fractional-seconds precision, as in timestamp(6), time(3) or
+# timestamp(3) with time zone. DuckDB keeps microseconds, as the singer-sdk's
+# parsed values do, so the precision doesn't change the column type.
+_TEMPORAL_PRECISION = re.compile(
+    r"^(timestamptz|timestamp|time|datetime2|datetimeoffset)\s*\(\s*\d+\s*\)"
+)
+
+# MySQL integers: a display width (int(11)) changes nothing; `unsigned` needs
+# the next wider type to hold its range. bigint unsigned (up to 2^64 - 1)
+# needs DECIMAL(20, 0), see `decimal_hint`.
+_MYSQL_INTEGER_HINT = re.compile(
+    r"^(smallint|mediumint|integer|int|bigint)(?:\s*\(\s*\d+\s*\))?"
+    r"(\s+unsigned)?(?:\s+zerofill)?$"
+)
+_SIGNED_INTEGER_TYPES = {
+    "smallint": "SMALLINT",
+    "mediumint": "INTEGER",
+    "integer": "INTEGER",
+    "int": "INTEGER",
+    "bigint": "BIGINT",
+}
+_UNSIGNED_INTEGER_TYPES = {
+    "smallint": "INTEGER",
+    "mediumint": "INTEGER",
+    "integer": "BIGINT",
+    "int": "BIGINT",
+}
+_UNSIGNED_BIGINT_DECIMAL = (20, 0)
+
 # `decimal(p,s)` and `numeric(p,s)` are the two portable spellings of the same
 # exact numeric; a tap reading a catalog emits whichever the source declared.
-_DECIMAL_HINT = re.compile(r"^(?:decimal|numeric)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)$")
+# A missing scale is 0, as in SQL (decimal(10) is DECIMAL(10, 0)).
+_DECIMAL_HINT = re.compile(r"^(?:decimal|numeric)\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)$")
+# Without a precision (Postgres' unconstrained numeric), a decimal hint takes
+# the default decimal mapping: the schema's precision/scale, or DECIMAL(38, 9).
+_UNSIZED_DECIMAL_HINTS = {"decimal", "numeric"}
+
+# Hints whose column is the one the JSON type gives anyway (a string's
+# VARCHAR, a boolean's BOOLEAN). They are accepted without a warning.
+_DEFAULT_TYPE_HINT = re.compile(
+    r"^(?:text|tinytext|mediumtext|longtext|citext|string|boolean|bool"
+    r"|(?:varchar|character varying|nvarchar|char|character|nchar|bpchar)"
+    r"(?:\s*\(\s*\d+\s*\))?)$"
+)
 
 
 def sql_datatype_hint(jsonschema: dict[str, Any]) -> str:
@@ -94,19 +142,40 @@ def decimal_hint(jsonschema: dict[str, Any]) -> tuple[int, int] | None:
     invalid (``DECIMAL(0, 0)``) or silently changed (``DECIMAL(5, 10)`` to
     ``DECIMAL(5, 5)``). Precision above 38 is valid and is capped at 38 later.
     """
-    if match := _DECIMAL_HINT.match(sql_datatype_hint(jsonschema)):
-        precision, scale = int(match.group(1)), int(match.group(2))
+    hint = sql_datatype_hint(jsonschema)
+    if match := _DECIMAL_HINT.match(hint):
+        precision, scale = int(match.group(1)), int(match.group(2) or 0)
         if precision >= 1 and scale <= precision:
             return precision, scale
+    if (match := _MYSQL_INTEGER_HINT.match(hint)) and (
+        match.group(1) == "bigint" and match.group(2)
+    ):
+        return _UNSIGNED_BIGINT_DECIMAL
     return None
+
+
+def is_decimal_hint(jsonschema: dict[str, Any]) -> bool:
+    """Whether the hint declares a DECIMAL column, sized or not."""
+    return (
+        decimal_hint(jsonschema) is not None
+        or sql_datatype_hint(jsonschema) in _UNSIZED_DECIMAL_HINTS
+    )
+
+
+def is_default_type_hint(jsonschema: dict[str, Any]) -> bool:
+    """Whether the hint names the type the JSON type maps to anyway (text, boolean)."""
+    return bool(_DEFAULT_TYPE_HINT.match(sql_datatype_hint(jsonschema)))
 
 
 def hinted_type(jsonschema: dict[str, Any]) -> str | None:
     """Return the DuckDB type a non-decimal hint maps to, or None if unsupported."""
-    hint = sql_datatype_hint(jsonschema)
+    hint = _TEMPORAL_PRECISION.sub(r"\1", sql_datatype_hint(jsonschema))
     if match := _FLOAT_PRECISION_HINT.match(hint):
         bits = int(match.group(1))
         return "REAL" if bits <= _MAX_SINGLE_PRECISION_BITS else "DOUBLE"
+    if (match := _MYSQL_INTEGER_HINT.match(hint)) and hint not in _HINT_TYPES:
+        types = _UNSIGNED_INTEGER_TYPES if match.group(2) else _SIGNED_INTEGER_TYPES
+        return types.get(match.group(1))
     return _HINT_TYPES.get(hint)
 
 
