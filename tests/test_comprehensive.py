@@ -984,6 +984,8 @@ class TestStagingFollowsColumnType:
                 ValueError,
             ),
             ({"type": "string", "x-sql-datatype": "double"}, "abc", pa.ArrowInvalid),
+            ({"type": "string", "x-sql-datatype": "bigint"}, "1e30", ValueError),
+            ({"type": "integer", "x-sql-datatype": "bigint"}, 2**63, ValueError),
         ],
         ids=[
             "string-decimal",
@@ -993,6 +995,8 @@ class TestStagingFollowsColumnType:
             "number-bigint-nan",
             "number-bigint-infinity",
             "string-double",
+            "string-bigint-overflow",
+            "integer-bigint-overflow",
         ],
     )
     def test_value_the_column_cannot_hold_fails_the_batch(

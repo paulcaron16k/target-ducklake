@@ -240,24 +240,34 @@ def _number_text(value: object) -> object:
     return value
 
 
+_INT64_RANGE = range(-(2**63), 2**63)
+
+
 def _integer_value(value: object, column: str) -> int | None:
     """A whole number (int, bool, Decimal, float or number text) as an exact int.
 
     Raises ValueError naming the column for anything else (a fraction, a
-    non-finite number, text that isn't a number), so the batch fails instead
-    of the value being changed.
+    non-finite number, text that isn't a number, a number outside int64), so
+    the batch fails instead of the value being changed.
     """
     number = _number_text(value)
-    if number is None or isinstance(number, int):  # bool is an int
-        return None if number is None else int(number)
-    if (
-        isinstance(number, (Decimal, float))
-        and math.isfinite(number)
-        and number == int(number)
-    ):
-        return int(number)
-    msg = f"Column {column!r} holds whole numbers; {value!r} is not one."
-    raise ValueError(msg)
+    if number is None:
+        return None
+    if isinstance(number, int):  # bool is an int
+        integer: int | None = int(number)
+    elif isinstance(number, Decimal) and number.is_finite():
+        integer = int(number) if number == number.to_integral_value() else None
+    elif isinstance(number, float) and math.isfinite(number):
+        integer = int(number) if number.is_integer() else None
+    else:
+        integer = None
+    if integer is None:
+        msg = f"Column {column!r} holds whole numbers; {value!r} is not one."
+        raise ValueError(msg)
+    if integer not in _INT64_RANGE:
+        msg = f"Column {column!r} holds 64-bit integers; {value!r} is out of range."
+        raise ValueError(msg)
+    return integer
 
 
 def _coerce_column(values: list, field: pa.Field) -> list:
