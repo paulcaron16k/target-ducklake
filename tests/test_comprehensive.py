@@ -566,6 +566,49 @@ class TestUntypedAndChoiceProperties:
             "parent__updated_at": {"type": ["string"]},
         }
 
+    @pytest.mark.parametrize(
+        "prop",
+        [
+            {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            {"anyOf": [{"type": "null"}, {"type": ["string", "null"]}]},
+            {"oneOf": [{"type": "string"}]},
+            {"allOf": [{"type": "string", "maxLength": 40}]},
+        ],
+        ids=["anyof", "anyof-type-list", "oneof", "allof"],
+    )
+    def test_auto_cast_timestamps_applies_to_choice_properties(self, prop: dict):
+        """A choice property resolving to a plain string is auto-cast like one."""
+        schema = {"type": "object", "properties": {"created_at": prop}}
+        flat = flatten_schema(schema, auto_cast_timestamps=True)
+        assert flat["created_at"]["format"] == "date-time"
+        connector = DuckLakeConnector(self.CONFIG)
+        assert connector.json_to_ducklake_schema(flat)[0]["type"] == "DATETIME"
+        # Off (the default), the column is left as it was.
+        assert "format" not in flatten_schema(schema)["created_at"]
+
+    @pytest.mark.parametrize(
+        "prop",
+        [
+            {"anyOf": [{"type": "string", "format": "date"}, {"type": "null"}]},
+            {"anyOf": [{"type": "string"}, {"type": "null"}], "format": "date"},
+            {"oneOf": [{"type": "integer"}]},
+            {"anyOf": [{"$ref": "#/d"}]},
+        ],
+        ids=["branch-format", "wrapper-format", "integer", "untyped"],
+    )
+    def test_auto_cast_timestamps_skips_other_choice_properties(self, prop: dict):
+        """A formatted, non-string or untyped choice column is not auto-cast."""
+        schema = {"type": "object", "properties": {"created_at": prop}}
+        flat = flatten_schema(schema, auto_cast_timestamps=True)
+        assert flat["created_at"].get("format") != "date-time"
+        assert flat == flatten_schema(schema)
+
+    def test_auto_cast_timestamps_checks_choice_property_names(self):
+        """Only names in TIMESTAMP_COLUMN_NAMES are auto-cast, as for plain strings."""
+        prop = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+        schema = {"type": "object", "properties": {"note": prop}}
+        assert "format" not in flatten_schema(schema, auto_cast_timestamps=True)["note"]
+
     def test_flattened_columns_share_nothing_with_the_input(self):
         """Editing a flattened column changes neither the input nor other columns."""
         schema = {

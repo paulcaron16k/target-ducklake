@@ -141,6 +141,22 @@ def _choice_column(prop: dict, keyword: str) -> dict:
     return _with_wrapper_hint(prop, column)
 
 
+def _leaf_column(prop: dict) -> dict:
+    """The column for a property that is not flattened into further columns."""
+    if "type" in prop:
+        # certain taps (e.g. postgres) sometimes return a list of types for JSON columns
+        # we need to handle this specific case, if we don't the schema returns VARCHAR
+        # may need to revisit this for other types
+        if "array" in prop["type"]:
+            return {"type": ["null", "array"]}
+        if "object" in prop["type"]:
+            return {"type": ["null", "object"]}
+        return prop
+    if keyword := next((kw for kw in _CHOICE_KEYWORDS if kw in prop), None):
+        return _choice_column(prop, keyword)
+    return UNTYPED_COLUMN  # no type information at all, e.g. {}
+
+
 def _with_wrapper_hint(prop: dict, branch: dict) -> dict:
     """Carry a choice property's own x-sql-datatype hint into its chosen branch.
 
@@ -176,34 +192,31 @@ def flatten_schema(
         # (left out of a copy, so the caller's schema keeps it)
         v = {key: value for key, value in prop.items() if key != "description"}
 
-        if "type" in v.keys():
-            if "object" in v["type"] and "properties" in v and level < max_level:
-                items.extend(
-                    flatten_schema(
-                        v,
-                        parent_key + [k],
-                        sep=sep,
-                        level=level + 1,
-                        max_level=max_level,
-                        auto_cast_timestamps=auto_cast_timestamps,
-                    ).items()
-                )
-            # certain taps (e.g. postgres) sometimes return a list of types for JSON columns
-            # we need to handle this specific case, if we don't the schema returns VARCHAR
-            # may need to revisit this for other types
-            elif "array" in v["type"]:
-                items.append((new_key, {"type": ["null", "array"]}))
-            elif "object" in v["type"]:
-                items.append((new_key, {"type": ["null", "object"]}))
-            # Apply timestamp auto-casting if applicable
-            elif _should_auto_cast_to_timestamp(new_key, v, auto_cast_timestamps):
-                items.append((new_key, _apply_timestamp_format(v)))
-            else:
-                items.append((new_key, v))
-        elif keyword := next((kw for kw in _CHOICE_KEYWORDS if kw in v), None):
-            items.append((new_key, _choice_column(v, keyword)))
-        else:  # no type information at all, e.g. {}
-            items.append((new_key, UNTYPED_COLUMN))
+        if (
+            "type" in v
+            and "object" in v["type"]
+            and "properties" in v
+            and level < max_level
+        ):
+            items.extend(
+                flatten_schema(
+                    v,
+                    parent_key + [k],
+                    sep=sep,
+                    level=level + 1,
+                    max_level=max_level,
+                    auto_cast_timestamps=auto_cast_timestamps,
+                ).items()
+            )
+            continue
+        column = _leaf_column(v)
+        # Timestamp auto-casting applies to the column, however it was declared;
+        # a format on a choice wrapper (not carried into the column) also stops it.
+        if v.get("format") is None and _should_auto_cast_to_timestamp(
+            new_key, column, auto_cast_timestamps
+        ):
+            column = _apply_timestamp_format(column)
+        items.append((new_key, column))
 
     key_func = lambda item: item[0]
     sorted_items = sorted(items, key=key_func)
