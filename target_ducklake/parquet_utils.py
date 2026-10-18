@@ -158,10 +158,11 @@ def _normalize_datetime(value):
     if isinstance(value, str):
         try:
             parsed = datetime.fromisoformat(value)
-            if parsed.tzinfo is not None:
-                return _datetime_text(parsed.astimezone(timezone.utc))
+            utc = parsed.astimezone(timezone.utc) if parsed.tzinfo else None
         except (ValueError, OverflowError):
-            pass
+            utc = None
+        if utc is not None:
+            return _datetime_text(utc)
     return value
 
 
