@@ -241,6 +241,7 @@ def _number_text(value: object) -> object:
 
 
 _INT64_RANGE = range(-(2**63), 2**63)
+_INT64_DIGITS = len(str(2**63))  # 19: a Decimal with more digits can't fit
 
 
 def _integer_value(value: object, column: str) -> int | None:
@@ -256,6 +257,10 @@ def _integer_value(value: object, column: str) -> int | None:
     if isinstance(number, int):  # bool is an int
         integer: int | None = int(number)
     elif isinstance(number, Decimal) and number.is_finite():
+        if number.adjusted() >= _INT64_DIGITS:
+            # Rejected on magnitude: int() of '1e1000000' would take minutes.
+            msg = f"Column {column!r} holds 64-bit integers; {value!r} is out of range."
+            raise ValueError(msg)
         integer = int(number) if number == number.to_integral_value() else None
     elif isinstance(number, float) and math.isfinite(number):
         integer = int(number) if number.is_integer() else None

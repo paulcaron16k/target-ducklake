@@ -986,6 +986,8 @@ class TestStagingFollowsColumnType:
             ({"type": "string", "x-sql-datatype": "double"}, "abc", pa.ArrowInvalid),
             ({"type": "string", "x-sql-datatype": "bigint"}, "1e30", ValueError),
             ({"type": "integer", "x-sql-datatype": "bigint"}, 2**63, ValueError),
+            # Rejected at once, without building a million-digit int.
+            ({"type": "string", "x-sql-datatype": "bigint"}, "1e1000000", ValueError),
         ],
         ids=[
             "string-decimal",
@@ -997,6 +999,7 @@ class TestStagingFollowsColumnType:
             "string-double",
             "string-bigint-overflow",
             "integer-bigint-overflow",
+            "string-bigint-huge-exponent",
         ],
     )
     def test_value_the_column_cannot_hold_fails_the_batch(
