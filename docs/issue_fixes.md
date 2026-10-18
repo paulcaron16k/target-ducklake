@@ -17,8 +17,10 @@ Each entry mirrors its issue on the [Target DuckLake (Definite fork)](https://gi
 | [DUCKLKD-50](https://github.com/paulcaron16k/target-ducklake-definite/issues/50) | x-sql-datatype hints on anyOf properties are lost; invalid decimal hints produce invalid DDL | `bug/DUCKLKD-50_anyof-and-invalid-decimal-hints` (deleted after merge) | `xflow_dev` | DUCKLKD-21 | Done (squash `0bb2fe7` in `xflow_dev`); no upstream PR |
 | [DUCKLKD-59](https://github.com/paulcaron16k/target-ducklake-definite/issues/59) | A decimal hint whose precision exceeds 38 caps the scale with it, leaving no integer digits | `bug/DUCKLKD-59_decimal-precision-cap` (deleted after merge) | `xflow_dev` | DUCKLKD-16, DUCKLKD-21 | Done (squash `ac91dc2` in `xflow_dev`); no upstream PR |
 | [DUCKLKD-60](https://github.com/paulcaron16k/target-ducklake-definite/issues/60) | flatten_schema crashes on an all-null or untyped anyOf branch and mutates the caller's schema | `bug/DUCKLKD-60_flatten-anyof-crash` (deleted after merge) | `xflow_dev` | DUCKLKD-50 | Done (squash `5e8461c` in `xflow_dev`); no upstream PR |
+| [DUCKLKD-65](https://github.com/paulcaron16k/target-ducklake-definite/issues/65) | Properties declared with oneOf, allOf or {} are silently left out of the table, and their values are lost | `bug/DUCKLKD-65_oneof-allof-columns` (deleted after merge) | `xflow_dev` | DUCKLKD-60 | Done (squash `6ca7032` in `xflow_dev`, with DUCKLKD-66); no upstream PR |
+| [DUCKLKD-66](https://github.com/paulcaron16k/target-ducklake-definite/issues/66) | An anyOf branch with several types gets a staging type that changes from run to run | `bug/DUCKLKD-65_oneof-allof-columns` (deleted after merge) | `xflow_dev` | DUCKLKD-60 | Done (squash `6ca7032` in `xflow_dev`, with DUCKLKD-65); no upstream PR |
 
-**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`). DUCKLKD-21 (`683bd73`) extends `number_precision_and_scale` from DUCKLKD-16 and the temporal key set from DUCKLKD-19, so upstream it must follow both. DUCKLKD-48 (`09a6e91`) replaces DUCKLKD-19's temporal-only cast with a cast of every key to the table's actual type, so upstream it follows DUCKLKD-18, 19 and 21; offering DUCKLKD-19 without DUCKLKD-48 would reintroduce the UUID and REAL key failures. DUCKLKD-49 (`8f83caf`) rewrites the same DELETE as a NULL-safe `USING` join and renames DUCKLKD-48's helper, so upstream it follows DUCKLKD-48. DUCKLKD-50 (`0bb2fe7`) changes `decimal_hint` in `type_hints.py`, which DUCKLKD-21 introduces, and makes `flatten.py` import that module, so upstream it follows DUCKLKD-21. DUCKLKD-59 (`ac91dc2`) rewrites `number_precision_and_scale` from DUCKLKD-16 and changes a DUCKLKD-21 test expectation, so upstream it follows both. DUCKLKD-60 (`5e8461c`) rewrites the `anyOf` path in `flatten_schema`, where DUCKLKD-50 added `_with_wrapper_hint`, so upstream it follows DUCKLKD-50; it also overrides `get_validator` in `sinks.py`.
+**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`). DUCKLKD-21 (`683bd73`) extends `number_precision_and_scale` from DUCKLKD-16 and the temporal key set from DUCKLKD-19, so upstream it must follow both. DUCKLKD-48 (`09a6e91`) replaces DUCKLKD-19's temporal-only cast with a cast of every key to the table's actual type, so upstream it follows DUCKLKD-18, 19 and 21; offering DUCKLKD-19 without DUCKLKD-48 would reintroduce the UUID and REAL key failures. DUCKLKD-49 (`8f83caf`) rewrites the same DELETE as a NULL-safe `USING` join and renames DUCKLKD-48's helper, so upstream it follows DUCKLKD-48. DUCKLKD-50 (`0bb2fe7`) changes `decimal_hint` in `type_hints.py`, which DUCKLKD-21 introduces, and makes `flatten.py` import that module, so upstream it follows DUCKLKD-21. DUCKLKD-59 (`ac91dc2`) rewrites `number_precision_and_scale` from DUCKLKD-16 and changes a DUCKLKD-21 test expectation, so upstream it follows both. DUCKLKD-60 (`5e8461c`) rewrites the `anyOf` path in `flatten_schema`, where DUCKLKD-50 added `_with_wrapper_hint`, so upstream it follows DUCKLKD-50; it also overrides `get_validator` in `sinks.py`. DUCKLKD-65 and DUCKLKD-66 (one squash, `6ca7032`) replace DUCKLKD-60's `_anyof_column` and `_first_choice_column` with `_choice_column`, so upstream they follow DUCKLKD-60 and travel together.
 
 **Verification baseline.** Upstream `main` already has 556 ruff findings, 4 files the formatter would change, and 2 mypy errors in `sinks.py`. "No new findings" below means none added by the fix, compared against that baseline. Tests run with `uv run --python 3.12 pytest tests/` (the default Python 3.14 has no wheel for the pinned pyarrow 20; tracked as [DUCKLKD-32](https://github.com/paulcaron16k/target-ducklake-definite/issues/32)).
 
@@ -381,7 +383,7 @@ Squash-merged into `xflow_dev` as `5e8461c` through fork PR #64 (branch `bug/DUC
 - Output is identical for every property that flattened before. The reviewer's differential fuzz over 60,000 random schemas found 0 differences wherever the old code returned; the old code crashed on about 47% of the calls.
 - `flatten_schema` complexity dropped from 19 to 13.
 
-**Validation.** The sink's `self.schema` is what the SDK validates records against, so the old mutation had changed validation:
+**Validation.** The sink's `self.schema` is what the SDK validates records against when `validate_records` is on. It is off by default in this target, so this matters only to streams that enable it. The old mutation had changed validation:
 - `anyOf`/`oneOf` properties without a null branch accepted null;
 - `oneOf: [string, null]` rejected a valid null, because null then matched two branches.
 
@@ -410,5 +412,87 @@ Independent Sonnet review, two rounds:
 Noted, unchanged: a null in a JSON column is stored as the JSON text `null`, as for every object column.
 
 Found, not fixed (filed): [DUCKLKD-65](https://github.com/paulcaron16k/target-ducklake-definite/issues/65). Properties declared with `oneOf`, `allOf` or `{}` are silently left out of the table, and their values are lost. Only `oneOf` whose first branch is string, array or object keeps a column.
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-65 Properties declared with oneOf, allOf or {} are silently left out of the table, and their values are lost
+
+## Intent
+
+Found by the independent Sonnet review of PR #64 (DUCKLKD-60) on 2026-10-18, finding 5; reproduced and found wider. A property with neither `type` nor `anyOf` took `flatten_schema`'s third path. That path looked only at the first branch of its first key, and kept the column only when that branch's type was exactly `string`, `array` or `object`. Otherwise the property got no column, and its values were dropped at staging with no error. Affected: `{}`, `oneOf [integer, null]`, `oneOf` with the null branch first, `oneOf` with a type list, and `allOf [number]`.
+
+## Acceptance
+
+- oneOf and allOf properties are flattened like anyOf: the first typed, non-null branch gives the column, with type lists handled and null branches skipped.
+- {} (any value) gives the JSON column (UNTYPED_COLUMN), as untyped properties do since DUCKLKD-60.
+- Existing tables gain the new columns through the normal add-column path; nothing already loaded changes type. The PR states this table-shape change.
+- Regression tests show each case's column and values on the old code missing.
+- No new ruff or mypy findings.
+
+## Evidence
+
+Squash-merged into `xflow_dev` as `6ca7032` through fork PR #67 (branch `bug/DUCKLKD-65_oneof-allof-columns`, deleted after merge), together with [DUCKLKD-66](https://github.com/paulcaron16k/target-ducklake-definite/issues/66).
+
+**The fix.** One `_choice_column(prop, keyword)` serves `anyOf`, `oneOf` and `allOf`:
+- the first branch with a non-null type gives the column;
+- null-only, untyped and non-dict branches are skipped;
+- the wrapper's `x-sql-datatype` hint is carried.
+
+A property with no type information at all (`{}`, a description only) is the JSON column. `allOf` uses its first typed branch; branches are not merged.
+
+**Behaviour changes, stated in the PR:**
+- Properties that were dropped get columns, and existing tables gain them through `prepare_table`'s add-column path.
+- `oneOf`/`allOf` columns that DUCKLKD-60 (not deployed) made JSON now take their branch's type.
+- `oneOf`/`allOf` wrapper hints are honoured.
+- An `anyOf` branch whose type is the list `["null"]` is skipped like `{type: "null"}`. It used to give VARCHAR and hide a later typed branch.
+
+**Tests and verification:**
+- New tests:
+  - seven column cases (column, DDL and staging);
+  - staged values;
+  - the type-order test of DUCKLKD-66.
+- On the old `flatten.py`, 11 fail.
+- `xflow_dev` suite: 247 passed. No new ruff, format or mypy findings; `flatten_schema` complexity is 12.
+- A differential check against `xflow_dev` over 20,000 random schemas:
+  - 0 lost columns and 9,078 new ones;
+  - every other difference is intended: a type now taken from a oneOf/allOf branch, a carried wrapper hint, the `["null"]`-branch case, or type order.
+- On a local DuckLake: the old code created the stream's table with only `id`. The new code added `amt DECIMAL(38,9)`, `any JSON`, `n BIGINT` and `s UUID`, and loaded their values.
+
+Independent Sonnet review, two rounds:
+- **Round 1:** no blocking findings. Fixed: the subprocess test's `cwd` (`7d22962`). Declined:
+  - allOf null validation, which correctly rejects null;
+  - a malformed `{type: 5}`, which is invalid JSON Schema and crashed before too.
+  - With `validate_records` off, the default, it reaches `flatten_schema`; the first reply's reason was corrected on the PR.
+- Three findings filed as follow-ups.
+- **Round 2:** nothing blocking.
+
+Found, not fixed (pre-existing, filed):
+- [DUCKLKD-68](https://github.com/paulcaron16k/target-ducklake-definite/issues/68): a column with several JSON types is staged at its first type while the DDL is VARCHAR, so `'abc'` in an `[integer, string]` column fails the batch.
+- [DUCKLKD-69](https://github.com/paulcaron16k/target-ducklake-definite/issues/69): `auto_cast_timestamps` ignores `anyOf`/`oneOf`/`allOf` properties.
+- [DUCKLKD-70](https://github.com/paulcaron16k/target-ducklake-definite/issues/70): a null in a JSON column is stored as the JSON text `null`.
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-66 An anyOf branch with several types gets a staging type that changes from run to run
+
+## Intent
+
+Found while starting DUCKLKD-65 on 2026-10-18; reproduced. `_anyof_column` built the column's type list with `list(set([...]))`, whose order depends on Python's per-process string hashing (PYTHONHASHSEED). Staging uses the first non-null type. So `anyOf [{type: [integer, string]}, {type: null}]` staged as int64 under seeds 1, 4 and 6, and as string under 2, 3 and 5, while the DDL was VARCHAR every time. A non-numeric value loaded in one run and failed in the next.
+
+## Acceptance
+
+- A choice branch's type list keeps its declared order (null first, then the branch's non-null types), as a plain type list does, so the column and staging types are the same in every process.
+- A regression test runs the flattening under several PYTHONHASHSEED values and gets one result.
+- No new ruff or mypy findings.
+
+## Evidence
+
+Fixed in the same squash as DUCKLKD-65 (`6ca7032`, fork PR #67), because the shared `_choice_column` would otherwise have carried the random order into `oneOf` and `allOf`. The column type is `["null", *branch types in declared order]`. `test_branch_type_order_is_the_same_in_every_process` runs the flattening for `anyOf`, `oneOf` and `allOf`, each in fresh interpreters under PYTHONHASHSEED 1–8. All three give one result, `["null", "integer", "string"]`. On the old code they fail; the `anyOf` case gave five different orders across the eight seeds.
+
+What remains is filed as [DUCKLKD-68](https://github.com/paulcaron16k/target-ducklake-definite/issues/68): staging at the first type while the DDL is VARCHAR, which now fails consistently for integer-first lists.
 
 Upstream PR: not opened.

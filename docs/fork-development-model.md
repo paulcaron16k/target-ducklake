@@ -155,6 +155,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-50](https://github.com/paulcaron16k/target-ducklake-definite/issues/50) Honour hints on anyOf properties; reject impossible decimal hints | squash `0bb2fe7` (fork PR #58) | — | In fork, PR not opened |
 | [DUCKLKD-59](https://github.com/paulcaron16k/target-ducklake-definite/issues/59) Cap decimals above 38 digits without losing integer digits | squash `ac91dc2` (fork PR #62) | — | In fork, PR not opened |
 | [DUCKLKD-60](https://github.com/paulcaron16k/target-ducklake-definite/issues/60) Untyped properties become JSON columns; flatten_schema no longer mutates its input | squash `5e8461c` (fork PR #64) | — | In fork, PR not opened |
+| [DUCKLKD-65](https://github.com/paulcaron16k/target-ducklake-definite/issues/65) + [DUCKLKD-66](https://github.com/paulcaron16k/target-ducklake-definite/issues/66) oneOf/allOf/{} properties get columns; choice types keep their declared order | squash `6ca7032` (fork PR #67) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
