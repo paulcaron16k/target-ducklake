@@ -603,6 +603,18 @@ class TestUntypedAndChoiceProperties:
         assert flat["created_at"].get("format") != "date-time"
         assert flat == flatten_schema(schema)
 
+    def test_auto_cast_timestamps_mixed_choice_follows_its_first_branch(self):
+        """A string-first mixed choice is auto-cast, as a plain type list is."""
+        mixed = {"anyOf": [{"type": "string"}, {"type": "integer"}]}
+        listed = {"type": ["string", "integer"]}
+        schema = {
+            "type": "object",
+            "properties": {"created_at": mixed, "updated_at": listed},
+        }
+        flat = flatten_schema(schema, auto_cast_timestamps=True)
+        assert flat["created_at"]["format"] == "date-time"
+        assert flat["updated_at"]["format"] == "date-time"
+
     def test_auto_cast_timestamps_checks_choice_property_names(self):
         """Only names in TIMESTAMP_COLUMN_NAMES are auto-cast, as for plain strings."""
         prop = {"anyOf": [{"type": "string"}, {"type": "null"}]}
