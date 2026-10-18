@@ -152,6 +152,9 @@ def _as_decimal(value: object) -> Decimal | None:
     return Decimal(str(value))
 
 
+_MAX_SHOWN_VALUE = 50
+
+
 class _DecimalMismatchError(ValueError):
     """A value a DECIMAL(p, s) column can't hold; names the column and the value.
 
@@ -161,7 +164,8 @@ class _DecimalMismatchError(ValueError):
 
     def __init__(self, field: pa.Field, value: object) -> None:
         shown = repr(value)
-        shown = shown if len(shown) <= 50 else shown[:47] + "..."
+        if len(shown) > _MAX_SHOWN_VALUE:
+            shown = shown[: _MAX_SHOWN_VALUE - 3] + "..."
         precision, scale = field.type.precision, field.type.scale
         super().__init__(
             f"Column {field.name!r} is DECIMAL({precision}, {scale}); "
