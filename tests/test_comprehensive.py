@@ -515,19 +515,20 @@ class TestUntypedAndChoiceProperties:
         assert rows[6] == (None,)
 
     @pytest.mark.parametrize(
-        "prop",
+        ("prop", "inner"),
         [
-            {"type": ["object", "null"]},
-            {"type": ["array", "null"], "items": {"type": "integer"}},
-            {"$ref": "#/d"},
-            {},
+            ({"type": ["object", "null"]}, {"a": None}),
+            ({"type": ["null", "array"], "items": {"type": "integer"}}, [None]),
+            ({"$ref": "#/d"}, {"a": None}),
+            ({}, [None]),
         ],
         ids=["object", "array", "untyped", "empty"],
     )
-    def test_none_in_json_column_is_sql_null(self, tmp_path: Path, prop: dict):
+    def test_none_in_json_column_is_sql_null(
+        self, tmp_path: Path, prop: dict, inner: object
+    ):
         """A missing value is SQL NULL; a JSON null inside a value is kept."""
         flat = flatten_schema({"type": "object", "properties": {"c": prop}})
-        inner = [None] if prop.get("type", [""])[0] == "array" else {"a": None}
         records = [flatten_record({"c": v}, flatten_schema=flat) for v in [None, inner]]
         path = tmp_path / "batch.parquet"
         pq.write_table(
