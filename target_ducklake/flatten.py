@@ -111,49 +111,38 @@ def flatten_record(
 UNTYPED_COLUMN: dict[str, list[str]] = {"type": ["null", "object"]}
 
 
-def _anyof_column(prop: dict) -> dict:
-    """The column for an anyOf property: its first typed, non-null branch.
+# JSON Schema keywords that list the alternatives a value can take. A property
+# declared with one of them (and no "type") gets its column from a branch.
+_CHOICE_KEYWORDS = ("anyOf", "oneOf", "allOf")
 
-    Branches without a type (a ``$ref``, a nested anyOf, ``{}``) are skipped;
-    with no typed branch left, the column is ``UNTYPED_COLUMN``. The branch is
-    copied, never edited, so the caller's schema is unchanged.
+
+def _non_null_types(branch: object) -> list[str]:
+    """A branch's declared types other than null, in their declared order."""
+    if not isinstance(branch, dict):
+        return []
+    types = branch.get("type") or []
+    types = [types] if isinstance(types, str) else types
+    return [t for t in types if t != "null"]
+
+
+def _choice_column(prop: dict, keyword: str) -> dict:
+    """The column for an anyOf/oneOf/allOf property: its first typed branch.
+
+    Null-only and untyped branches (a ``$ref``, a nested choice, ``{}``) are
+    skipped; with no typed branch left, the column is ``UNTYPED_COLUMN``. The
+    column's type is null followed by the branch's types in their declared
+    order, as for a plain type list, so it is the same in every process.
     """
-    branch = next(
-        (
-            b
-            for b in prop["anyOf"]
-            if isinstance(b, dict) and b.get("type") not in (None, "null")
-        ),
-        None,
-    )
+    branches = prop[keyword] if isinstance(prop[keyword], list) else []
+    branch = next((b for b in branches if _non_null_types(b)), None)
     if branch is None:
         return UNTYPED_COLUMN
-    types = branch["type"]
-    types = [types] if isinstance(types, str) else types
-    return _with_wrapper_hint(prop, {**branch, "type": list(set(["null", *types]))})
-
-
-def _first_choice_column(prop: dict) -> dict | None:
-    """The column for a property with neither ``type`` nor ``anyOf``.
-
-    Such a property (e.g. ``oneOf``) uses the first branch of its first key,
-    made nullable, when that branch is a string, array or object, and is left
-    out otherwise, as before. When it has no branches with a type at all
-    (``format`` or ``$ref`` alone), the column is ``UNTYPED_COLUMN``.
-    """
-    first = next(iter(prop.values()))
-    if not (isinstance(first, list) and first and isinstance(first[0], dict)):
-        return UNTYPED_COLUMN
-    branch = first[0]
-    if "type" not in branch:
-        return UNTYPED_COLUMN
-    if branch["type"] in ("string", "array", "object"):
-        return {**branch, "type": ["null", branch["type"]]}
-    return None
+    column = {**branch, "type": ["null", *_non_null_types(branch)]}
+    return _with_wrapper_hint(prop, column)
 
 
 def _with_wrapper_hint(prop: dict, branch: dict) -> dict:
-    """Carry an anyOf property's own x-sql-datatype hint into its chosen branch.
+    """Carry a choice property's own x-sql-datatype hint into its chosen branch.
 
     The hint describes the column whichever branch is chosen; a hint on the
     branch itself wins, and an empty one counts as no hint. Only the hint is
@@ -211,10 +200,10 @@ def flatten_schema(
                 items.append((new_key, _apply_timestamp_format(v)))
             else:
                 items.append((new_key, v))
-        elif "anyOf" in v.keys():
-            items.append((new_key, _anyof_column(v)))
-        elif v and (column := _first_choice_column(v)) is not None:
-            items.append((new_key, column))
+        elif keyword := next((kw for kw in _CHOICE_KEYWORDS if kw in v), None):
+            items.append((new_key, _choice_column(v, keyword)))
+        else:  # no type information at all, e.g. {}
+            items.append((new_key, UNTYPED_COLUMN))
 
     key_func = lambda item: item[0]
     sorted_items = sorted(items, key=key_func)

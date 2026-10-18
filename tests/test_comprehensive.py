@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import subprocess
+import sys
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -600,8 +603,6 @@ class TestUntypedAndChoiceProperties:
                 "listed": {"anyOf": [{"type": ["string", "null"]}]},
                 "one_string": {"oneOf": [{"type": "string"}, {"type": "null"}]},
                 "one_object": {"oneOf": [{"type": "object"}]},
-                "one_integer": {"oneOf": [{"type": "integer"}]},
-                "empty": {},
                 "arr": {"type": ["array", "null"], "items": {"type": "string"}},
                 "obj": {"type": "object", "properties": {"x": {"type": "integer"}}},
             },
@@ -617,6 +618,95 @@ class TestUntypedAndChoiceProperties:
             "arr": {"type": ["array", "null"]},
             "obj": {"type": ["null", "object"]},
         }
+
+    @pytest.mark.parametrize(
+        ("prop", "expected"),
+        [
+            (
+                {"oneOf": [{"type": "integer"}, {"type": "null"}]},
+                ({"type": ["null", "integer"]}, "BIGINT", pa.int64()),
+            ),
+            (
+                {"oneOf": [{"type": "null"}, {"type": "string"}]},
+                ({"type": ["null", "string"]}, "VARCHAR", pa.string()),
+            ),
+            (
+                {"oneOf": [{"type": ["boolean", "null"]}]},
+                ({"type": ["null", "boolean"]}, "BOOLEAN", pa.bool_()),
+            ),
+            (
+                {"allOf": [{"type": "number"}]},
+                ({"type": ["null", "number"]}, "DECIMAL(38, 9)", pa.decimal128(38, 9)),
+            ),
+            (
+                {"oneOf": [{"type": "string"}], "x-sql-datatype": "uuid"},
+                (
+                    {"type": ["null", "string"], "x-sql-datatype": "uuid"},
+                    "UUID",
+                    pa.string(),
+                ),
+            ),
+            ({}, ({"type": ["null", "object"]}, "JSON", pa.string())),
+            (
+                {"description": "only a description"},
+                ({"type": ["null", "object"]}, "JSON", pa.string()),
+            ),
+        ],
+        ids=[
+            "oneof-integer",
+            "oneof-null-first",
+            "oneof-type-list",
+            "allof-number",
+            "oneof-wrapper-hint",
+            "empty",
+            "description-only",
+        ],
+    )
+    def test_choice_and_empty_properties_get_columns(self, prop: dict, expected: tuple):
+        """oneOf/allOf flatten like anyOf, and {} is a JSON column, not dropped."""
+        flat = flatten_schema({"type": "object", "properties": {"c": prop}})
+        ddl = DuckLakeConnector(self.CONFIG).json_to_ducklake_schema(flat)[0]["type"]
+        staging = flatten_schema_to_pyarrow_schema(flat).field("c").type
+        assert (flat["c"], ddl, staging) == expected
+
+    def test_choice_values_are_staged(self):
+        """Values of a oneOf property reach the staged batch."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer"},
+                "n": {"oneOf": [{"type": "integer"}, {"type": "null"}]},
+            },
+        }
+        flat = flatten_schema(schema)
+        table = create_pyarrow_table(
+            [{"id": 1, "n": 5}, {"id": 2, "n": None}],
+            flatten_schema_to_pyarrow_schema(flat),
+        )
+        assert table.column("n").to_pylist() == [5, None]
+
+    @pytest.mark.parametrize("keyword", ["anyOf", "oneOf", "allOf"])
+    def test_branch_type_order_is_the_same_in_every_process(self, keyword: str):
+        """The column's type list keeps its declared order, whatever the hash seed."""
+        code = (
+            "import json; from target_ducklake.flatten import flatten_schema; "
+            f"prop = {{{keyword!r}: [{{'type': ['integer', 'string']}}]}}; "
+            "print(json.dumps(flatten_schema("
+            "{'type': 'object', 'properties': {'c': prop}})['c']['type']))"
+        )
+        outputs = {
+            # A fresh interpreter is the only way to set the hash seed.
+            subprocess.run(  # noqa: S603
+                [sys.executable, "-c", code],
+                cwd=Path(__file__).parents[1],  # the repo root, for an uninstalled run
+                env={**os.environ, "PYTHONHASHSEED": str(seed)},
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            for seed in range(1, 9)
+        }
+        assert [json.loads(o) for o in outputs] == [["null", "integer", "string"]]
 
     def _sink(self, prop: dict, **config: object) -> ducklakeSink:
         target = Mock()
