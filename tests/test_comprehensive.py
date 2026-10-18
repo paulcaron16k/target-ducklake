@@ -2074,12 +2074,21 @@ class TestTimezoneOffsets:
     def test_mixed_zone_batch_with_convert_stores_utc(
         self, tmp_path: Path, ids: tuple[str, ...]
     ):
-        """With convert_tz_to_utc, aware values store UTC and naive ones as given."""
+        """With convert_tz_to_utc, aware values store UTC and naive ones as given.
+
+        TIMESTAMPTZ holds each aware value's instant and reads a naive value in
+        the session zone (Asia/Tokyo here), whatever the order.
+        """
         rows = self._load_mixed(tmp_path, ids, convert_tz_to_utc=True)
+        tokyo = ZoneInfo("Asia/Tokyo")
         for k in ids:
             value = self.MIXED[k]
             wall_clock = value.astimezone(timezone.utc) if value.tzinfo else value
-            assert rows[k][0] == wall_clock.strftime("%Y-%m-%d %H:%M:%S")
+            instant = value if value.tzinfo else value.replace(tzinfo=tokyo)
+            assert rows[k] == (
+                wall_clock.strftime("%Y-%m-%d %H:%M:%S"),
+                instant.timestamp(),
+            )
 
     def test_one_zone_column_is_left_to_pyarrow(self):
         """A column in one zone, across DST, stages as before (pyarrow's text)."""
