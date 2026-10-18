@@ -4,6 +4,7 @@ https://github.com/meltano/sdk/blob/35b499d6163f91752fd674f2a3e46a7e22a1fb47/sin
 """
 
 import collections
+import copy
 import itertools
 import json
 from datetime import date, datetime
@@ -105,6 +106,52 @@ def flatten_record(
     return dict(items)
 
 
+# A property with no usable type can hold any value, so it is stored as JSON
+# text, which keeps every value intact.
+UNTYPED_COLUMN: dict[str, list[str]] = {"type": ["null", "object"]}
+
+
+def _anyof_column(prop: dict) -> dict:
+    """The column for an anyOf property: its first typed, non-null branch.
+
+    Branches without a type (a ``$ref``, a nested anyOf, ``{}``) are skipped;
+    with no typed branch left, the column is ``UNTYPED_COLUMN``. The branch is
+    copied, never edited, so the caller's schema is unchanged.
+    """
+    branch = next(
+        (
+            b
+            for b in prop["anyOf"]
+            if isinstance(b, dict) and b.get("type") not in (None, "null")
+        ),
+        None,
+    )
+    if branch is None:
+        return UNTYPED_COLUMN
+    types = branch["type"]
+    types = [types] if isinstance(types, str) else types
+    return _with_wrapper_hint(prop, {**branch, "type": list(set(["null", *types]))})
+
+
+def _first_choice_column(prop: dict) -> dict | None:
+    """The column for a property with neither ``type`` nor ``anyOf``.
+
+    Such a property (e.g. ``oneOf``) uses the first branch of its first key,
+    made nullable, when that branch is a string, array or object, and is left
+    out otherwise, as before. When it has no branches with a type at all
+    (``format`` or ``$ref`` alone), the column is ``UNTYPED_COLUMN``.
+    """
+    first = next(iter(prop.values()))
+    if not (isinstance(first, list) and first and isinstance(first[0], dict)):
+        return UNTYPED_COLUMN
+    branch = first[0]
+    if "type" not in branch:
+        return UNTYPED_COLUMN
+    if branch["type"] in ("string", "array", "object"):
+        return {**branch, "type": ["null", branch["type"]]}
+    return None
+
+
 def _with_wrapper_hint(prop: dict, branch: dict) -> dict:
     """Carry an anyOf property's own x-sql-datatype hint into its chosen branch.
 
@@ -131,11 +178,14 @@ def flatten_schema(
     if "properties" not in d:
         return {}
 
-    for k, v in d["properties"].items():
+    for k, prop in d["properties"].items():
         new_key = flatten_key(k, parent_key, sep)
+        if not isinstance(prop, dict):  # a boolean schema: true allows any value
+            items.append((new_key, UNTYPED_COLUMN))
+            continue
         # some schemas from airbyte sources have description field which is not needed and causes issues
-        if "description" in v.keys():
-            del v["description"]
+        # (left out of a copy, so the caller's schema keeps it)
+        v = {key: value for key, value in prop.items() if key != "description"}
 
         if "type" in v.keys():
             if "object" in v["type"] and "properties" in v and level < max_level:
@@ -162,27 +212,9 @@ def flatten_schema(
             else:
                 items.append((new_key, v))
         elif "anyOf" in v.keys():
-            llv = v["anyOf"]
-            i, entry = 0, llv[0]
-            while entry["type"] == "null":
-                i += 1
-                entry = llv[i]
-            # modified to handle type value in schema is string or list of strings
-            if isinstance(entry["type"], str):
-                entry["type"] = list(set(["null", entry["type"]]))
-            elif isinstance(entry["type"], list):
-                entry["type"] = list(set(["null"] + entry["type"]))  # type: ignore
-            items.append((new_key, _with_wrapper_hint(v, entry)))
-        elif len(v.values()) > 0:
-            if list(v.values())[0][0]["type"] == "string":
-                list(v.values())[0][0]["type"] = ["null", "string"]
-                items.append((new_key, list(v.values())[0][0]))
-            elif list(v.values())[0][0]["type"] == "array":
-                list(v.values())[0][0]["type"] = ["null", "array"]
-                items.append((new_key, list(v.values())[0][0]))
-            elif list(v.values())[0][0]["type"] == "object":
-                list(v.values())[0][0]["type"] = ["null", "object"]
-                items.append((new_key, list(v.values())[0][0]))
+            items.append((new_key, _anyof_column(v)))
+        elif v and (column := _first_choice_column(v)) is not None:
+            items.append((new_key, column))
 
     key_func = lambda item: item[0]
     sorted_items = sorted(items, key=key_func)
@@ -190,7 +222,32 @@ def flatten_schema(
         if len(list(g)) > 1:
             raise ValueError(f"Duplicate column name produced in schema: {k}")
 
-    return dict(sorted_items)
+    # A deep copy, so editing a column never reaches the caller's schema or
+    # UNTYPED_COLUMN.
+    return copy.deepcopy(dict(sorted_items))
+
+
+def nullable_choices(schema: dict) -> dict:
+    """Return a copy of a stream schema in which anyOf/oneOf properties accept null.
+
+    Every DuckLake column this target creates is nullable, and record
+    validation has always accepted null for most of these properties, so a tap
+    that sends null where its choice list doesn't declare it still loads. Any
+    property with anyOf or oneOf accepts null, whatever else it declares, at
+    any depth of nested object properties. Only null is added; other values
+    validate as before. The given schema is not changed.
+    """
+    if "properties" not in schema:
+        return schema
+    properties = {}
+    for name, prop in schema["properties"].items():
+        if isinstance(prop, dict) and ("anyOf" in prop or "oneOf" in prop):
+            properties[name] = {"anyOf": [prop, {"type": "null"}]}
+        elif isinstance(prop, dict):
+            properties[name] = nullable_choices(prop)
+        else:
+            properties[name] = prop
+    return {**schema, "properties": properties}
 
 
 def truncate_column_names(

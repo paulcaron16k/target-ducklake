@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import json
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -14,7 +16,7 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from singer_sdk.exceptions import ConfigValidationError
+from singer_sdk.exceptions import ConfigValidationError, InvalidRecord
 
 from target_ducklake.connector import (
     DuckLakeConnector,
@@ -429,6 +431,252 @@ class TestFlattenModule:
         result = _apply_timestamp_format(schema_entry)
         assert result["format"] == "date-time"
         assert result["type"] == "string"
+
+
+def _types(column: dict) -> dict:
+    """A flattened column with its type as a sorted list, for order-free comparison."""
+    types = column["type"]
+    return {**column, "type": sorted([types] if isinstance(types, str) else types)}
+
+
+class TestUntypedAndChoiceProperties:
+    """Properties without a usable type, and anyOf/oneOf choices, load safely."""
+
+    CONFIG: ClassVar[dict[str, str]] = {
+        "catalog_url": "test.db",
+        "data_path": "/tmp/test",
+        "storage_type": "local",
+    }
+    JSON_COLUMN: ClassVar[dict] = {"type": ["null", "object"]}
+
+    @pytest.mark.parametrize(
+        "prop",
+        [
+            {"anyOf": [{"type": "null"}]},
+            {"anyOf": [{"$ref": "#/definitions/d"}, {"type": "null"}]},
+            {"anyOf": [{"anyOf": [{"type": "string"}]}, {"type": "null"}]},
+            {"anyOf": [{"x-sql-datatype": "uuid"}, {"type": "null"}]},
+            {"anyOf": [{}, {"type": "null"}]},
+            {"format": "date-time"},
+            {"$ref": "#/definitions/d"},
+            {"x-sql-datatype": "uuid"},
+        ],
+        ids=[
+            "anyof-all-null",
+            "anyof-ref",
+            "anyof-nested-anyof",
+            "anyof-hint-only",
+            "anyof-empty-branch",
+            "format-only",
+            "ref-only",
+            "hint-only",
+        ],
+    )
+    def test_untyped_property_becomes_json_column(self, prop: dict):
+        """A property with no usable type is a JSON column, not a crash."""
+        flat = flatten_schema({"type": "object", "properties": {"c": prop}})
+        assert flat == {"c": self.JSON_COLUMN}
+        columns = DuckLakeConnector(self.CONFIG).json_to_ducklake_schema(flat)
+        assert columns[0]["type"] == "JSON"
+
+    def test_anyof_skips_untyped_branches(self):
+        """The first typed, non-null anyOf branch is chosen."""
+        prop = {"anyOf": [{"$ref": "#/definitions/d"}, {"type": "integer"}]}
+        flat = flatten_schema({"type": "object", "properties": {"c": prop}})
+        assert _types(flat["c"]) == {"type": ["integer", "null"]}
+
+    def test_untyped_values_load_into_json_column(self, tmp_path: Path):
+        """Any value in an untyped property is kept as JSON text."""
+        schema = {"type": "object", "properties": {"c": {"$ref": "#/d"}}}
+        flat = flatten_schema(schema)
+        at = datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc)
+        values = [5, "abc", {"a": 1}, [1, 2], 1.5, True, None, Decimal("2.5"), at]
+        records = [flatten_record({"c": v}, flatten_schema=flat) for v in values]
+        path = tmp_path / "batch.parquet"
+        pq.write_table(
+            create_pyarrow_table(records, flatten_schema_to_pyarrow_schema(flat)), path
+        )
+        ddl = DuckLakeConnector(self.CONFIG).json_to_ducklake_schema(flat)[0]["type"]
+        con = duckdb.connect()
+        con.execute(f"CREATE TABLE t (c {ddl})")
+        con.execute(f"INSERT INTO t SELECT c FROM '{path}'")
+        rows = con.execute("SELECT c FROM t").fetchall()
+        # As for every JSON column: None is JSON null, a Decimal a JSON number
+        # and a datetime ISO text.
+        assert [json.loads(r[0]) for r in rows] == [
+            *values[:6],
+            None,
+            2.5,
+            "2024-01-01T10:00:00+00:00",
+        ]
+
+    def test_flatten_schema_leaves_input_unchanged(self):
+        """Flattening never edits the schema it is given, at any level."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "a": {"type": "string", "description": "kept"},
+                "b": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+                "c": {"oneOf": [{"type": "string"}, {"type": "null"}]},
+                "d": {
+                    "type": "object",
+                    "properties": {
+                        "e": {"anyOf": [{"type": "null"}, {"type": "number"}]},
+                        "f": {"type": "string", "description": "kept"},
+                    },
+                },
+            },
+        }
+        original = copy.deepcopy(schema)
+        flatten_schema(schema, max_level=1)
+        assert schema == original
+
+    def test_nested_flattening_unchanged(self):
+        """Nested flattening with auto-cast timestamps is as before (old output)."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "created_at": {"type": ["string", "null"], "description": "d"},
+                "parent": {
+                    "type": "object",
+                    "properties": {
+                        "updated_at": {"type": "string"},
+                        "hinted": {
+                            "anyOf": [{"type": "null"}, {"type": "number"}],
+                            "x-sql-datatype": "real",
+                        },
+                        "deep": {
+                            "type": "object",
+                            "properties": {"x": {"type": "integer"}},
+                        },
+                        "tags": {"oneOf": [{"type": "array"}]},
+                    },
+                },
+            },
+        }
+        flat = flatten_schema(schema, max_level=1, auto_cast_timestamps=True)
+        assert {k: _types(v) for k, v in flat.items()} == {
+            "created_at": {"type": ["null", "string"], "format": "date-time"},
+            "parent__deep": {"type": ["null", "object"]},
+            "parent__hinted": {"type": ["null", "number"], "x-sql-datatype": "real"},
+            "parent__tags": {"type": ["array", "null"]},
+            "parent__updated_at": {"type": ["string"]},
+        }
+
+    def test_flattened_columns_share_nothing_with_the_input(self):
+        """Editing a flattened column changes neither the input nor other columns."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "a": {"type": "string", "enum": ["x", "y"]},
+                "b": {"anyOf": [{"type": "array", "items": {"type": "string"}}]},
+                "u1": {"$ref": "#/d"},
+                "u2": {"$ref": "#/d"},
+            },
+        }
+        original = copy.deepcopy(schema)
+        flat = flatten_schema(schema)
+        flat["a"]["enum"].append("z")
+        flat["u1"]["type"].append("string")
+        assert schema == original
+        assert sorted(flatten_schema(schema)["u2"]["type"]) == ["null", "object"]
+
+    def test_boolean_property_schema_becomes_json_column(self):
+        """A boolean schema (true: any value) is a JSON column, not a crash."""
+        flat = flatten_schema({"type": "object", "properties": {"c": True}})
+        assert flat == {"c": self.JSON_COLUMN}
+
+    def test_output_unchanged_for_schemas_that_loaded_before(self):
+        """Every kind of property that flattened before still flattens the same."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "plain": {"type": "string", "description": "dropped"},
+                "hinted": {
+                    "anyOf": [{"type": "number"}, {"type": "null"}],
+                    "x-sql-datatype": "numeric(12,4)",
+                },
+                "no_null": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+                "listed": {"anyOf": [{"type": ["string", "null"]}]},
+                "one_string": {"oneOf": [{"type": "string"}, {"type": "null"}]},
+                "one_object": {"oneOf": [{"type": "object"}]},
+                "one_integer": {"oneOf": [{"type": "integer"}]},
+                "empty": {},
+                "arr": {"type": ["array", "null"], "items": {"type": "string"}},
+                "obj": {"type": "object", "properties": {"x": {"type": "integer"}}},
+            },
+        }
+        flat = flatten_schema(schema)
+        assert {k: _types(v) for k, v in flat.items()} == {
+            "plain": {"type": ["string"]},
+            "hinted": {"type": ["null", "number"], "x-sql-datatype": "numeric(12,4)"},
+            "no_null": {"type": ["null", "string"]},
+            "listed": {"type": ["null", "string"]},
+            "one_string": {"type": ["null", "string"]},
+            "one_object": {"type": ["null", "object"]},
+            "arr": {"type": ["array", "null"]},
+            "obj": {"type": ["null", "object"]},
+        }
+
+    def _sink(self, prop: dict, **config: object) -> ducklakeSink:
+        target = Mock()
+        target.config = {**self.CONFIG, **config}
+        return ducklakeSink(
+            target=target,
+            stream_name="t",
+            schema={"type": "object", "properties": {"c": prop}},
+            key_properties=[],
+            connector=DuckLakeConnector(self.CONFIG),
+        )
+
+    @pytest.mark.parametrize(
+        "prop",
+        [
+            {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+            {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            {"oneOf": [{"type": "string"}, {"type": "null"}]},
+            {"oneOf": [{"type": "string"}, {"type": "integer"}]},
+            {
+                "type": "object",
+                "properties": {"n": {"anyOf": [{"type": "string"}]}},
+            },
+            # A type beside the choice list doesn't stop null being accepted.
+            {"type": "string", "anyOf": [{"maxLength": 3}]},
+        ],
+        ids=[
+            "anyof-no-null",
+            "anyof-with-null",
+            "oneof-with-null",
+            "oneof-no-null",
+            "nested-anyof",
+            "type-and-anyof",
+        ],
+    )
+    def test_sink_validator_accepts_null_for_choices(self, prop: dict):
+        """Null passes validation for anyOf/oneOf properties; the schema is kept."""
+        original = copy.deepcopy(prop)
+        sink = self._sink(prop)
+        assert sink.schema["properties"]["c"] == original
+        record = {"c": {"n": None}} if "properties" in prop else {"c": None}
+        sink._validate_and_parse(record)
+
+    def test_sink_validator_still_rejects_invalid_values_for_choices(self):
+        """Only null is added: a value matching no branch is still rejected."""
+        sink = self._sink({"anyOf": [{"type": "string"}, {"type": "integer"}]})
+        with pytest.raises(InvalidRecord):
+            sink._validate_and_parse({"c": [1]})
+
+    def test_sink_without_record_validation_has_no_validator(self):
+        """validate_records false still turns validation off."""
+        sink = self._sink({"anyOf": [{"type": "string"}]}, validate_records=False)
+        assert sink._validator is None
+
+    def test_sink_validator_still_rejects_null_for_plain_types(self):
+        """A plain non-nullable type keeps rejecting null, as before."""
+        sink = self._sink({"type": "string"})
+        sink._validator.validate({"c": "x"})
+        with pytest.raises(InvalidRecord):
+            sink._validator.validate({"c": None})
 
 
 class TestParquetUtils:

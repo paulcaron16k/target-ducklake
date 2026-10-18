@@ -13,11 +13,13 @@ import psutil
 import pyarrow.parquet as pq
 from singer_sdk import Target
 from singer_sdk.sinks import SQLSink
+from singer_sdk.sinks.core import JSONSchemaValidator
 
 from target_ducklake.connector import DuckLakeConnector
 from target_ducklake.flatten import (
     flatten_record,
     flatten_schema,
+    nullable_choices,
     truncate_column_names,
 )
 from target_ducklake.parquet_utils import (
@@ -113,6 +115,19 @@ class ducklakeSink(SQLSink):
                 f"Load method is {self.load_method} for {self.stream_name}"
             )
             self.should_overwrite_table = False
+
+    def get_validator(self) -> JSONSchemaValidator | None:
+        """Validate records against the schema with anyOf/oneOf made nullable.
+
+        See ``nullable_choices``. The SDK's default validates against
+        ``self.schema`` itself, which stays exactly as the tap sent it.
+        """
+        if not self.validate_schema:
+            return None
+        return JSONSchemaValidator(
+            nullable_choices(self.schema),
+            validate_formats=self.validate_field_string_format,
+        )
 
     @property
     def target_schema(self) -> str:
