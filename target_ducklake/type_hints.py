@@ -3,8 +3,8 @@
 JSON Schema can't say smallint vs bigint, real vs double, decimal(p,s), or
 timestamp vs timestamptz. Database taps carry the source column's declared type
 in the ``x-sql-datatype`` annotation instead. This module is the one vocabulary
-for those hints, shared by the DuckLake DDL (``connector``) and the parquet
-staging schema (``parquet_utils``) so the two always agree.
+for those hints, used by the DuckLake DDL (``connector``); the parquet staging
+schema follows the DDL's column types, so the two always agree.
 
 A hint not listed here maps to nothing, and the column keeps the type its JSON
 Schema type and format give it.
