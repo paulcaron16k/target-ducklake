@@ -10,7 +10,7 @@ import subprocess
 import sys
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -964,7 +964,7 @@ class TestStagingFollowsColumnType:
             (
                 {"type": "string", "x-sql-datatype": "numeric(12,4)"},
                 "n/a",
-                InvalidOperation,
+                ValueError,
             ),
             (
                 {"type": "number", "x-sql-datatype": "bigint"},
@@ -1088,15 +1088,33 @@ class TestExistingNumberColumnStaging:
         assert "1 value(s) in column 'amount'" in caplog.text
         assert "DECIMAL(10, 2)" in caplog.text
 
-    def test_value_too_large_for_the_existing_column_fails(self, tmp_path: Path):
+    @pytest.mark.parametrize(
+        ("column_ddl", "value"),
+        [
+            ("amount DECIMAL(5, 2)", Decimal("1234.5")),
+            # Rounding to the scale adds the digit that doesn't fit.
+            ("amount DECIMAL(5, 2)", Decimal("999.995")),
+            # 39 digits at scale 30: beyond the 38-digit decimal context too.
+            ("amount DECIMAL(38, 30)", Decimal(1000000000)),
+        ],
+        ids=["narrow", "rounds-over", "wide"],
+    )
+    def test_value_too_large_for_the_existing_column_fails(
+        self, tmp_path: Path, column_ddl: str, value: Decimal
+    ):
         """A value with more integer digits than the column holds fails the batch."""
-        with pytest.raises(pa.ArrowInvalid):
-            self._load(
-                tmp_path,
-                "amount DECIMAL(5, 2)",
-                {"type": "number"},
-                [Decimal("1234.5")],
-            )
+        with pytest.raises(ValueError, match="Column 'amount' is DECIMAL"):
+            self._load(tmp_path, column_ddl, {"type": "number"}, [value])
+
+    def test_non_finite_number_fails_without_a_rounding_report(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """NaN and infinity fail the batch, naming the column; nothing is 'rounded'."""
+        schema = pa.schema([pa.field("amount", pa.decimal128(38, 9))])
+        for value in (float("nan"), float("inf"), Decimal("-Infinity")):
+            with pytest.raises(ValueError, match="Column 'amount' is DECIMAL"):
+                create_pyarrow_table([{"amount": value}], schema)
+        assert "rounded" not in caplog.text
 
     @pytest.mark.parametrize(
         ("column_ddl", "staged"),

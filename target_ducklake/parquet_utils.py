@@ -57,8 +57,8 @@ def _capped_to_38(precision: int, scale: int) -> tuple[int, int]:
     default scale, so a money column keeps its cents (``numeric(40,2)`` gives
     DECIMAL(38, 2)) and a capped type never keeps fewer fraction digits than
     the DECIMAL(38, 9) default. A value with more integer digits than are left
-    fails the batch at staging (``decimal.InvalidOperation`` in
-    ``_to_decimal``), as it would with DECIMAL(38, 9).
+    fails the batch at staging (``ValueError`` in ``_decimal_column``), as
+    it would with DECIMAL(38, 9).
     """
     integer_digits = precision - scale
     fraction_floor = min(scale, DECIMAL_DEFAULT_SCALE)
@@ -152,30 +152,38 @@ def _as_decimal(value: object) -> Decimal | None:
     return Decimal(str(value))
 
 
-def _to_decimal(value: object, scale: int) -> Decimal | None:
-    """Convert a numeric value to a Decimal rounded to ``scale`` digits.
+def _decimal_column(values: list, field: pa.Field) -> list[Decimal | None]:
+    """Round each value to the column's scale, failing on any that doesn't fit.
 
-    Rounds half-even, matching how DuckDB rounds when casting to DECIMAL.
+    Extra fraction digits are rounded half-even, as DuckDB's own cast to the
+    column rounds them, and a warning reports how many values were rounded.
+    A value with more integer digits than DECIMAL(p, s) holds, a non-finite
+    number or text that isn't a number raises ValueError naming the column.
     """
-    exact = _as_decimal(value)
-    if exact is None:
-        return None
-    return exact.quantize(Decimal(1).scaleb(-scale), context=_DECIMAL_CONTEXT)
-
-
-def _report_rounding(field: pa.Field, values: list, rounded: list) -> None:
-    """Log a warning when values had more fraction digits than the column keeps.
-
-    They are rounded half-even to the column's scale, as DuckDB's own cast
-    to the column would round them; the warning makes that visible.
-    """
-    changed = sum(
-        1
-        for value, result in zip(values, rounded, strict=True)
-        if result is not None and _as_decimal(value) != result
-    )
+    precision, scale = field.type.precision, field.type.scale
+    quantum = Decimal(1).scaleb(-scale)
+    rounded: list[Decimal | None] = []
+    changed = 0
+    for value in values:
+        msg = (
+            f"Column {field.name!r} is DECIMAL({precision}, {scale}); "
+            f"{value!r} doesn't fit."
+        )
+        try:
+            exact = _as_decimal(value)
+            if exact is None:
+                rounded.append(None)
+                continue
+            result = exact.quantize(quantum, context=_DECIMAL_CONTEXT)
+        except InvalidOperation:  # not a number, or more than 38 digits
+            raise ValueError(msg) from None
+        if not result.is_finite() or (
+            result and result.adjusted() >= precision - scale
+        ):
+            raise ValueError(msg)
+        changed += result != exact
+        rounded.append(result)
     if changed:
-        precision, scale = field.type.precision, field.type.scale
         logger.warning(
             "%d value(s) in column %r had more than %d fraction digits and were "
             "rounded to fit DECIMAL(%d, %d).",
@@ -185,6 +193,7 @@ def _report_rounding(field: pa.Field, values: list, rounded: list) -> None:
             precision,
             scale,
         )
+    return rounded
 
 
 def _has_fixed_offset(value: object) -> bool:
@@ -310,9 +319,7 @@ def _integer_value(value: object, column: str) -> int | None:
 def _coerce_column(values: list, field: pa.Field) -> list:
     """Coerce Python values so pyarrow can build the column with the field's type."""
     if pa.types.is_decimal(field.type):
-        rounded = [_to_decimal(v, field.type.scale) for v in values]
-        _report_rounding(field, values, rounded)
-        return rounded
+        return _decimal_column(values, field)
     if pa.types.is_integer(field.type):
         return [_integer_value(v, field.name) for v in values]
     if pa.types.is_floating(field.type):
