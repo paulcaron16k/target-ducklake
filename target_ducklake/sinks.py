@@ -24,7 +24,7 @@ from target_ducklake.flatten import (
 )
 from target_ducklake.parquet_utils import (
     concat_tables,
-    flatten_schema_to_pyarrow_schema,
+    staging_schema,
 )
 
 
@@ -72,10 +72,11 @@ class ducklakeSink(SQLSink):
         self._column_name_mapping: dict[str, str] = {}
         self._apply_column_name_truncation()
 
-        self.pyarrow_schema = flatten_schema_to_pyarrow_schema(self.flatten_schema)
         self.ducklake_schema = self.connector.json_to_ducklake_schema(
             self.flatten_schema
         )
+        # Staged at the columns' own types, so every value they hold stages.
+        self.pyarrow_schema = staging_schema(self.ducklake_schema)
         # Log pyarrow and ducklake schemas for debugging
         self.logger.info(
             f"PyArrow schema for stream '{stream_name}': {self.pyarrow_schema}"

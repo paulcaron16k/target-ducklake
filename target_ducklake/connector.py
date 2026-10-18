@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+import warnings
 from typing import Any
 
 import duckdb
@@ -13,7 +14,7 @@ from singer_sdk.connectors.sql import JSONSchemaToSQL
 from sqlalchemy.types import BIGINT, DECIMAL, INTEGER, JSON, TypeEngine, UserDefinedType
 
 from target_ducklake.parquet_utils import number_precision_and_scale
-from target_ducklake.type_hints import decimal_hint, hinted_type
+from target_ducklake.type_hints import decimal_hint, hint_fits_json_type, hinted_type
 
 logger = logging.getLogger(__name__)
 
@@ -74,13 +75,25 @@ class JSONSchemaToDuckLake(JSONSchemaToSQL):
 
         A supported hint (see ``type_hints``) gives the source column's own type;
         an unsupported one falls back to the JSON Schema type and format, with
-        the SDK's warning.
+        the SDK's warning. A supported hint that the property's JSON type can't
+        be loaded into (``uuid`` on an integer, see ``hint_fits_json_type``) is
+        ignored with a warning, and the JSON type decides the column.
         """
-        if decimal_hint(schema) is not None:
-            return DECIMAL(*number_precision_and_scale(schema))
-        if (type_name := hinted_type(schema)) is not None:
-            return DuckDBType(type_name)
-        return super().to_sql_type(schema)
+        hinted = "DECIMAL" if decimal_hint(schema) is not None else hinted_type(schema)
+        if hinted is None:
+            return super().to_sql_type(schema)
+        if hint_fits_json_type(schema, hinted):
+            if hinted == "DECIMAL":
+                return DECIMAL(*number_precision_and_scale(schema))
+            return DuckDBType(hinted)
+        warnings.warn(
+            f"Ignoring x-sql-datatype '{schema['x-sql-datatype']}': values of "
+            f"JSON type {schema.get('type')} can't be loaded into {hinted}.",
+            UserWarning,
+            stacklevel=2,
+        )
+        unhinted = {k: v for k, v in schema.items() if k != "x-sql-datatype"}
+        return super().to_sql_type(unhinted)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
