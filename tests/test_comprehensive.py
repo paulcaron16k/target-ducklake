@@ -698,6 +698,7 @@ class TestUntypedAndChoiceProperties:
             # A fresh interpreter is the only way to set the hash seed.
             subprocess.run(  # noqa: S603
                 [sys.executable, "-c", code],
+                cwd=Path(__file__).parents[1],  # the repo root, for an uninstalled run
                 env={**os.environ, "PYTHONHASHSEED": str(seed)},
                 capture_output=True,
                 text=True,
