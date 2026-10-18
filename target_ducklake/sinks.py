@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 import polars as pl
 import psutil
+import pyarrow as pa
 import pyarrow.parquet as pq
 from singer_sdk import Target
 from singer_sdk.sinks import SQLSink
@@ -25,7 +26,13 @@ from target_ducklake.flatten import (
 from target_ducklake.parquet_utils import (
     concat_tables,
     staging_schema,
+    staging_type,
 )
+
+
+def _is_fractional(staged: pa.DataType) -> bool:
+    """Whether a staging type holds fractions: a decimal or a float."""
+    return pa.types.is_decimal(staged) or pa.types.is_floating(staged)
 
 
 class ducklakeSink(SQLSink):
@@ -206,36 +213,60 @@ class ducklakeSink(SQLSink):
         self.connector.prepare_target_schema(target_schema_name=self.target_schema)
 
         # prepare the table
-        self._table_columns = self.connector.prepare_table(
+        table_types = self.connector.prepare_table(
             target_schema_name=self.target_schema,
             table_name=self.target_table,
             columns=self.ducklake_schema,
             partition_fields=self.partition_fields,
             overwrite_table=self.should_overwrite_table,
         )
-        # Read on the first merge only; append and overwrite never need them.
-        self._key_types: dict[str, str] | None = None
+        self._table_columns = list(table_types)
+        # DuckDB matches identifiers case-insensitively, and the singer-sdk
+        # lowercases key_properties while columns keep the property's case.
+        self._table_types = {name.lower(): typ for name, typ in table_types.items()}
+        self.pyarrow_schema = staging_schema(
+            self._staged_columns(self.ducklake_schema, self._table_types)
+        )
+
+    @staticmethod
+    def _staged_columns(
+        columns: list[dict[str, str]], table_types: dict[str, str]
+    ) -> list[dict[str, str]]:
+        """The columns to stage: each at its DDL type, or an existing number column's.
+
+        A column the table already has as DECIMAL, REAL or DOUBLE is staged at
+        that type, not the stream's: staging at another scale would round
+        values before the insert casts them (a DECIMAL(38, 30) column staged at
+        the default (38, 9) lost 21 fraction digits silently, and a DOUBLE
+        column staged as a decimal stored 1.5e-12 as 0). Only columns the
+        stream also stages as numbers are affected; table_types is keyed by
+        lowercased name.
+        """
+        staged = []
+        for column in columns:
+            table_type = table_types.get(column["name"].lower())
+            if (
+                table_type is not None
+                and _is_fractional(staging_type(column["type"]))
+                and _is_fractional(staging_type(table_type))
+            ):
+                staged.append({**column, "type": table_type})
+            else:
+                staged.append(column)
+        return staged
 
     def _key_column_types(self) -> dict[str, str]:
         """Map each key property to its table column's actual type.
 
-        Merge keys are cast to these types. They are read from the table, once
-        per sink, because an existing table's types can differ from this
-        stream's declared types.
+        Merge keys are cast to these types. They come from the table, read in
+        setup, because an existing table's types can differ from this stream's
+        declared types.
         """
-        if self._key_types is None:
-            column_types = self.connector.get_table_column_types(
-                self.target_schema, self.target_table
-            )
-            # DuckDB matches identifiers case-insensitively, and the singer-sdk
-            # lowercases key_properties while columns keep the property's case.
-            by_name = {name.lower(): typ for name, typ in column_types.items()}
-            self._key_types = {
-                key: by_name[key.lower()]
-                for key in self.key_properties
-                if key.lower() in by_name
-            }
-        return self._key_types
+        return {
+            key: self._table_types[key.lower()]
+            for key in self.key_properties
+            if key.lower() in self._table_types
+        }
 
     def process_record(self, record: dict, context: dict) -> None:
         """Process the record and flatten if necessary."""

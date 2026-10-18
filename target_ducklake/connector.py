@@ -493,11 +493,11 @@ class DuckLakeConnector(SQLConnector):
         columns: list[dict[str, str]],
         partition_fields: list[dict[str, str]] | None = None,
         overwrite_table: bool = False,
-    ) -> list[str]:
+    ) -> dict[str, str]:
         """Prepare the table for the target schema.
         If the table doesn't exist, create it.
         Add missing columns to existing table if necessary.
-        Returns all columns in the table and order in which they appear.
+        Returns every column of the table, in table order, mapped to its type.
         """
         if not self._check_if_table_exists(target_schema_name, table_name):
             logger.info(f"Table {table_name} does not exist in schema {target_schema_name}. Creating empty table.")
@@ -536,7 +536,7 @@ class DuckLakeConnector(SQLConnector):
             )
             self._add_partition_fields(target_schema_name, table_name, partition_fields)
 
-        return self.get_table_columns(target_schema_name, table_name)
+        return self.get_table_column_types(target_schema_name, table_name)
 
     def _add_partition_fields(
         self,

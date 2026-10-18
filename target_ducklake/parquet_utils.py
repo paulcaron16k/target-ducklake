@@ -140,19 +140,51 @@ def _normalize_data_for_pyarrow(data: dict, datetime_fields: list[str]) -> dict:
     return data
 
 
+def _as_decimal(value: object) -> Decimal | None:
+    """Convert a numeric value to the Decimal it represents exactly.
+
+    Floats go through ``str`` so their shortest repr is kept, not binary noise.
+    """
+    if value is None or isinstance(value, Decimal):
+        return value
+    if isinstance(value, bool):
+        value = int(value)
+    return Decimal(str(value))
+
+
 def _to_decimal(value: object, scale: int) -> Decimal | None:
     """Convert a numeric value to a Decimal rounded to ``scale`` digits.
 
     Rounds half-even, matching how DuckDB rounds when casting to DECIMAL.
-    Floats go through ``str`` so their shortest repr is kept, not binary noise.
     """
-    if value is None:
+    exact = _as_decimal(value)
+    if exact is None:
         return None
-    if isinstance(value, bool):
-        value = int(value)
-    if not isinstance(value, Decimal):
-        value = Decimal(str(value))
-    return value.quantize(Decimal(1).scaleb(-scale), context=_DECIMAL_CONTEXT)
+    return exact.quantize(Decimal(1).scaleb(-scale), context=_DECIMAL_CONTEXT)
+
+
+def _report_rounding(field: pa.Field, values: list, rounded: list) -> None:
+    """Log a warning when values had more fraction digits than the column keeps.
+
+    They are rounded half-even to the column's scale, as DuckDB's own cast
+    to the column would round them; the warning makes that visible.
+    """
+    changed = sum(
+        1
+        for value, result in zip(values, rounded, strict=True)
+        if result is not None and _as_decimal(value) != result
+    )
+    if changed:
+        precision, scale = field.type.precision, field.type.scale
+        logger.warning(
+            "%d value(s) in column %r had more than %d fraction digits and were "
+            "rounded to fit DECIMAL(%d, %d).",
+            changed,
+            field.name,
+            scale,
+            precision,
+            scale,
+        )
 
 
 def _has_fixed_offset(value: object) -> bool:
@@ -278,7 +310,9 @@ def _integer_value(value: object, column: str) -> int | None:
 def _coerce_column(values: list, field: pa.Field) -> list:
     """Coerce Python values so pyarrow can build the column with the field's type."""
     if pa.types.is_decimal(field.type):
-        return [_to_decimal(v, field.type.scale) for v in values]
+        rounded = [_to_decimal(v, field.type.scale) for v in values]
+        _report_rounding(field, values, rounded)
+        return rounded
     if pa.types.is_integer(field.type):
         return [_integer_value(v, field.name) for v in values]
     if pa.types.is_floating(field.type):
