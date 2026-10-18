@@ -152,6 +152,23 @@ def _as_decimal(value: object) -> Decimal | None:
     return Decimal(str(value))
 
 
+class _DecimalMismatchError(ValueError):
+    """A value a DECIMAL(p, s) column can't hold; names the column and the value.
+
+    The value is shown as given, cut to 50 characters, since it may be source
+    text rather than a number.
+    """
+
+    def __init__(self, field: pa.Field, value: object) -> None:
+        shown = repr(value)
+        shown = shown if len(shown) <= 50 else shown[:47] + "..."
+        precision, scale = field.type.precision, field.type.scale
+        super().__init__(
+            f"Column {field.name!r} is DECIMAL({precision}, {scale}); "
+            f"{shown} doesn't fit."
+        )
+
+
 def _decimal_column(values: list, field: pa.Field) -> list[Decimal | None]:
     """Round each value to the column's scale, failing on any that doesn't fit.
 
@@ -165,10 +182,6 @@ def _decimal_column(values: list, field: pa.Field) -> list[Decimal | None]:
     rounded: list[Decimal | None] = []
     changed = 0
     for value in values:
-        msg = (
-            f"Column {field.name!r} is DECIMAL({precision}, {scale}); "
-            f"{value!r} doesn't fit."
-        )
         try:
             exact = _as_decimal(value)
             if exact is None:
@@ -176,11 +189,11 @@ def _decimal_column(values: list, field: pa.Field) -> list[Decimal | None]:
                 continue
             result = exact.quantize(quantum, context=_DECIMAL_CONTEXT)
         except InvalidOperation:  # not a number, or more than 38 digits
-            raise ValueError(msg) from None
+            raise _DecimalMismatchError(field, value) from None
         if not result.is_finite() or (
             result and result.adjusted() >= precision - scale
         ):
-            raise ValueError(msg)
+            raise _DecimalMismatchError(field, value)
         changed += result != exact
         rounded.append(result)
     if changed:
