@@ -889,6 +889,7 @@ class TestStagingFollowsColumnType:
             # Number text loads as it did through DuckDB's cast.
             ("string", "bigint", " +12.0 ", "BIGINT", 12),
             ("string", "integer", "1e2", "INTEGER", 100),
+            ("string", "bigint", "0e100", "BIGINT", 0),
             ("string", "double", " 1.5 ", "DOUBLE", 1.5),
             ("string", "double", "1.5e-12", "DOUBLE", 1.5e-12),
             ("string", "uuid", UUID, "UUID", uuid.UUID(UUID)),

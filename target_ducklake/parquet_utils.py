@@ -257,8 +257,9 @@ def _integer_value(value: object, column: str) -> int | None:
     if isinstance(number, int):  # bool is an int
         integer: int | None = int(number)
     elif isinstance(number, Decimal) and number.is_finite():
-        if number.adjusted() >= _INT64_DIGITS:
+        if number and number.adjusted() >= _INT64_DIGITS:
             # Rejected on magnitude: int() of '1e1000000' would take minutes.
+            # (A zero's adjusted() is no magnitude: '0e100' is 0.)
             msg = f"Column {column!r} holds 64-bit integers; {value!r} is out of range."
             raise ValueError(msg)
         integer = int(number) if number == number.to_integral_value() else None
