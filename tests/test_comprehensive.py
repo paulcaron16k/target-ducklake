@@ -10,7 +10,7 @@ import subprocess
 import sys
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -1051,7 +1051,7 @@ class TestStagingFollowsColumnType:
             (
                 {"type": "string", "x-sql-datatype": "numeric(12,4)"},
                 "n/a",
-                InvalidOperation,
+                ValueError,
             ),
             (
                 {"type": "number", "x-sql-datatype": "bigint"},
@@ -1096,6 +1096,137 @@ class TestStagingFollowsColumnType:
         flat = flatten_schema({"type": "object", "properties": {"c": prop}})
         with pytest.raises(error):
             create_pyarrow_table([{"c": value}], _staging_schema(flat))
+
+
+class TestExistingNumberColumnStaging:
+    """Numbers are staged at an existing column's own type, never rounded silently.
+
+    Drives the real sink (setup, then one batch) on an in-memory catalog with
+    a table created before, e.g. by an earlier version's type mapping.
+    """
+
+    @staticmethod
+    def _load(
+        tmp_path: Path, column_ddl: str, prop: dict, values: list
+    ) -> tuple[list, ducklakeSink]:
+        con = duckdb.connect()
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        con.execute("CREATE SCHEMA ducklake_catalog.s")
+        con.execute(f"CREATE TABLE ducklake_catalog.s.t (id BIGINT, {column_ddl})")
+        config = {
+            "catalog_url": "test.db",
+            "data_path": str(tmp_path / "data"),
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging"),
+        }
+        target = Mock()
+        target.config = config
+        connector = DuckLakeConnector(config)
+        schema = {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}, "amount": prop},
+        }
+        with patch.object(
+            connector, "execute", side_effect=lambda sql: con.execute(sql)
+        ):
+            sink = ducklakeSink(
+                target=target,
+                stream_name="t",
+                schema=schema,
+                key_properties=["id"],
+                connector=connector,
+            )
+            sink.setup()
+            records = [{"id": i, "amount": v} for i, v in enumerate(values)]
+            sink.process_batch({"records": records})
+        rows = con.execute("SELECT amount FROM ducklake_catalog.s.t ORDER BY id")
+        return [r[0] for r in rows.fetchall()], sink
+
+    def test_existing_decimal_column_keeps_its_scale(self, tmp_path: Path):
+        """A DECIMAL(38, 30) column made by an earlier mapping keeps 30 digits."""
+        value = Decimal("1.123456789012345678901234567890")
+        rows, sink = self._load(
+            tmp_path, "amount DECIMAL(38, 30)", {"type": "number"}, [value]
+        )
+        assert rows == [value]
+        assert sink.pyarrow_schema.field("amount").type == pa.decimal128(38, 30)
+
+    @pytest.mark.parametrize("column_type", ["DOUBLE", "REAL"])
+    def test_existing_float_column_is_staged_as_float(
+        self, tmp_path: Path, column_type: str
+    ):
+        """A DOUBLE or REAL column gets 1.5e-12, not the default scale's 0."""
+        rows, _ = self._load(
+            tmp_path, f"amount {column_type}", {"type": "number"}, [Decimal("1.5E-12")]
+        )
+        assert rows == [pytest.approx(1.5e-12)]
+
+    def test_values_rounded_to_the_column_scale_are_reported(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        """Extra fraction digits round to the column's scale, with a warning."""
+        values = [Decimal("1.239"), Decimal("2.5"), None]
+        with caplog.at_level("WARNING", logger="target_ducklake.parquet_utils"):
+            rows, _ = self._load(
+                tmp_path, "amount DECIMAL(10, 2)", {"type": "number"}, values
+            )
+        assert rows == [Decimal("1.24"), Decimal("2.50"), None]
+        assert "1 value(s) in column 'amount'" in caplog.text
+        assert "DECIMAL(10, 2)" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("column_ddl", "value"),
+        [
+            ("amount DECIMAL(5, 2)", Decimal("1234.5")),
+            # Rounding to the scale adds the digit that doesn't fit.
+            ("amount DECIMAL(5, 2)", Decimal("999.995")),
+            # 39 digits at scale 30: beyond the 38-digit decimal context too.
+            ("amount DECIMAL(38, 30)", Decimal(1000000000)),
+        ],
+        ids=["narrow", "rounds-over", "wide"],
+    )
+    def test_value_too_large_for_the_existing_column_fails(
+        self, tmp_path: Path, column_ddl: str, value: Decimal
+    ):
+        """A value with more integer digits than the column holds fails the batch."""
+        with pytest.raises(ValueError, match="Column 'amount' is DECIMAL"):
+            self._load(tmp_path, column_ddl, {"type": "number"}, [value])
+
+    def test_non_finite_number_fails_without_a_rounding_report(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """NaN and infinity fail the batch, naming the column; nothing is 'rounded'."""
+        schema = pa.schema([pa.field("amount", pa.decimal128(38, 9))])
+        for value in (float("nan"), float("inf"), Decimal("-Infinity")):
+            with pytest.raises(ValueError, match="Column 'amount' is DECIMAL"):
+                create_pyarrow_table([{"amount": value}], schema)
+        assert "rounded" not in caplog.text
+
+    @pytest.mark.parametrize(
+        ("column_ddl", "staged"),
+        [
+            ("amount VARCHAR", pa.decimal128(38, 9)),
+            ("amount BIGINT", pa.decimal128(38, 9)),
+            ("other INTEGER", pa.decimal128(38, 9)),
+        ],
+        ids=["varchar-column", "bigint-column", "new-column"],
+    )
+    def test_other_columns_keep_the_stream_staging(
+        self, tmp_path: Path, column_ddl: str, staged: pa.DataType
+    ):
+        """Only an existing DECIMAL/REAL/DOUBLE column changes a number's staging."""
+        _, sink = self._load(tmp_path, column_ddl, {"type": "number"}, [Decimal(1)])
+        assert sink.pyarrow_schema.field("amount").type == staged
+
+    def test_existing_decimal_column_for_a_string_stream_stays_text(
+        self, tmp_path: Path
+    ):
+        """A stream staging text into an existing DECIMAL column is unchanged."""
+        _, sink = self._load(
+            tmp_path, "amount DECIMAL(12, 4)", {"type": "string"}, ["1.5"]
+        )
+        assert sink.pyarrow_schema.field("amount").type == pa.string()
 
 
 class TestDecimalPrecision:
@@ -3064,14 +3195,15 @@ class TestColumnTypeReconciliation:
             ),
             patch.object(connector, "_add_columns") as mock_add,
             patch.object(connector, "_alter_column_type") as mock_alter,
-            patch.object(connector, "get_table_columns", return_value=["legacy_id"]),
         ):
-            connector.prepare_table(
+            table_types = connector.prepare_table(
                 "myschema", "mytable", [{"name": "legacy_id", "type": "BIGINT"}]
             )
 
         mock_alter.assert_called_once_with("myschema", "mytable", "legacy_id", "BIGINT")
         mock_add.assert_not_called()
+        # The table's columns are returned with their types, read once more.
+        assert table_types == {"legacy_id": "INTEGER"}
 
 
 class TestCaseInsensitiveColumns:

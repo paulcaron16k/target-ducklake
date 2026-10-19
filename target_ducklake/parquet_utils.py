@@ -57,8 +57,8 @@ def _capped_to_38(precision: int, scale: int) -> tuple[int, int]:
     default scale, so a money column keeps its cents (``numeric(40,2)`` gives
     DECIMAL(38, 2)) and a capped type never keeps fewer fraction digits than
     the DECIMAL(38, 9) default. A value with more integer digits than are left
-    fails the batch at staging (``decimal.InvalidOperation`` in
-    ``_to_decimal``), as it would with DECIMAL(38, 9).
+    fails the batch at staging (``ValueError`` in ``_decimal_column``), as
+    it would with DECIMAL(38, 9).
     """
     integer_digits = precision - scale
     fraction_floor = min(scale, DECIMAL_DEFAULT_SCALE)
@@ -156,19 +156,77 @@ def _normalize_data_for_pyarrow(data: dict, datetime_fields: list[str]) -> dict:
     return data
 
 
-def _to_decimal(value: object, scale: int) -> Decimal | None:
-    """Convert a numeric value to a Decimal rounded to ``scale`` digits.
+def _as_decimal(value: object) -> Decimal | None:
+    """Convert a numeric value to the Decimal it represents exactly.
 
-    Rounds half-even, matching how DuckDB rounds when casting to DECIMAL.
     Floats go through ``str`` so their shortest repr is kept, not binary noise.
     """
-    if value is None:
-        return None
+    if value is None or isinstance(value, Decimal):
+        return value
     if isinstance(value, bool):
         value = int(value)
-    if not isinstance(value, Decimal):
-        value = Decimal(str(value))
-    return value.quantize(Decimal(1).scaleb(-scale), context=_DECIMAL_CONTEXT)
+    return Decimal(str(value))
+
+
+_MAX_SHOWN_VALUE = 50
+
+
+class _DecimalMismatchError(ValueError):
+    """A value a DECIMAL(p, s) column can't hold; names the column and the value.
+
+    The value is shown as given, cut to 50 characters, since it may be source
+    text rather than a number.
+    """
+
+    def __init__(self, field: pa.Field, value: object) -> None:
+        shown = repr(value)
+        if len(shown) > _MAX_SHOWN_VALUE:
+            shown = shown[: _MAX_SHOWN_VALUE - 3] + "..."
+        precision, scale = field.type.precision, field.type.scale
+        super().__init__(
+            f"Column {field.name!r} is DECIMAL({precision}, {scale}); "
+            f"{shown} doesn't fit."
+        )
+
+
+def _decimal_column(values: list, field: pa.Field) -> list[Decimal | None]:
+    """Round each value to the column's scale, failing on any that doesn't fit.
+
+    Extra fraction digits are rounded half-even, as DuckDB's own cast to the
+    column rounds them, and a warning reports how many values were rounded.
+    A value with more integer digits than DECIMAL(p, s) holds, a non-finite
+    number or text that isn't a number raises ValueError naming the column.
+    """
+    precision, scale = field.type.precision, field.type.scale
+    quantum = Decimal(1).scaleb(-scale)
+    rounded: list[Decimal | None] = []
+    changed = 0
+    for value in values:
+        try:
+            exact = _as_decimal(value)
+            if exact is None:
+                rounded.append(None)
+                continue
+            result = exact.quantize(quantum, context=_DECIMAL_CONTEXT)
+        except InvalidOperation:  # not a number, or more than 38 digits
+            raise _DecimalMismatchError(field, value) from None
+        if not result.is_finite() or (
+            result and result.adjusted() >= precision - scale
+        ):
+            raise _DecimalMismatchError(field, value)
+        changed += result != exact
+        rounded.append(result)
+    if changed:
+        logger.warning(
+            "%d value(s) in column %r had more than %d fraction digits and were "
+            "rounded to fit DECIMAL(%d, %d).",
+            changed,
+            field.name,
+            scale,
+            precision,
+            scale,
+        )
+    return rounded
 
 
 def _has_fixed_offset(value: object) -> bool:
@@ -307,7 +365,7 @@ def _integer_value(value: object, column: str) -> int | None:
 def _coerce_column(values: list, field: pa.Field) -> list:
     """Coerce Python values so pyarrow can build the column with the field's type."""
     if pa.types.is_decimal(field.type):
-        return [_to_decimal(v, field.type.scale) for v in values]
+        return _decimal_column(values, field)
     if pa.types.is_integer(field.type):
         return [_integer_value(v, field.name) for v in values]
     if pa.types.is_floating(field.type):
