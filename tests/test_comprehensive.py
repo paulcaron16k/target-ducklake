@@ -1234,7 +1234,7 @@ class TestExistingNumberColumnStaging:
         assert sink.pyarrow_schema.field("amount").type == pa.string()
 
     def test_whole_number_decimal_into_existing_integer_column(self, tmp_path: Path):
-        """A bigint unsigned value into an existing BIGINT column loads or fails clearly.
+        """A bigint unsigned value into a BIGINT column loads or fails clearly.
 
         It is staged as int64, so an out-of-range value names the column.
         """
