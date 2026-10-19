@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING
 
 from singer_sdk import typing as th
 from singer_sdk.target_base import SQLTarget
@@ -11,6 +13,11 @@ from singer_sdk.target_base import SQLTarget
 from target_ducklake.sinks import (
     ducklakeSink,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from singer_sdk.sinks import Sink
 
 
 class Targetducklake(SQLTarget):
@@ -32,12 +39,30 @@ class Targetducklake(SQLTarget):
         """
         parallel = bool(self.config.get("parallel_draining", True))
         if parallel and self.config.get("catalog_type") == "sqlite":
-            self.logger.warning(
+            self.logger.info(
                 "catalog_type is sqlite, which allows one writer at a time: "
                 "sinks are drained one at a time (parallel_draining is ignored)."
             )
             return False
         return parallel
+
+    def _drain_all(self, sink_list: Iterable[Sink], parallelism: int) -> None:
+        """Drain sinks in parallel threads, and wait for all of them before raising.
+
+        The SDK's parallel drain raises the first failure while other threads
+        may still be running DuckDB queries; the interpreter then exits under
+        them and the process aborts (exit 134) instead of failing with the
+        error. Here every drain finishes first, then the first failure is
+        raised, so the run exits with it. Nothing changes when drains succeed.
+        """
+        if parallelism == 1:
+            super()._drain_all(sink_list, parallelism)
+            return
+        with ThreadPoolExecutor(max_workers=parallelism) as pool:
+            futures = [pool.submit(self.drain_one, sink) for sink in sink_list]
+        # Leaving the block waited for every drain; raise the first failure.
+        for future in futures:
+            future.result()
 
     @property
     def config(self):

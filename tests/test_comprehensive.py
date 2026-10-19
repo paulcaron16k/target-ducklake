@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -28,7 +29,6 @@ from target_ducklake.connector import (
     DuckLakeConnector,
     DuckLakeConnectorError,
     JSONSchemaToDuckLake,
-    is_transient_error,
 )
 from target_ducklake.flatten import (
     CustomJSONEncoder,
@@ -3477,11 +3477,6 @@ class TestCaseInsensitiveColumns:
 class TestSqliteCatalogDraining:
     """A SQLite catalog, which allows one writer at a time, loads several streams."""
 
-    LOCKED = (
-        "TransactionContext Error: Failed to commit: Failed to commit DuckLake "
-        "transaction.\nFailed to flush changes into DuckLake: database is locked"
-    )
-
     @pytest.mark.parametrize(
         ("catalog_type", "parallel_draining", "expected"),
         [
@@ -3502,7 +3497,7 @@ class TestSqliteCatalogDraining:
         parallel_draining: object,
         expected: int,
     ):
-        """parallel_draining is ignored for sqlite, with a warning when it was on."""
+        """parallel_draining is ignored for sqlite, with a log line when it was on."""
         config: dict[str, object] = {
             "catalog_url": "test.db",
             "data_path": "/tmp/test",
@@ -3514,8 +3509,8 @@ class TestSqliteCatalogDraining:
         target = Targetducklake(config=config)
         assert target.max_parallelism == expected
         # The SDK's target logger writes to stderr without propagating.
-        warned = "drained one at a time" in capfd.readouterr().err
-        assert warned == (catalog_type == "sqlite" and parallel_draining is not False)
+        logged = "drained one at a time" in capfd.readouterr().err
+        assert logged == (catalog_type == "sqlite" and parallel_draining is not False)
 
     def test_several_streams_load_into_a_sqlite_catalog(self, tmp_path: Path):
         """Two streams drained in one run both load (default config).
@@ -3558,21 +3553,28 @@ class TestSqliteCatalogDraining:
         ]
         assert counts == [3, 3, 3]
 
-    def test_database_is_locked_is_transient(self):
-        """A SQLite catalog busy with another writer is retried, not fatal."""
-        assert is_transient_error(duckdb.TransactionException(self.LOCKED))
+    def test_parallel_drain_waits_for_every_sink_before_raising(self):
+        """A failing sink's error is raised only after the other drains finish.
 
-    @patch("target_ducklake.connector.time.sleep")
-    def test_execute_retries_a_locked_catalog(self, mock_sleep: Mock):
-        """execute() retries a 'database is locked' commit and succeeds."""
-        connector = DuckLakeConnector({"catalog_url": "x", "data_path": "/x"})
-        cursor = Mock()
-        result = Mock()
-        cursor.execute.side_effect = [duckdb.TransactionException(self.LOCKED), result]
-        connector._connection = Mock()
-        connector._connection.cursor.return_value = cursor
-        assert connector.execute("BEGIN; SELECT 1; COMMIT;") is result
-        assert [c.args[0] for c in cursor.execute.call_args_list] == [
-            "BEGIN; SELECT 1; COMMIT;"
-        ] * 2
-        mock_sleep.assert_called_once_with(2)
+        Raised while another thread was still inside DuckDB, the error made
+        the interpreter exit under that thread, and the process aborted
+        (exit 134) instead of failing with the error.
+        """
+        target = Targetducklake(
+            config={"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
+        )
+        finished = threading.Event()
+
+        def drain_one(sink: str) -> None:
+            if sink == "fails":
+                msg = "boom"
+                raise RuntimeError(msg)
+            threading.Event().wait(0.3)  # still draining when the other fails
+            finished.set()
+
+        with (
+            patch.object(target, "drain_one", side_effect=drain_one),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            target._drain_all(["fails", "slow"], parallelism=2)
+        assert finished.is_set()

@@ -59,7 +59,7 @@ Tests are in `tests/test_comprehensive.py`. All tests are unit tests using mocks
 All queries go through `DuckLakeConnector.execute()`, which retries on two categories of transient errors with exponential backoff:
 
 1. **`duckdb.IOException`** — covers Postgres catalog connectivity errors and S3/GCS storage errors (via `duckdb.HTTPException`, a subclass)
-2. **`duckdb.Error` with transient message** — covers SSL/connection drops that DuckLake wraps in a plain `duckdb.Error` (e.g., "SSL connection has been closed unexpectedly"), and a SQLite catalog busy with another writer ("database is locked"). Detected by `is_transient_error()` in `connector.py`, which checks against `_TRANSIENT_ERROR_PATTERNS`.
+2. **`duckdb.Error` with transient message** — covers SSL/connection drops that DuckLake wraps in a plain `duckdb.Error` (e.g., "SSL connection has been closed unexpectedly"). Detected by `is_transient_error()` in `connector.py`, which checks against `_TRANSIENT_ERROR_PATTERNS`.
 
 All other exceptions are raised immediately without retry.
 
