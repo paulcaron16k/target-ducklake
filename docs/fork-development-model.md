@@ -156,6 +156,14 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-59](https://github.com/paulcaron16k/target-ducklake-definite/issues/59) Cap decimals above 38 digits without losing integer digits | squash `ac91dc2` (fork PR #62) | — | In fork, PR not opened |
 | [DUCKLKD-60](https://github.com/paulcaron16k/target-ducklake-definite/issues/60) Untyped properties become JSON columns; flatten_schema no longer mutates its input | squash `5e8461c` (fork PR #64) | — | In fork, PR not opened |
 | [DUCKLKD-65](https://github.com/paulcaron16k/target-ducklake-definite/issues/65) + [DUCKLKD-66](https://github.com/paulcaron16k/target-ducklake-definite/issues/66) oneOf/allOf/{} properties get columns; choice types keep their declared order | squash `6ca7032` (fork PR #67) | — | In fork, PR not opened |
+| [DUCKLKD-70](https://github.com/paulcaron16k/target-ducklake-definite/issues/70) Null in a JSON column is SQL NULL | squash `49d221e` (fork PR #71) | — | In fork, PR not opened |
+| [DUCKLKD-69](https://github.com/paulcaron16k/target-ducklake-definite/issues/69) Auto-cast timestamps for choice properties | squash `e5445b9` (fork PR #72) | — | In fork, PR not opened |
+| [DUCKLKD-53](https://github.com/paulcaron16k/target-ducklake-definite/issues/53) Match existing columns case-insensitively | squash `4b3880a` (fork PR #73) | — | In fork, PR not opened |
+| [DUCKLKD-55](https://github.com/paulcaron16k/target-ducklake-definite/issues/55) convert_tz_to_utc converts date-time text | squash `472e2bc` (fork PR #75) | — | In fork, PR not opened |
+| [DUCKLKD-57](https://github.com/paulcaron16k/target-ducklake-definite/issues/57) Mixed-zone batches keep each value's zone | squash `3798b52` (fork PR #76) | — | In fork, PR not opened |
+| [DUCKLKD-68](https://github.com/paulcaron16k/target-ducklake-definite/issues/68) + [DUCKLKD-61](https://github.com/paulcaron16k/target-ducklake-definite/issues/61) Staging follows the column type; conflicting hints ignored | squash `2c668e9` (fork PR #74) | — | In fork, PR not opened |
+| [DUCKLKD-63](https://github.com/paulcaron16k/target-ducklake-definite/issues/63) Stage numbers at an existing column's type | squash `aac6968` (fork PR #77) | — | In fork, PR not opened |
+| [DUCKLKD-51](https://github.com/paulcaron16k/target-ducklake-definite/issues/51) More x-sql-datatype spellings | squash `ab371be` (fork PR #78) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 

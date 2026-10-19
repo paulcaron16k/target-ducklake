@@ -19,8 +19,17 @@ Each entry mirrors its issue on the [Target DuckLake (Definite fork)](https://gi
 | [DUCKLKD-60](https://github.com/paulcaron16k/target-ducklake-definite/issues/60) | flatten_schema crashes on an all-null or untyped anyOf branch and mutates the caller's schema | `bug/DUCKLKD-60_flatten-anyof-crash` (deleted after merge) | `xflow_dev` | DUCKLKD-50 | Done (squash `5e8461c` in `xflow_dev`); no upstream PR |
 | [DUCKLKD-65](https://github.com/paulcaron16k/target-ducklake-definite/issues/65) | Properties declared with oneOf, allOf or {} are silently left out of the table, and their values are lost | `bug/DUCKLKD-65_oneof-allof-columns` (deleted after merge) | `xflow_dev` | DUCKLKD-60 | Done (squash `6ca7032` in `xflow_dev`, with DUCKLKD-66); no upstream PR |
 | [DUCKLKD-66](https://github.com/paulcaron16k/target-ducklake-definite/issues/66) | An anyOf branch with several types gets a staging type that changes from run to run | `bug/DUCKLKD-65_oneof-allof-columns` (deleted after merge) | `xflow_dev` | DUCKLKD-60 | Done (squash `6ca7032` in `xflow_dev`, with DUCKLKD-65); no upstream PR |
+| [DUCKLKD-70](https://github.com/paulcaron16k/target-ducklake-definite/issues/70) | A null in a JSON (object or array) column is stored as the JSON text null, not SQL NULL | `bug/DUCKLKD-70_json-null` (deleted after merge) | `xflow_dev` | DUCKLKD-60 | Done (squash `49d221e` in `xflow_dev`); no upstream PR |
+| [DUCKLKD-69](https://github.com/paulcaron16k/target-ducklake-definite/issues/69) | auto_cast_timestamps ignores properties declared with anyOf, oneOf or allOf | `bug/DUCKLKD-69_autocast-choices` (deleted after merge) | `xflow_dev` | DUCKLKD-65 | Done (squash `e5445b9` in `xflow_dev`); no upstream PR |
+| [DUCKLKD-53](https://github.com/paulcaron16k/target-ducklake-definite/issues/53) | Existing columns whose name differs only in case are re-added, failing setup | `bug/DUCKLKD-53_case-insensitive-columns` (deleted after merge) | `xflow_dev` | DUCKLKD-48 | Done (squash `4b3880a` in `xflow_dev`); no upstream PR |
+| [DUCKLKD-55](https://github.com/paulcaron16k/target-ducklake-definite/issues/55) | convert_tz_to_utc doesn't convert unparsed date-time strings | `bug/DUCKLKD-55_convert-tz-strings` (deleted after merge) | `xflow_dev` | DUCKLKD-47 | Done (squash `472e2bc` in `xflow_dev`); no upstream PR |
+| [DUCKLKD-57](https://github.com/paulcaron16k/target-ducklake-definite/issues/57) | Without convert_tz_to_utc, a timestamp column's wall-clock time depends on batch order | `bug/DUCKLKD-57_mixed-zone-wall-clock` (deleted after merge) | `xflow_dev` | DUCKLKD-47 | Done (squash `3798b52` in `xflow_dev`); no upstream PR |
+| [DUCKLKD-68](https://github.com/paulcaron16k/target-ducklake-definite/issues/68) | A column with several JSON types is staged at its first type while the table column is VARCHAR | `bug/DUCKLKD-68_staging-follows-ddl` (deleted after merge) | `xflow_dev` | DUCKLKD-21, DUCKLKD-65 | Done (squash `2c668e9`, with DUCKLKD-61 in `xflow_dev`); no upstream PR |
+| [DUCKLKD-61](https://github.com/paulcaron16k/target-ducklake-definite/issues/61) | A hint that conflicts with the JSON type gives different DDL and staging types | `bug/DUCKLKD-68_staging-follows-ddl` (deleted after merge) | `xflow_dev` | DUCKLKD-21, DUCKLKD-50 | Done (squash `2c668e9`, with DUCKLKD-68 in `xflow_dev`); no upstream PR |
+| [DUCKLKD-63](https://github.com/paulcaron16k/target-ducklake-definite/issues/63) | Decimals are staged at the stream's declared scale, not an existing column's, so they are rounded silently | `bug/DUCKLKD-63_existing-decimal-scale` (deleted after merge) | `xflow_dev` | DUCKLKD-68 | Done (squash `aac6968` in `xflow_dev`); no upstream PR |
+| [DUCKLKD-51](https://github.com/paulcaron16k/target-ducklake-definite/issues/51) | Support more x-sql-datatype spellings and stop warning on hints that match the default | `story/DUCKLKD-51_more-hint-spellings` (deleted after merge) | `xflow_dev` | DUCKLKD-61, DUCKLKD-63 | Done (squash `ab371be` in `xflow_dev`); no upstream PR |
 
-**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`). DUCKLKD-21 (`683bd73`) extends `number_precision_and_scale` from DUCKLKD-16 and the temporal key set from DUCKLKD-19, so upstream it must follow both. DUCKLKD-48 (`09a6e91`) replaces DUCKLKD-19's temporal-only cast with a cast of every key to the table's actual type, so upstream it follows DUCKLKD-18, 19 and 21; offering DUCKLKD-19 without DUCKLKD-48 would reintroduce the UUID and REAL key failures. DUCKLKD-49 (`8f83caf`) rewrites the same DELETE as a NULL-safe `USING` join and renames DUCKLKD-48's helper, so upstream it follows DUCKLKD-48. DUCKLKD-50 (`0bb2fe7`) changes `decimal_hint` in `type_hints.py`, which DUCKLKD-21 introduces, and makes `flatten.py` import that module, so upstream it follows DUCKLKD-21. DUCKLKD-59 (`ac91dc2`) rewrites `number_precision_and_scale` from DUCKLKD-16 and changes a DUCKLKD-21 test expectation, so upstream it follows both. DUCKLKD-60 (`5e8461c`) rewrites the `anyOf` path in `flatten_schema`, where DUCKLKD-50 added `_with_wrapper_hint`, so upstream it follows DUCKLKD-50; it also overrides `get_validator` in `sinks.py`. DUCKLKD-65 and DUCKLKD-66 (one squash, `6ca7032`) replace DUCKLKD-60's `_anyof_column` and `_first_choice_column` with `_choice_column`, so upstream they follow DUCKLKD-60 and travel together.
+**Conflict notes.** DUCKLKD-16 to DUCKLKD-18 each branch from upstream `main` and change different code. They overlap only in the import block at the top of `tests/test_comprehensive.py`; resolve by keeping the union of the imports. DUCKLKD-19 edits `_build_key_columns_sql`, which DUCKLKD-18 introduces. It branched from `xflow_dev`, which already contained DUCKLKD-18, and landed as squash commit `4466be0`. Offered upstream, cherry-pick `4466be0` onto `origin/main` after DUCKLKD-18 and reword the message (drop the DUCKLKD key, `(#45)` and `Fixes #19`). DUCKLKD-21 (`683bd73`) extends `number_precision_and_scale` from DUCKLKD-16 and the temporal key set from DUCKLKD-19, so upstream it must follow both. DUCKLKD-48 (`09a6e91`) replaces DUCKLKD-19's temporal-only cast with a cast of every key to the table's actual type, so upstream it follows DUCKLKD-18, 19 and 21; offering DUCKLKD-19 without DUCKLKD-48 would reintroduce the UUID and REAL key failures. DUCKLKD-49 (`8f83caf`) rewrites the same DELETE as a NULL-safe `USING` join and renames DUCKLKD-48's helper, so upstream it follows DUCKLKD-48. DUCKLKD-50 (`0bb2fe7`) changes `decimal_hint` in `type_hints.py`, which DUCKLKD-21 introduces, and makes `flatten.py` import that module, so upstream it follows DUCKLKD-21. DUCKLKD-59 (`ac91dc2`) rewrites `number_precision_and_scale` from DUCKLKD-16 and changes a DUCKLKD-21 test expectation, so upstream it follows both. DUCKLKD-60 (`5e8461c`) rewrites the `anyOf` path in `flatten_schema`, where DUCKLKD-50 added `_with_wrapper_hint`, so upstream it follows DUCKLKD-50; it also overrides `get_validator` in `sinks.py`. DUCKLKD-65 and DUCKLKD-66 (one squash, `6ca7032`) replace DUCKLKD-60's `_anyof_column` and `_first_choice_column` with `_choice_column`, so upstream they follow DUCKLKD-60 and travel together. DUCKLKD-70 (`49d221e`), DUCKLKD-69 (`e5445b9`), DUCKLKD-53 (`4b3880a`), DUCKLKD-55 (`472e2bc`) and DUCKLKD-57 (`3798b52`) change separate code and merged cleanly in that order; DUCKLKD-69 builds on DUCKLKD-65's `_choice_column`, DUCKLKD-55 and DUCKLKD-57 on DUCKLKD-47's text rendering. DUCKLKD-68 and DUCKLKD-61 (one squash, `2c668e9`) replace staging by JSON type (`_field_type_to_pyarrow_field`, `flatten_schema_to_pyarrow_schema`) with `staging_type` over the DDL, and rewrite `_coerce_column`, so upstream they follow DUCKLKD-21, 50, 57 and 65; the merge with DUCKLKD-57 kept both `_mixes_zones` and the per-type coercion. DUCKLKD-63 (`aac6968`) builds on `staging_type` and changes `prepare_table` to return column types, so it follows DUCKLKD-68. DUCKLKD-51 (`ab371be`) extends DUCKLKD-61's hint rule and relies on DUCKLKD-63's existing-column staging, so it follows both. DUCKLKD-63 and DUCKLKD-51 were developed stacked; after their parents' squashes they were applied onto `xflow_dev` in a merge commit, so their squashes contain only their own changes.
 
 **Verification baseline.** Upstream `main` already has 556 ruff findings, 4 files the formatter would change, and 2 mypy errors in `sinks.py`. "No new findings" below means none added by the fix, compared against that baseline. Tests run with `uv run --python 3.12 pytest tests/` (the default Python 3.14 has no wheel for the pinned pyarrow 20; tracked as [DUCKLKD-32](https://github.com/paulcaron16k/target-ducklake-definite/issues/32)).
 
@@ -494,5 +503,212 @@ Found while starting DUCKLKD-65 on 2026-10-18; reproduced. `_anyof_column` built
 Fixed in the same squash as DUCKLKD-65 (`6ca7032`, fork PR #67), because the shared `_choice_column` would otherwise have carried the random order into `oneOf` and `allOf`. The column type is `["null", *branch types in declared order]`. `test_branch_type_order_is_the_same_in_every_process` runs the flattening for `anyOf`, `oneOf` and `allOf`, each in fresh interpreters under PYTHONHASHSEED 1–8. All three give one result, `["null", "integer", "string"]`. On the old code they fail; the `anyOf` case gave five different orders across the eight seeds.
 
 What remains is filed as [DUCKLKD-68](https://github.com/paulcaron16k/target-ducklake-definite/issues/68): staging at the first type while the DDL is VARCHAR, which now fails consistently for integer-first lists.
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-70 A null in a JSON (object or array) column is stored as the JSON text null, not SQL NULL
+
+## Intent
+
+Found by the independent reviews of PR #64 and PR #67 on 2026-10-18. `flatten_record` JSON-dumped every value of an object, array or untyped column, including None, so an explicit null was stored as the text `'null'` (`c IS NULL` false) while a missing key gave SQL NULL.
+
+## Acceptance
+
+- None in an object, array or untyped (JSON) column is stored as SQL NULL; a null inside a value, such as `{"a": null}`, is unchanged.
+- The PR states the change for existing rows, with SQL to convert them.
+- A regression test checks `c IS NULL` through staging and DuckDB and fails on the old code; no new ruff or mypy findings.
+
+## Evidence
+
+Squash-merged into `xflow_dev` as `49d221e` through fork PR #71. None is never JSON-dumped; values containing a null, and the string `"null"`, are dumped as before. Existing rows keep `'null'`; to convert them: `UPDATE lake.schema.tbl SET c = NULL WHERE c::VARCHAR = 'null';` (checked on a DuckLake table loaded by the old code).
+
+`test_none_in_json_column_is_sql_null` (object, array, untyped, `{}`) and the updated untyped-values test: 5 fail on the old code. Real DuckLake: the old code stored `'null'` for explicit nulls and NULL for missing keys; the new code stores NULL for both. Independent Sonnet review: no blocking findings; nit 1 fixed (test cases name their inner value), nit 2 answered (NULL keys match NULL since DUCKLKD-49). Re-review: no findings.
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-69 auto_cast_timestamps ignores properties declared with anyOf, oneOf or allOf
+
+## Intent
+
+Found by the independent review of PR #67 on 2026-10-18. The auto-cast check ran only in `flatten_schema`'s `type` branch, so `created_at: {anyOf: [string, null]}` stayed VARCHAR with `auto_cast_timestamps` on.
+
+## Acceptance
+
+- With the setting, a choice property resolving to a string without a format, named in `TIMESTAMP_COLUMN_NAMES`, gets format date-time; off, nothing changes.
+- The PR states that new tables get TIMESTAMP where they got VARCHAR and existing tables keep VARCHAR.
+- A regression test fails on the old code; no new ruff or mypy findings.
+
+## Evidence
+
+Squash-merged into `xflow_dev` as `e5445b9` through fork PR #72. `_leaf_column` resolves every non-flattened property, and the auto-cast check runs once on the resolved column; a `format` on a choice wrapper also stops it. `flatten_schema` lost its C901/PLR0912 findings. Mixed choices follow their first branch, as plain type lists do (pinned by a test, stated in the PR).
+
+The 4 auto-cast cases fail on the old code; the skip and name cases pin unchanged behaviour. Real DuckLake: anyOf/oneOf `created_at`/`updated_at` became TIMESTAMP; an existing all-VARCHAR table kept VARCHAR and loaded. Independent Sonnet review: no blocking findings; nit 1 declined (the wrapper-format check is not redundant), nit 2 fixed (mixed-choice pin and description). Re-review: no findings.
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-53 Existing columns whose name differs only in case are re-added, failing setup
+
+## Intent
+
+Found reproducing a review finding on PR #52 on 2026-10-17. `prepare_table` compared column names case-sensitively, so a table with `"ID"` receiving a stream property `id` ran `ADD COLUMN "id"` and failed setup with `Column with name id already exists!`.
+
+## Acceptance
+
+- `prepare_table` and the type widening match existing columns case-insensitively; loading and merging into such a table succeeds.
+- A regression test reproduces the Catalog Error on the old code.
+
+## Evidence
+
+Squash-merged into `xflow_dev` as `4b3880a` through fork PR #73. `_by_lower_name` serves `prepare_table` and `_reconcile_column_types` (widening issued against the table's own name). The INSERT column list (`_build_columns_sql`) matched case-sensitively too and would have filled `"ID"` with NULL once setup succeeded; it is fixed in the same PR.
+
+`TestCaseInsensitiveColumns` (merge and append lifecycles, widening, INSERT columns): all 4 fail on the old code, 2 with the reported Catalog Error. Real DuckLake against an upper-case table: setup succeeded, only the new column was added, one row per key. Independent Sonnet review: no blocking or should-fix findings; three nits needed no change.
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-55 convert_tz_to_utc doesn't convert unparsed date-time strings
+
+## Intent
+
+Found fixing DUCKLKD-47 on 2026-10-17. The singer-sdk parses only top-level date-times it recognises, so nested values, top-level oneOf/allOf properties and auto-cast strings reached staging as text, and `convert_tz_to_utc` skipped them: a timestamp column stored the wall-clock time.
+
+## Acceptance
+
+- With the setting, date-time text with an offset is converted to UTC like a parsed value, top-level and flattened; without it, nothing changes.
+- Unparseable strings keep today's behaviour; a regression test reproduces the wall-clock value on the old code.
+
+## Evidence
+
+Squash-merged into `xflow_dev` as `472e2bc` through fork PR #75. `_normalize_datetime` parses text with `datetime.fromisoformat` (the SDK's parser); text with an offset becomes UTC text (`...Z`). Naive, unparseable and out-of-range text is left as it is.
+
+Tests through the real sink and the SDK's own parsing, for nested, oneOf and auto-cast shapes: the 9 offset cases fail on the old code; 11 others pin unchanged behaviour. Real DuckLake: before, only the top-level value was converted; after, all four. Independent Sonnet review: no blocking findings; nit 2 fixed (the `try` covers only parsing), nit 1 declined (UTC text matches DUCKLKD-47's). Re-review: no findings.
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-57 Without convert_tz_to_utc, a timestamp column's wall-clock time depends on batch order
+
+## Intent
+
+Found fixing DUCKLKD-47 on 2026-10-17. pyarrow builds a datetime column in its first value's zone, so a batch mixing zones stored order-dependent wall-clock times. Found while fixing: a batch mixing naive and aware values (`...T10:00:00` and `...Z`, the case real taps produce) was order-dependent for TIMESTAMPTZ columns too, with the setting on or off.
+
+## Acceptance
+
+- With `convert_tz_to_utc` off, a plain timestamp column stores each value's own wall-clock time regardless of the batch.
+- TIMESTAMPTZ columns and the setting on are unchanged; a regression test reproduces the order dependence on the old code.
+
+## Evidence
+
+Squash-merged into `xflow_dev` as `3798b52` through fork PR #76. A column whose datetimes have more than one `tzinfo` (naive counts as one) is rendered as text, each value in its own offset (`_mixes_zones`, alongside DUCKLKD-47's fixed-offset rule); one-zone columns are left to pyarrow. **Beyond the Acceptance as written:** naive+aware batches now store correct TIMESTAMPTZ instants, with the setting on and off, because they were wrong before; every other batch is unchanged.
+
+7 cases fail on the old code (6 orders; naive+UTC with the setting on); 3 pin unchanged behaviour. Real DuckLake, values sent as JSON text in both orders: the old code stored the UTC value 5 hours off (naive first) or read the naive value as UTC (UTC first); the new code gives the same, correct result in both orders. Independent Sonnet review: no blocking findings; nit 1 fixed (TIMESTAMPTZ pinned with the setting on, Acceptance difference stated), nit 2 answered in the description. Re-review: no findings.
+
+Seen while testing, unrelated: with a sqlite catalog, two streams draining in parallel can fail the run (`Failed to get extended data file list from DuckLake`); old and new code behave the same.
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-68 A column with several JSON types is staged at its first type while the table column is VARCHAR
+
+## Intent
+
+Found by the independent review of PR #67 on 2026-10-18. For `[integer, string]`, the DDL is VARCHAR but staging was int64, so `'abc'` failed the batch; `[number, string]` staged a decimal.
+
+## Acceptance
+
+- A column with more than one non-null type is staged at its DDL type, so every value it can hold stages; DDL and staging agree for every combination (parametrized), and single-type columns are unchanged.
+- A regression test loads `'abc'` into `[integer, string]` and fails on the old code; no new ruff or mypy findings.
+
+## Evidence
+
+Squash-merged into `xflow_dev` as `2c668e9` through fork PR #74, together with [DUCKLKD-61](https://github.com/paulcaron16k/target-ducklake-definite/issues/61) (same root cause: staging did not follow the DDL). `staging_type(column_type)` maps each DDL type to its parquet type, and the sink builds `staging_schema(self.ducklake_schema)`; `_field_type_to_pyarrow_field`, `flatten_schema_to_pyarrow_schema` and `is_float_hint` were removed. `_coerce_column` coerces values to the staging type:
+- text columns render scalars as the text they store (`true`, `1.50`);
+- int64/float64 columns read number text as DuckDB's cast did (`' 7 '`, `'+5'`, `'1e2'`, `'12.0'`);
+- int64 columns keep whole numbers exact and raise a `ValueError` naming the column for fractions, non-finite and out-of-range values (rejected on magnitude, so `'1e1000000'` doesn't stall).
+
+A differential check over 20,000 random columns found differences only for multi-type columns and conflicting hints. New multi-type numbers in existing VARCHAR columns are stored as their exact text (`1.50`, not `1.500000000`).
+
+`TestStagingFollowsColumnType` (55 cases at merge); 40 of the original 44 fail on the old code. Real DuckLake: the old code failed the batch on `'n/a'`; the new code loaded every multi-type and hinted column. Independent Sonnet review, five rounds: round 1 should-fix (integer-hinted text parsed more strictly than DuckDB) fixed, with three nits; rounds 2–4 one nit each (out-of-range errors, a huge-exponent stall, zero with a large exponent), all fixed; round 5: no findings.
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-61 A hint that conflicts with the JSON type gives different DDL and staging types
+
+## Intent
+
+Found by the independent review of PR #58 on 2026-10-17. The DDL followed the hint and staging the JSON type: string+`numeric(12,4)` created DECIMAL(12,4) but staged text; integer+`uuid` created UUID but staged int64, which no value could be loaded into.
+
+## Acceptance
+
+- Decide and document the rule for a hint incompatible with the JSON type; DDL and staging agree under it for each pair.
+- A test pins the rule for string+decimal and integer+uuid; no new ruff or mypy findings.
+
+## Evidence
+
+Fixed in the same squash as DUCKLKD-68 (`2c668e9`, fork PR #74). **Rule:** a hint applies when the property's values can be loaded into it, and staging then follows it; otherwise it is ignored with a warning and the JSON type decides (`type_hints.hint_fits_json_type`). A `string` takes any supported hint; `integer`, `number` and `boolean` take numeric hints and `json`/`jsonb`; `object` and `array` take only `json`/`jsonb`. Documented in the README's *Column types* section. Ignored hints change only new tables (integer+uuid now creates BIGINT).
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-63 Decimals are staged at the stream's declared scale, not an existing column's, so they are rounded silently
+
+## Intent
+
+Found by the independent review of PR #62 on 2026-10-17; filed on the owner's decision. A table created by upstream `main` as DECIMAL(38,30) was staged at (38,9), so `1.123456789012345678901234567890` was stored as `1.123456789`, silently. Found while fixing: an existing DOUBLE column fed by a number stream stored `1.5e-12` as 0.
+
+## Acceptance
+
+- When the table exists, each decimal column is staged at the column's own (precision, scale), read from the table.
+- A value that doesn't fit fails loudly or is reported, never rounded silently; new tables are unchanged.
+- A regression test loads the 30-digit value into an existing DECIMAL(38,30) column through the sink and fails on the old code.
+
+## Evidence
+
+Squash-merged into `xflow_dev` as `aac6968` through fork PR #77. `prepare_table` returns the table's column types from the PRAGMA it already ran, and the sink stages a number column at an existing DECIMAL, REAL or DOUBLE column's type (`_staged_columns`). Merge-key types come from the same read, so merges issue one query fewer. `_decimal_column` rounds each value once:
+- values rounded to the column's scale are reported with a warning (`1 value(s) in column 'd2' had more than 2 fraction digits and were rounded to fit DECIMAL(10, 2).`);
+- a value with too many integer digits, a non-finite number or non-number text raises a `ValueError` naming the column and DECIMAL(p, s).
+
+Tests through the real sink against existing tables; the DECIMAL(38,30), DOUBLE, REAL and rounding-report cases fail on the old code. Real DuckLake: before, `d30` lost 21 digits and `dbl` stored 0; after, both are exact, with the warning for `d2`. Independent Sonnet review, three rounds: round 1 should-fix (bare `InvalidOperation` for wide columns) and two nits fixed; round 2 should-fix (error message built on every value) and a nit fixed; round 3: no findings.
+
+Upstream PR: not opened.
+
+---
+
+# DUCKLKD-51 Support more x-sql-datatype spellings and stop warning on hints that match the default
+
+## Intent
+
+Raised by the independent review of PR #46 on 2026-10-17 (findings 5, 6 and 8). Common source spellings fell back with an SDK warning; hints matching the default mapping warned on every sink creation; the DECIMAL-to-DOUBLE behaviour for existing tables was undecided.
+
+## Acceptance
+
+- The listed spellings map to the matching DuckDB type, or are documented as deliberately unsupported; hints equivalent to the default mapping don't warn.
+- The DECIMAL-to-DOUBLE behaviour for existing tables is decided and documented; tests cover each new spelling.
+
+## Evidence
+
+Squash-merged into `xflow_dev` as `ab371be` through fork PR #78. New mappings:
+- `decimal(p)` is DECIMAL(p,0), and unsized `numeric`/`decimal` take the default decimal mapping;
+- temporal precisions are ignored (`timestamp(3) with time zone`);
+- SQL Server `datetime2`/`smalldatetime`/`datetimeoffset`;
+- MySQL display widths, `mediumint` and `unsigned` ranges, with `bigint unsigned` → DECIMAL(20,0); `unsigned` is ignored on decimals and floats.
+
+Text-type hints (including `varchar(max)`) are silent on string properties, and `boolean`/`bool` on boolean properties; elsewhere they warn. Deliberately unsupported: `tinyint`, `datetime`, `timetz`/`time with time zone`, `bit`, binary types.
+
+**Decision:** an existing DECIMAL column is never changed to DOUBLE; a float hint on it stores values at its scale, with DUCKLKD-63's rounding warning. Recreate the column to store doubles. Existing columns also keep their stored values under the new mappings: a string property into an existing text column is staged as text, and a whole-number decimal into an existing integer column as int64. All of this is documented in the README.
+
+New tests: 35 of the original 41 fail on the code without the change; the 13 added for the review fail on its first commit. Real DuckLake: all new spellings created the expected columns and loaded exactly, with no hint warning. Independent Sonnet review, two rounds: round 1 three should-fix (existing VARCHAR columns, default hints on other JSON types, `varchar(max)`) and two nits, all fixed; round 2: no findings.
 
 Upstream PR: not opened.
