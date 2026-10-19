@@ -225,34 +225,56 @@ class ducklakeSink(SQLSink):
         # lowercases key_properties while columns keep the property's case.
         self._table_types = {name.lower(): typ for name, typ in table_types.items()}
         self.pyarrow_schema = staging_schema(
-            self._staged_columns(self.ducklake_schema, self._table_types)
+            self._staged_columns(
+                self.ducklake_schema, self._table_types, self.flatten_schema
+            )
         )
 
     @staticmethod
     def _staged_columns(
-        columns: list[dict[str, str]], table_types: dict[str, str]
+        columns: list[dict[str, str]],
+        table_types: dict[str, str],
+        flattened: dict[str, dict],
     ) -> list[dict[str, str]]:
-        """The columns to stage: each at its DDL type, or an existing number column's.
+        """The columns to stage: each at its DDL type, or an existing column's.
 
-        A column the table already has as DECIMAL, REAL or DOUBLE is staged at
-        that type, not the stream's: staging at another scale would round
-        values before the insert casts them (a DECIMAL(38, 30) column staged at
-        the default (38, 9) lost 21 fraction digits silently, and a DOUBLE
-        column staged as a decimal stored 1.5e-12 as 0). Only columns the
-        stream also stages as numbers are affected; table_types is keyed by
-        lowercased name.
+        An existing column's own type is used where staging at the stream's
+        type would change values before the insert casts them:
+        - a number column the table has as DECIMAL, REAL or DOUBLE (staging at
+          another scale rounded silently: a DECIMAL(38, 30) column staged at
+          the default (38, 9) lost 21 fraction digits, and a DOUBLE column
+          staged as a decimal stored 1.5e-12 as 0);
+        - a whole-number decimal (scale 0, e.g. bigint unsigned) the table has
+          as an integer, so a value out of its range fails with a clear error;
+        - a string property the table has as a text column, whose text is then
+          kept as sent, whatever its hint (a ``numeric`` hint would otherwise
+          store '1.5' as '1.500000000').
+
+        ``table_types`` is keyed by lowercased name; ``flattened`` is the
+        flattened stream schema the columns were built from.
         """
         staged = []
         for column in columns:
             table_type = table_types.get(column["name"].lower())
-            if (
-                table_type is not None
-                and _is_fractional(staging_type(column["type"]))
-                and _is_fractional(staging_type(table_type))
-            ):
-                staged.append({**column, "type": table_type})
-            else:
+            if table_type is None:
                 staged.append(column)
+                continue
+            ours, theirs = staging_type(column["type"]), staging_type(table_type)
+            types = flattened.get(column["name"], {}).get("type") or []
+            types = [types] if isinstance(types, str) else types
+            use_table_type = (
+                (_is_fractional(ours) and _is_fractional(theirs))
+                or (
+                    pa.types.is_decimal(ours)
+                    and ours.scale == 0
+                    and pa.types.is_integer(theirs)
+                )
+                or (
+                    pa.types.is_string(theirs)
+                    and [t for t in types if t != "null"] == ["string"]
+                )
+            )
+            staged.append({**column, "type": table_type} if use_table_type else column)
         return staged
 
     def _key_column_types(self) -> dict[str, str]:

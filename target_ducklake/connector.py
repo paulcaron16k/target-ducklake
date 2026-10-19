@@ -14,7 +14,12 @@ from singer_sdk.connectors.sql import JSONSchemaToSQL
 from sqlalchemy.types import BIGINT, DECIMAL, INTEGER, JSON, TypeEngine, UserDefinedType
 
 from target_ducklake.parquet_utils import number_precision_and_scale
-from target_ducklake.type_hints import decimal_hint, hint_fits_json_type, hinted_type
+from target_ducklake.type_hints import (
+    hint_fits_json_type,
+    hinted_type,
+    is_decimal_hint,
+    is_default_type_hint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +89,10 @@ class JSONSchemaToDuckLake(JSONSchemaToSQL):
         be loaded into (``uuid`` on an integer, see ``hint_fits_json_type``) is
         ignored with a warning, and the JSON type decides the column.
         """
-        hinted = "DECIMAL" if decimal_hint(schema) is not None else hinted_type(schema)
+        unhinted = {k: v for k, v in schema.items() if k != "x-sql-datatype"}
+        if is_default_type_hint(schema):
+            return super().to_sql_type(unhinted)
+        hinted = "DECIMAL" if is_decimal_hint(schema) else hinted_type(schema)
         if hinted is None:
             return super().to_sql_type(schema)
         if hint_fits_json_type(schema, hinted):
@@ -97,7 +105,6 @@ class JSONSchemaToDuckLake(JSONSchemaToSQL):
             UserWarning,
             stacklevel=2,
         )
-        unhinted = {k: v for k, v in schema.items() if k != "x-sql-datatype"}
         return super().to_sql_type(unhinted)
 
     def __init__(self, *args, **kwargs):

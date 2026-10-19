@@ -1193,6 +1193,58 @@ class TestExistingNumberColumnStaging:
         with pytest.raises(ValueError, match="Column 'amount' is DECIMAL"):
             self._load(tmp_path, column_ddl, {"type": "number"}, [value])
 
+    def test_float_hint_on_existing_decimal_column_keeps_the_column(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        """An existing DECIMAL column isn't changed to DOUBLE for a float hint.
+
+        Its values are rounded to its scale, with the rounding warning; the
+        column must be recreated to store doubles.
+        """
+        with caplog.at_level("WARNING", logger="target_ducklake.parquet_utils"):
+            rows, _ = self._load(
+                tmp_path,
+                "amount DECIMAL(38, 9)",
+                {"type": "number", "x-sql-datatype": "double"},
+                [Decimal("1.5E-12"), Decimal("2.5")],
+            )
+        assert rows == [Decimal(0), Decimal("2.5")]
+        assert "1 value(s) in column 'amount'" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("value", "stored"),
+        [("1.5", "1.5"), ("1" * 33, "1" * 33), ("abc", "abc")],
+        ids=["fraction", "33-digit-integer", "text"],
+    )
+    def test_string_into_existing_text_column_keeps_its_text(
+        self, tmp_path: Path, value: str, stored: str
+    ):
+        """A string property's text lands unchanged in an existing VARCHAR column.
+
+        Its hint (here unsized numeric, which a new table would make DECIMAL)
+        doesn't change what the existing text column receives.
+        """
+        rows, sink = self._load(
+            tmp_path,
+            "amount VARCHAR",
+            {"type": "string", "x-sql-datatype": "numeric"},
+            [value],
+        )
+        assert rows == [stored]
+        assert sink.pyarrow_schema.field("amount").type == pa.string()
+
+    def test_whole_number_decimal_into_existing_integer_column(self, tmp_path: Path):
+        """A bigint unsigned value into a BIGINT column loads or fails clearly.
+
+        It is staged as int64, so an out-of-range value names the column.
+        """
+        prop = {"type": "integer", "x-sql-datatype": "bigint unsigned"}
+        rows, sink = self._load(tmp_path / "ok", "amount BIGINT", prop, [5])
+        assert rows == [5]
+        assert sink.pyarrow_schema.field("amount").type == pa.int64()
+        with pytest.raises(ValueError, match="Column 'amount' holds 64-bit integers"):
+            self._load(tmp_path / "big", "amount BIGINT", prop, [2**64 - 1])
+
     def test_non_finite_number_fails_without_a_rounding_report(
         self, caplog: pytest.LogCaptureFixture
     ):
@@ -1708,6 +1760,120 @@ class TestSqlDatatypeHints:
         assert schema.field("d").type == pa.decimal128(12, 4)
         assert schema.field("f").type == pa.float64()
         assert schema.field("n").type == pa.decimal128(38, 9)
+
+    @pytest.mark.parametrize(
+        ("json_type", "hint", "ddl"),
+        [
+            # Decimals without a scale (0) or without a size (the default).
+            ("number", "decimal(10)", "DECIMAL(10, 0)"),
+            ("number", "numeric(12)", "DECIMAL(12, 0)"),
+            ("number", "numeric", "DECIMAL(38, 9)"),
+            ("string", "decimal", "DECIMAL(38, 9)"),
+            # Fractional-seconds precision.
+            ("string", "timestamp(6)", "TIMESTAMP"),
+            ("string", "timestamp(3) without time zone", "TIMESTAMP"),
+            ("string", "timestamp(3) with time zone", "TIMESTAMPTZ"),
+            ("string", "timestamptz(6)", "TIMESTAMPTZ"),
+            ("string", "time(3)", "TIME"),
+            # SQL Server.
+            ("string", "datetime2", "TIMESTAMP"),
+            ("string", "datetime2(7)", "TIMESTAMP"),
+            ("string", "smalldatetime", "TIMESTAMP"),
+            ("string", "datetimeoffset(7)", "TIMESTAMPTZ"),
+            # MySQL integers: display widths and unsigned ranges.
+            ("integer", "int(11)", "INTEGER"),
+            ("integer", "bigint(20)", "BIGINT"),
+            ("integer", "mediumint", "INTEGER"),
+            ("integer", "mediumint unsigned", "INTEGER"),
+            ("integer", "smallint unsigned", "INTEGER"),
+            ("integer", "int unsigned", "BIGINT"),
+            ("integer", "int(10) unsigned zerofill", "BIGINT"),
+            ("integer", "integer unsigned", "BIGINT"),
+            ("integer", "bigint unsigned", "DECIMAL(20, 0)"),
+            ("integer", "bigint(20) unsigned", "DECIMAL(20, 0)"),
+            # MySQL's deprecated unsigned decimals and floats.
+            ("number", "decimal(10,2) unsigned", "DECIMAL(10, 2)"),
+            ("number", "double unsigned", "DOUBLE"),
+            ("number", "float unsigned zerofill", "DOUBLE"),
+        ],
+    )
+    def test_more_source_spellings(
+        self,
+        recwarn: pytest.WarningsRecorder,
+        json_type: str,
+        hint: str,
+        ddl: str,
+    ):
+        """Common source spellings map to their type, staged alike, with no warning."""
+        flat = {"c": {"type": ["null", json_type], "x-sql-datatype": hint}}
+        columns = DuckLakeConnector(self.CONFIG).json_to_ducklake_schema(flat)
+        assert columns[0]["type"] == ddl
+        assert _staging_schema(flat).field("c").type == staging_type(ddl)
+        assert not [w for w in recwarn.list if "x-sql-datatype" in str(w.message)]
+
+    @pytest.mark.parametrize(
+        ("json_type", "hint"),
+        [
+            ("string", "text"),
+            ("string", "TEXT"),
+            ("string", "longtext"),
+            ("string", "varchar"),
+            ("string", "varchar(255)"),
+            ("string", "character varying(10)"),
+            ("string", "char(2)"),
+            ("string", "nvarchar(50)"),
+            ("string", "varchar(max)"),
+            ("string", "nvarchar(MAX)"),
+            ("string", "citext"),
+            ("boolean", "boolean"),
+            ("boolean", "bool"),
+        ],
+    )
+    def test_hint_matching_the_default_does_not_warn(
+        self, recwarn: pytest.WarningsRecorder, json_type: str, hint: str
+    ):
+        """A hint naming the type the JSON type gives anyway is silently accepted."""
+        prop = {"type": json_type, "x-sql-datatype": hint}
+        assert self._ddl_type(prop) == self._ddl_type({"type": json_type})
+        assert not recwarn.list
+
+    @pytest.mark.parametrize(
+        ("json_type", "hint"),
+        [
+            ("integer", "text"),
+            ("integer", "boolean"),
+            ("boolean", "text"),
+            ("string", "boolean"),
+        ],
+    )
+    def test_default_hint_on_another_json_type_still_warns(
+        self, json_type: str, hint: str
+    ):
+        """A text or boolean hint is silent only on the JSON type it names."""
+        with pytest.warns(UserWarning, match="does not support the x-sql-datatype"):
+            ddl = self._ddl_type({"type": json_type, "x-sql-datatype": hint})
+        assert ddl == self._ddl_type({"type": json_type})
+
+    @pytest.mark.parametrize(
+        "hint", ["tinyint", "tinyint(1) unsigned", "timetz", "datetime", "decimal(0)"]
+    )
+    def test_deliberately_unsupported_hints_still_warn(self, hint: str):
+        """Hints left unsupported on purpose (tinyint, timetz, datetime) still warn."""
+        with pytest.warns(UserWarning, match="does not support the x-sql-datatype"):
+            self._ddl_type({"type": "string", "x-sql-datatype": hint})
+
+    def test_bigint_unsigned_holds_its_maximum(self, tmp_path: Path):
+        """2^64 - 1 loads into a bigint unsigned column exactly."""
+        flat = {"c": {"type": "integer", "x-sql-datatype": "bigint unsigned"}}
+        ddl = DuckLakeConnector(self.CONFIG).json_to_ducklake_schema(flat)[0]["type"]
+        path = tmp_path / "batch.parquet"
+        pq.write_table(
+            create_pyarrow_table([{"c": 2**64 - 1}], _staging_schema(flat)), path
+        )
+        con = duckdb.connect()
+        con.execute(f"CREATE TABLE t (c {ddl})")
+        con.execute(f"INSERT INTO t SELECT c FROM '{path}'")
+        assert con.execute("SELECT c FROM t").fetchone()[0] == 2**64 - 1
 
     def _column_types(self, prop: dict) -> tuple[str, pa.DataType]:
         """The DDL type and staging type a stream property gets, as in the sink."""
