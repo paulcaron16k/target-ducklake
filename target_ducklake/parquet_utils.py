@@ -143,10 +143,26 @@ def flatten_schema_to_pyarrow_schema(flatten_schema_dictionary: dict) -> pa.Sche
 
 
 def _normalize_datetime(value):
-    """Convert a timezone-aware datetime to UTC (used with convert_tz_to_utc)."""
+    """Convert a timezone-aware datetime to UTC (used with convert_tz_to_utc).
+
+    A date-time the singer-sdk didn't parse (it parses only top-level
+    properties, so a flattened nested value arrives as text) is converted too:
+    text with an offset, such as '2024-01-01T10:00:00+05:30', becomes UTC text
+    ('2024-01-01 04:30:00.000000Z'). It is parsed as the SDK parses date-times.
+    Text without an offset, text that doesn't parse, and text whose UTC time
+    leaves the year range are left as they are.
+    """
     if isinstance(value, datetime) and value.tzinfo is not None:
         # Convert to UTC timezone
         return value.astimezone(timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+            utc = parsed.astimezone(timezone.utc) if parsed.tzinfo else None
+        except (ValueError, OverflowError):
+            utc = None
+        if utc is not None:
+            return _datetime_text(utc)
     return value
 
 

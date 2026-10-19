@@ -36,6 +36,7 @@ from target_ducklake.flatten import (
 )
 from target_ducklake.parquet_utils import (
     _field_type_to_pyarrow_field,
+    _normalize_data_for_pyarrow,
     create_pyarrow_table,
     flatten_schema_to_pyarrow_schema,
     number_precision_and_scale,
@@ -2012,6 +2013,125 @@ class TestTimezoneOffsets:
             sink.setup()
             for batch in batches:
                 sink.process_batch({"records": batch})
+
+    TEXT_SHAPES: ClassVar[list[str]] = ["nested", "oneof", "auto-cast"]
+
+    @staticmethod
+    def _load_text(
+        tmp_path: Path, text: str, *, convert_tz_to_utc: bool, shape: str = "nested"
+    ) -> tuple[str, float]:
+        """Load a date-time that the singer-sdk leaves as text.
+
+        The SDK parses only top-level date-times it recognises, so the value
+        stays the tap's string when it is nested (flattened into its own
+        column), declared with oneOf, or made a date-time by
+        auto_cast_timestamps. Records go through the SDK's own parsing.
+        Returns the plain column's wall-clock time and the TIMESTAMPTZ instant.
+        """
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        config = {
+            "catalog_url": "test.db",
+            "data_path": str(tmp_path / "data"),
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging"),
+            "flatten_max_level": 1,
+            "auto_cast_timestamps": True,
+            "convert_tz_to_utc": convert_tz_to_utc,
+        }
+        target = Mock()
+        target.config = config
+        connector = DuckLakeConnector(config)
+        date_time = {"type": "string", "format": "date-time"}
+        tz = {**date_time, "x-sql-datatype": "timestamptz"}
+        props: dict
+        record: dict
+        if shape == "nested":
+            props = {
+                "p": {"type": "object", "properties": {"at": date_time, "at_tz": tz}}
+            }
+            record = {"p": {"at": text, "at_tz": text}}
+            columns = ("p__at", "p__at_tz")
+        elif shape == "oneof":
+            props = {"at": {"oneOf": [date_time]}, "at_tz": {"oneOf": [tz]}}
+            record = {"at": text, "at_tz": text}
+            columns = ("at", "at_tz")
+        else:
+            props = {
+                "created_at": {"type": "string"},
+                "at_tz": {"type": "string", "x-sql-datatype": "timestamptz"},
+            }
+            record = {"created_at": text, "at_tz": text}
+            columns = ("created_at", "at_tz")
+        schema = {"type": "object", "properties": {"id": {"type": "string"}, **props}}
+        with patch.object(
+            connector, "execute", side_effect=lambda sql: con.execute(sql)
+        ):
+            sink = ducklakeSink(
+                target=target,
+                stream_name="t",
+                schema=schema,
+                key_properties=["id"],
+                connector=connector,
+            )
+            sink.setup()
+            context: dict = {}
+            parsed = sink._validate_and_parse({"id": "a", **record})
+            sink.process_record(parsed, context)
+            sink.process_batch(context)
+        plain, instant = columns
+        return con.execute(
+            f'SELECT "{plain}"::VARCHAR, epoch("{instant}") FROM ducklake_catalog.s.t'
+        ).fetchone()
+
+    @pytest.mark.parametrize("shape", TEXT_SHAPES)
+    @pytest.mark.parametrize(
+        ("text", "wall_clock"),
+        [
+            ("2024-01-01T10:00:00+05:30", "2024-01-01 04:30:00"),
+            ("2024-01-01T10:00:00-07:00", "2024-01-01 17:00:00"),
+            ("2024-01-01T10:00:00.5+02:00", "2024-01-01 08:00:00.5"),
+            ("2024-01-01T10:00:00Z", "2024-01-01 10:00:00"),
+        ],
+    )
+    def test_convert_tz_to_utc_converts_unparsed_text(
+        self, tmp_path: Path, text: str, wall_clock: str, shape: str
+    ):
+        """Date-time text with an offset is stored in UTC, like a parsed value."""
+        instant = datetime.fromisoformat(text).timestamp()
+        loaded = self._load_text(tmp_path, text, convert_tz_to_utc=True, shape=shape)
+        assert loaded == (wall_clock, instant)
+
+    @pytest.mark.parametrize("shape", TEXT_SHAPES)
+    def test_unparsed_text_keeps_wall_clock_without_convert(
+        self, tmp_path: Path, shape: str
+    ):
+        """Without convert_tz_to_utc, the text's own wall-clock time is kept."""
+        text = "2024-01-01T10:00:00+05:30"
+        loaded = self._load_text(tmp_path, text, convert_tz_to_utc=False, shape=shape)
+        assert loaded == (
+            "2024-01-01 10:00:00",
+            datetime.fromisoformat(text).timestamp(),
+        )
+
+    def test_naive_unparsed_text_is_unchanged_with_convert(self, tmp_path: Path):
+        """Text without an offset is loaded as given, with convert_tz_to_utc too."""
+        loaded = self._load_text(
+            tmp_path, "2024-01-01T10:00:00", convert_tz_to_utc=True
+        )
+        assert loaded[0] == "2024-01-01 10:00:00"
+
+    @pytest.mark.parametrize(
+        "text",
+        ["not a date", "", "9999-12-31T23:59:59-05:00", "2024-13-01T00:00:00+02:00"],
+        ids=["garbage", "empty", "utc-beyond-year-9999", "invalid-month"],
+    )
+    def test_text_that_does_not_convert_is_left_as_it_is(self, text: str):
+        """Text that doesn't parse, or overflows in UTC, reaches DuckDB unchanged."""
+        data = {"at": [text, None]}
+        assert _normalize_data_for_pyarrow(data, ["at"]) == {"at": [text, None]}
 
     @pytest.mark.parametrize("offset", ["+02:00", "-07:00", "+05:30"])
     @pytest.mark.parametrize("convert", ["keep-offset", "convert-to-utc"])
