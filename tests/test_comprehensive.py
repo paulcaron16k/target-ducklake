@@ -2219,6 +2219,96 @@ class TestTimezoneOffsets:
         stored = utc_wall_clock if convert == "convert-to-utc" else wall_clock
         assert row == (stored, instant)
 
+    MIXED: ClassVar[dict[str, datetime]] = {
+        "utc": datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc),
+        "paris": datetime(2024, 1, 1, 10, 0, tzinfo=ZoneInfo("Europe/Paris")),
+        "new_york": datetime(2024, 7, 1, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+        "naive": datetime(2024, 1, 1, 10, 0),  # noqa: DTZ001
+    }
+
+    def _load_mixed(
+        self, tmp_path: Path, ids: tuple[str, ...], *, convert_tz_to_utc: bool
+    ) -> dict[str, tuple]:
+        """Load MIXED values in the given order as one batch, in a non-UTC session.
+
+        Returns each id's plain wall-clock time and TIMESTAMPTZ instant.
+        """
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'Asia/Tokyo'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        batch = [{"id": k, "at": self.MIXED[k], "at_tz": self.MIXED[k]} for k in ids]
+        self._load_into(con, tmp_path, [batch], convert_tz_to_utc=convert_tz_to_utc)
+        return {
+            r[0]: r[1:]
+            for r in con.execute(
+                'SELECT id, "at"::VARCHAR, epoch(at_tz) FROM ducklake_catalog.s.t'
+            ).fetchall()
+        }
+
+    @pytest.mark.parametrize(
+        "ids",
+        [
+            ("utc", "paris"),
+            ("paris", "utc"),
+            ("paris", "new_york", "utc"),
+            ("utc", "naive"),
+            ("naive", "utc"),
+            ("naive", "paris", "new_york"),
+        ],
+        ids="-".join,
+    )
+    def test_mixed_zone_batch_keeps_each_wall_clock_in_any_order(
+        self, tmp_path: Path, ids: tuple[str, ...]
+    ):
+        """Without convert_tz_to_utc, each value keeps its own wall-clock time.
+
+        A plain column stores 10:00 for every value whatever the other values
+        in the batch; TIMESTAMPTZ stores each aware value's instant and reads
+        a naive value in the session zone (Asia/Tokyo here).
+        """
+        rows = self._load_mixed(tmp_path, ids, convert_tz_to_utc=False)
+        tokyo = ZoneInfo("Asia/Tokyo")
+        expected = {}
+        for k in ids:
+            value = self.MIXED[k]
+            instant = value if value.tzinfo else value.replace(tzinfo=tokyo)
+            expected[k] = (value.strftime("%Y-%m-%d 10:00:00"), instant.timestamp())
+        assert rows == expected
+
+    @pytest.mark.parametrize(
+        "ids", [("utc", "paris"), ("paris", "utc"), ("naive", "utc")], ids="-".join
+    )
+    def test_mixed_zone_batch_with_convert_stores_utc(
+        self, tmp_path: Path, ids: tuple[str, ...]
+    ):
+        """With convert_tz_to_utc, aware values store UTC and naive ones as given.
+
+        TIMESTAMPTZ holds each aware value's instant and reads a naive value in
+        the session zone (Asia/Tokyo here), whatever the order.
+        """
+        rows = self._load_mixed(tmp_path, ids, convert_tz_to_utc=True)
+        tokyo = ZoneInfo("Asia/Tokyo")
+        for k in ids:
+            value = self.MIXED[k]
+            wall_clock = value.astimezone(timezone.utc) if value.tzinfo else value
+            instant = value if value.tzinfo else value.replace(tzinfo=tokyo)
+            assert rows[k] == (
+                wall_clock.strftime("%Y-%m-%d %H:%M:%S"),
+                instant.timestamp(),
+            )
+
+    def test_one_zone_column_is_left_to_pyarrow(self):
+        """A column in one zone, across DST, stages as before (pyarrow's text)."""
+        paris = ZoneInfo("Europe/Paris")
+        values = [
+            datetime(2024, 1, 1, 10, tzinfo=paris),
+            datetime(2024, 7, 1, 10, tzinfo=paris),
+        ]
+        schema = pa.schema([pa.field("at", pa.string())])
+        staged = create_pyarrow_table([{"at": v} for v in values], schema)
+        by_pyarrow = pa.array(values).cast(pa.string()).to_pylist()
+        assert staged.column("at").to_pylist() == by_pyarrow
+
     @pytest.mark.parametrize("convert", ["keep-offset", "convert-to-utc"])
     def test_batch_mixing_fixed_offsets_with_other_zones(
         self, tmp_path: Path, convert: str

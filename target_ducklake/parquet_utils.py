@@ -210,6 +210,18 @@ def _has_fixed_offset(value: object) -> bool:
     )
 
 
+def _mixes_zones(values: list) -> bool:
+    """Whether a column's datetimes are in more than one zone (naive counts as one).
+
+    pyarrow converts such a column to the zone of its first value, so a
+    timestamp column's wall-clock times would depend on the order of the
+    records: [UTC 10:00, Paris 10:00] staged Paris as 09:00, and [Paris 10:00,
+    UTC 10:00] staged UTC as 11:00. A naive value was read as UTC after an
+    aware one, and an aware value lost its zone after a naive one.
+    """
+    return len({v.tzinfo for v in values if isinstance(v, datetime)}) > 1
+
+
 def _datetime_text(value: datetime) -> str:
     """Render a datetime as ISO text that DuckDB reads exactly.
 
@@ -252,9 +264,10 @@ def _coerce_column(values: list, field: pa.Field) -> list:
     """Coerce Python values so pyarrow can build the column with the field's type."""
     if pa.types.is_decimal(field.type):
         return [_to_decimal(v, field.type.scale) for v in values]
-    if any(_has_fixed_offset(v) for v in values):
-        # pyarrow can't build this column, so render every datetime in it as
-        # text, each in its own offset. Columns without fixed offsets are left
+    if any(_has_fixed_offset(v) for v in values) or _mixes_zones(values):
+        # pyarrow can't build a column with a fixed offset, and moves a column
+        # mixing zones into its first value's zone, so render every datetime
+        # in it as text, each in its own offset. Columns in one zone are left
         # to pyarrow, so what loaded before stages byte-for-byte the same.
         values = [_datetime_text(v) if isinstance(v, datetime) else v for v in values]
     # Decimals in non-number columns become floats (the previous behaviour).
