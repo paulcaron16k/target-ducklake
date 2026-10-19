@@ -99,7 +99,9 @@ def flatten_record(
                     json.dumps(
                         v, cls=CustomJSONEncoder
                     )  # use custom encoder to convert Decimal type to float
-                    if _should_json_dump_value(k, v, flatten_schema)
+                    # A missing value stays None (SQL NULL), not the JSON text
+                    # 'null'; a null inside a value is still dumped as JSON.
+                    if v is not None and _should_json_dump_value(k, v, flatten_schema)
                     else v,
                 )
             )

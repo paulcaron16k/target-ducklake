@@ -504,14 +504,46 @@ class TestUntypedAndChoiceProperties:
         con.execute(f"CREATE TABLE t (c {ddl})")
         con.execute(f"INSERT INTO t SELECT c FROM '{path}'")
         rows = con.execute("SELECT c FROM t").fetchall()
-        # As for every JSON column: None is JSON null, a Decimal a JSON number
+        # As for every JSON column: None is SQL NULL, a Decimal a JSON number
         # and a datetime ISO text.
-        assert [json.loads(r[0]) for r in rows] == [
+        assert [None if r[0] is None else json.loads(r[0]) for r in rows] == [
             *values[:6],
             None,
             2.5,
             "2024-01-01T10:00:00+00:00",
         ]
+        assert rows[6] == (None,)
+
+    @pytest.mark.parametrize(
+        ("prop", "inner"),
+        [
+            ({"type": ["object", "null"]}, {"a": None}),
+            ({"type": ["null", "array"], "items": {"type": "integer"}}, [None]),
+            ({"$ref": "#/d"}, {"a": None}),
+            ({}, [None]),
+        ],
+        ids=["object", "array", "untyped", "empty"],
+    )
+    def test_none_in_json_column_is_sql_null(
+        self, tmp_path: Path, prop: dict, inner: object
+    ):
+        """A missing value is SQL NULL; a JSON null inside a value is kept."""
+        flat = flatten_schema({"type": "object", "properties": {"c": prop}})
+        records = [flatten_record({"c": v}, flatten_schema=flat) for v in [None, inner]]
+        path = tmp_path / "batch.parquet"
+        pq.write_table(
+            create_pyarrow_table(records, flatten_schema_to_pyarrow_schema(flat)), path
+        )
+        ddl = DuckLakeConnector(self.CONFIG).json_to_ducklake_schema(flat)[0]["type"]
+        con = duckdb.connect()
+        con.execute(f"CREATE TABLE t (n INTEGER, c {ddl})")
+        con.execute(f"INSERT INTO t SELECT row_number() OVER (), c FROM '{path}'")
+        assert con.execute("SELECT n, c IS NULL FROM t ORDER BY n").fetchall() == [
+            (1, True),
+            (2, False),
+        ]
+        stored = con.execute("SELECT c FROM t WHERE n = 2").fetchone()[0]
+        assert json.loads(stored) == inner
 
     def test_flatten_schema_leaves_input_unchanged(self):
         """Flattening never edits the schema it is given, at any level."""
