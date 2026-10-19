@@ -50,19 +50,23 @@ class Targetducklake(SQLTarget):
         """Drain sinks in parallel threads, and wait for all of them before raising.
 
         The SDK's parallel drain raises the first failure while other threads
-        may still be running DuckDB queries; the interpreter then exits under
-        them and the process aborts (exit 134) instead of failing with the
-        error. Here every drain finishes first, then the first failure is
-        raised, so the run exits with it. Nothing changes when drains succeed.
+        may still be running DuckDB queries, and the process then aborted
+        (exit 134) instead of failing with the error. Here every drain
+        finishes first; each failure is logged and the first one is raised,
+        so the run exits with it. Sinks that drain successfully commit their
+        batch, as on the serial path. Nothing changes when drains succeed.
         """
         if parallelism == 1:
             super()._drain_all(sink_list, parallelism)
             return
         with ThreadPoolExecutor(max_workers=parallelism) as pool:
             futures = [pool.submit(self.drain_one, sink) for sink in sink_list]
-        # Leaving the block waited for every drain; raise the first failure.
-        for future in futures:
-            future.result()
+        # Leaving the block waited for every drain.
+        errors = [error for future in futures if (error := future.exception())]
+        for error in errors[1:]:
+            self.logger.error("Another sink also failed to drain: %s", error)
+        if errors:
+            raise errors[0]
 
     @property
     def config(self):

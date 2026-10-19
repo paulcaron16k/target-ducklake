@@ -3578,3 +3578,21 @@ class TestSqliteCatalogDraining:
         ):
             target._drain_all(["fails", "slow"], parallelism=2)
         assert finished.is_set()
+
+    def test_parallel_drain_reports_every_failure(
+        self, capfd: pytest.CaptureFixture[str]
+    ):
+        """With two failing sinks, the first error is raised and the other logged."""
+        target = Targetducklake(
+            config={"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
+        )
+
+        def drain_one(sink: str) -> None:
+            raise RuntimeError(sink)
+
+        with (
+            patch.object(target, "drain_one", side_effect=drain_one),
+            pytest.raises(RuntimeError, match="first"),
+        ):
+            target._drain_all(["first", "second"], parallelism=2)
+        assert "Another sink also failed to drain: second" in capfd.readouterr().err
