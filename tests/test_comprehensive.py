@@ -37,6 +37,7 @@ from target_ducklake.flatten import (
     truncate_column_names,
 )
 from target_ducklake.parquet_utils import (
+    _normalize_data_for_pyarrow,
     create_pyarrow_table,
     number_precision_and_scale,
     staging_schema,
@@ -510,14 +511,44 @@ class TestUntypedAndChoiceProperties:
         con.execute(f"CREATE TABLE t (c {ddl})")
         con.execute(f"INSERT INTO t SELECT c FROM '{path}'")
         rows = con.execute("SELECT c FROM t").fetchall()
-        # As for every JSON column: None is JSON null, a Decimal a JSON number
+        # As for every JSON column: None is SQL NULL, a Decimal a JSON number
         # and a datetime ISO text.
-        assert [json.loads(r[0]) for r in rows] == [
+        assert [None if r[0] is None else json.loads(r[0]) for r in rows] == [
             *values[:6],
             None,
             2.5,
             "2024-01-01T10:00:00+00:00",
         ]
+        assert rows[6] == (None,)
+
+    @pytest.mark.parametrize(
+        ("prop", "inner"),
+        [
+            ({"type": ["object", "null"]}, {"a": None}),
+            ({"type": ["null", "array"], "items": {"type": "integer"}}, [None]),
+            ({"$ref": "#/d"}, {"a": None}),
+            ({}, [None]),
+        ],
+        ids=["object", "array", "untyped", "empty"],
+    )
+    def test_none_in_json_column_is_sql_null(
+        self, tmp_path: Path, prop: dict, inner: object
+    ):
+        """A missing value is SQL NULL; a JSON null inside a value is kept."""
+        flat = flatten_schema({"type": "object", "properties": {"c": prop}})
+        records = [flatten_record({"c": v}, flatten_schema=flat) for v in [None, inner]]
+        path = tmp_path / "batch.parquet"
+        pq.write_table(create_pyarrow_table(records, _staging_schema(flat)), path)
+        ddl = DuckLakeConnector(self.CONFIG).json_to_ducklake_schema(flat)[0]["type"]
+        con = duckdb.connect()
+        con.execute(f"CREATE TABLE t (n INTEGER, c {ddl})")
+        con.execute(f"INSERT INTO t SELECT row_number() OVER (), c FROM '{path}'")
+        assert con.execute("SELECT n, c IS NULL FROM t ORDER BY n").fetchall() == [
+            (1, True),
+            (2, False),
+        ]
+        stored = con.execute("SELECT c FROM t WHERE n = 2").fetchone()[0]
+        assert json.loads(stored) == inner
 
     def test_flatten_schema_leaves_input_unchanged(self):
         """Flattening never edits the schema it is given, at any level."""
@@ -571,6 +602,61 @@ class TestUntypedAndChoiceProperties:
             "parent__tags": {"type": ["array", "null"]},
             "parent__updated_at": {"type": ["string"]},
         }
+
+    @pytest.mark.parametrize(
+        "prop",
+        [
+            {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            {"anyOf": [{"type": "null"}, {"type": ["string", "null"]}]},
+            {"oneOf": [{"type": "string"}]},
+            {"allOf": [{"type": "string", "maxLength": 40}]},
+        ],
+        ids=["anyof", "anyof-type-list", "oneof", "allof"],
+    )
+    def test_auto_cast_timestamps_applies_to_choice_properties(self, prop: dict):
+        """A choice property resolving to a plain string is auto-cast like one."""
+        schema = {"type": "object", "properties": {"created_at": prop}}
+        flat = flatten_schema(schema, auto_cast_timestamps=True)
+        assert flat["created_at"]["format"] == "date-time"
+        connector = DuckLakeConnector(self.CONFIG)
+        assert connector.json_to_ducklake_schema(flat)[0]["type"] == "DATETIME"
+        # Off (the default), the column is left as it was.
+        assert "format" not in flatten_schema(schema)["created_at"]
+
+    @pytest.mark.parametrize(
+        "prop",
+        [
+            {"anyOf": [{"type": "string", "format": "date"}, {"type": "null"}]},
+            {"anyOf": [{"type": "string"}, {"type": "null"}], "format": "date"},
+            {"oneOf": [{"type": "integer"}]},
+            {"anyOf": [{"$ref": "#/d"}]},
+        ],
+        ids=["branch-format", "wrapper-format", "integer", "untyped"],
+    )
+    def test_auto_cast_timestamps_skips_other_choice_properties(self, prop: dict):
+        """A formatted, non-string or untyped choice column is not auto-cast."""
+        schema = {"type": "object", "properties": {"created_at": prop}}
+        flat = flatten_schema(schema, auto_cast_timestamps=True)
+        assert flat["created_at"].get("format") != "date-time"
+        assert flat == flatten_schema(schema)
+
+    def test_auto_cast_timestamps_mixed_choice_follows_its_first_branch(self):
+        """A string-first mixed choice is auto-cast, as a plain type list is."""
+        mixed = {"anyOf": [{"type": "string"}, {"type": "integer"}]}
+        listed = {"type": ["string", "integer"]}
+        schema = {
+            "type": "object",
+            "properties": {"created_at": mixed, "updated_at": listed},
+        }
+        flat = flatten_schema(schema, auto_cast_timestamps=True)
+        assert flat["created_at"]["format"] == "date-time"
+        assert flat["updated_at"]["format"] == "date-time"
+
+    def test_auto_cast_timestamps_checks_choice_property_names(self):
+        """Only names in TIMESTAMP_COLUMN_NAMES are auto-cast, as for plain strings."""
+        prop = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+        schema = {"type": "object", "properties": {"note": prop}}
+        assert "format" not in flatten_schema(schema, auto_cast_timestamps=True)["note"]
 
     def test_flattened_columns_share_nothing_with_the_input(self):
         """Editing a flattened column changes neither the input nor other columns."""
@@ -889,6 +975,7 @@ class TestStagingFollowsColumnType:
             # Number text loads as it did through DuckDB's cast.
             ("string", "bigint", " +12.0 ", "BIGINT", 12),
             ("string", "integer", "1e2", "INTEGER", 100),
+            ("string", "bigint", "0e100", "BIGINT", 0),
             ("string", "double", " 1.5 ", "DOUBLE", 1.5),
             ("string", "double", "1.5e-12", "DOUBLE", 1.5e-12),
             ("string", "uuid", UUID, "UUID", uuid.UUID(UUID)),
@@ -2423,6 +2510,125 @@ class TestTimezoneOffsets:
             for batch in batches:
                 sink.process_batch({"records": batch})
 
+    TEXT_SHAPES: ClassVar[list[str]] = ["nested", "oneof", "auto-cast"]
+
+    @staticmethod
+    def _load_text(
+        tmp_path: Path, text: str, *, convert_tz_to_utc: bool, shape: str = "nested"
+    ) -> tuple[str, float]:
+        """Load a date-time that the singer-sdk leaves as text.
+
+        The SDK parses only top-level date-times it recognises, so the value
+        stays the tap's string when it is nested (flattened into its own
+        column), declared with oneOf, or made a date-time by
+        auto_cast_timestamps. Records go through the SDK's own parsing.
+        Returns the plain column's wall-clock time and the TIMESTAMPTZ instant.
+        """
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        config = {
+            "catalog_url": "test.db",
+            "data_path": str(tmp_path / "data"),
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging"),
+            "flatten_max_level": 1,
+            "auto_cast_timestamps": True,
+            "convert_tz_to_utc": convert_tz_to_utc,
+        }
+        target = Mock()
+        target.config = config
+        connector = DuckLakeConnector(config)
+        date_time = {"type": "string", "format": "date-time"}
+        tz = {**date_time, "x-sql-datatype": "timestamptz"}
+        props: dict
+        record: dict
+        if shape == "nested":
+            props = {
+                "p": {"type": "object", "properties": {"at": date_time, "at_tz": tz}}
+            }
+            record = {"p": {"at": text, "at_tz": text}}
+            columns = ("p__at", "p__at_tz")
+        elif shape == "oneof":
+            props = {"at": {"oneOf": [date_time]}, "at_tz": {"oneOf": [tz]}}
+            record = {"at": text, "at_tz": text}
+            columns = ("at", "at_tz")
+        else:
+            props = {
+                "created_at": {"type": "string"},
+                "at_tz": {"type": "string", "x-sql-datatype": "timestamptz"},
+            }
+            record = {"created_at": text, "at_tz": text}
+            columns = ("created_at", "at_tz")
+        schema = {"type": "object", "properties": {"id": {"type": "string"}, **props}}
+        with patch.object(
+            connector, "execute", side_effect=lambda sql: con.execute(sql)
+        ):
+            sink = ducklakeSink(
+                target=target,
+                stream_name="t",
+                schema=schema,
+                key_properties=["id"],
+                connector=connector,
+            )
+            sink.setup()
+            context: dict = {}
+            parsed = sink._validate_and_parse({"id": "a", **record})
+            sink.process_record(parsed, context)
+            sink.process_batch(context)
+        plain, instant = columns
+        return con.execute(
+            f'SELECT "{plain}"::VARCHAR, epoch("{instant}") FROM ducklake_catalog.s.t'
+        ).fetchone()
+
+    @pytest.mark.parametrize("shape", TEXT_SHAPES)
+    @pytest.mark.parametrize(
+        ("text", "wall_clock"),
+        [
+            ("2024-01-01T10:00:00+05:30", "2024-01-01 04:30:00"),
+            ("2024-01-01T10:00:00-07:00", "2024-01-01 17:00:00"),
+            ("2024-01-01T10:00:00.5+02:00", "2024-01-01 08:00:00.5"),
+            ("2024-01-01T10:00:00Z", "2024-01-01 10:00:00"),
+        ],
+    )
+    def test_convert_tz_to_utc_converts_unparsed_text(
+        self, tmp_path: Path, text: str, wall_clock: str, shape: str
+    ):
+        """Date-time text with an offset is stored in UTC, like a parsed value."""
+        instant = datetime.fromisoformat(text).timestamp()
+        loaded = self._load_text(tmp_path, text, convert_tz_to_utc=True, shape=shape)
+        assert loaded == (wall_clock, instant)
+
+    @pytest.mark.parametrize("shape", TEXT_SHAPES)
+    def test_unparsed_text_keeps_wall_clock_without_convert(
+        self, tmp_path: Path, shape: str
+    ):
+        """Without convert_tz_to_utc, the text's own wall-clock time is kept."""
+        text = "2024-01-01T10:00:00+05:30"
+        loaded = self._load_text(tmp_path, text, convert_tz_to_utc=False, shape=shape)
+        assert loaded == (
+            "2024-01-01 10:00:00",
+            datetime.fromisoformat(text).timestamp(),
+        )
+
+    def test_naive_unparsed_text_is_unchanged_with_convert(self, tmp_path: Path):
+        """Text without an offset is loaded as given, with convert_tz_to_utc too."""
+        loaded = self._load_text(
+            tmp_path, "2024-01-01T10:00:00", convert_tz_to_utc=True
+        )
+        assert loaded[0] == "2024-01-01 10:00:00"
+
+    @pytest.mark.parametrize(
+        "text",
+        ["not a date", "", "9999-12-31T23:59:59-05:00", "2024-13-01T00:00:00+02:00"],
+        ids=["garbage", "empty", "utc-beyond-year-9999", "invalid-month"],
+    )
+    def test_text_that_does_not_convert_is_left_as_it_is(self, text: str):
+        """Text that doesn't parse, or overflows in UTC, reaches DuckDB unchanged."""
+        data = {"at": [text, None]}
+        assert _normalize_data_for_pyarrow(data, ["at"]) == {"at": [text, None]}
+
     @pytest.mark.parametrize("offset", ["+02:00", "-07:00", "+05:30"])
     @pytest.mark.parametrize("convert", ["keep-offset", "convert-to-utc"])
     def test_fixed_offset_loads(self, tmp_path: Path, offset: str, convert: str):
@@ -2508,6 +2714,96 @@ class TestTimezoneOffsets:
         wall_clock, utc_wall_clock, instant = expected
         stored = utc_wall_clock if convert == "convert-to-utc" else wall_clock
         assert row == (stored, instant)
+
+    MIXED: ClassVar[dict[str, datetime]] = {
+        "utc": datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc),
+        "paris": datetime(2024, 1, 1, 10, 0, tzinfo=ZoneInfo("Europe/Paris")),
+        "new_york": datetime(2024, 7, 1, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+        "naive": datetime(2024, 1, 1, 10, 0),  # noqa: DTZ001
+    }
+
+    def _load_mixed(
+        self, tmp_path: Path, ids: tuple[str, ...], *, convert_tz_to_utc: bool
+    ) -> dict[str, tuple]:
+        """Load MIXED values in the given order as one batch, in a non-UTC session.
+
+        Returns each id's plain wall-clock time and TIMESTAMPTZ instant.
+        """
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'Asia/Tokyo'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        batch = [{"id": k, "at": self.MIXED[k], "at_tz": self.MIXED[k]} for k in ids]
+        self._load_into(con, tmp_path, [batch], convert_tz_to_utc=convert_tz_to_utc)
+        return {
+            r[0]: r[1:]
+            for r in con.execute(
+                'SELECT id, "at"::VARCHAR, epoch(at_tz) FROM ducklake_catalog.s.t'
+            ).fetchall()
+        }
+
+    @pytest.mark.parametrize(
+        "ids",
+        [
+            ("utc", "paris"),
+            ("paris", "utc"),
+            ("paris", "new_york", "utc"),
+            ("utc", "naive"),
+            ("naive", "utc"),
+            ("naive", "paris", "new_york"),
+        ],
+        ids="-".join,
+    )
+    def test_mixed_zone_batch_keeps_each_wall_clock_in_any_order(
+        self, tmp_path: Path, ids: tuple[str, ...]
+    ):
+        """Without convert_tz_to_utc, each value keeps its own wall-clock time.
+
+        A plain column stores 10:00 for every value whatever the other values
+        in the batch; TIMESTAMPTZ stores each aware value's instant and reads
+        a naive value in the session zone (Asia/Tokyo here).
+        """
+        rows = self._load_mixed(tmp_path, ids, convert_tz_to_utc=False)
+        tokyo = ZoneInfo("Asia/Tokyo")
+        expected = {}
+        for k in ids:
+            value = self.MIXED[k]
+            instant = value if value.tzinfo else value.replace(tzinfo=tokyo)
+            expected[k] = (value.strftime("%Y-%m-%d 10:00:00"), instant.timestamp())
+        assert rows == expected
+
+    @pytest.mark.parametrize(
+        "ids", [("utc", "paris"), ("paris", "utc"), ("naive", "utc")], ids="-".join
+    )
+    def test_mixed_zone_batch_with_convert_stores_utc(
+        self, tmp_path: Path, ids: tuple[str, ...]
+    ):
+        """With convert_tz_to_utc, aware values store UTC and naive ones as given.
+
+        TIMESTAMPTZ holds each aware value's instant and reads a naive value in
+        the session zone (Asia/Tokyo here), whatever the order.
+        """
+        rows = self._load_mixed(tmp_path, ids, convert_tz_to_utc=True)
+        tokyo = ZoneInfo("Asia/Tokyo")
+        for k in ids:
+            value = self.MIXED[k]
+            wall_clock = value.astimezone(timezone.utc) if value.tzinfo else value
+            instant = value if value.tzinfo else value.replace(tzinfo=tokyo)
+            assert rows[k] == (
+                wall_clock.strftime("%Y-%m-%d %H:%M:%S"),
+                instant.timestamp(),
+            )
+
+    def test_one_zone_column_is_left_to_pyarrow(self):
+        """A column in one zone, across DST, stages as before (pyarrow's text)."""
+        paris = ZoneInfo("Europe/Paris")
+        values = [
+            datetime(2024, 1, 1, 10, tzinfo=paris),
+            datetime(2024, 7, 1, 10, tzinfo=paris),
+        ]
+        schema = pa.schema([pa.field("at", pa.string())])
+        staged = create_pyarrow_table([{"at": v} for v in values], schema)
+        by_pyarrow = pa.array(values).cast(pa.string()).to_pylist()
+        assert staged.column("at").to_pylist() == by_pyarrow
 
     @pytest.mark.parametrize("convert", ["keep-offset", "convert-to-utc"])
     def test_batch_mixing_fixed_offsets_with_other_zones(
@@ -3074,3 +3370,103 @@ class TestColumnTypeReconciliation:
         mock_add.assert_not_called()
         # The table's columns are returned with their types, read once more.
         assert table_types == {"legacy_id": "INTEGER"}
+
+
+class TestCaseInsensitiveColumns:
+    """An existing table whose column names differ only in case still loads.
+
+    DuckDB identifiers are case-insensitive, so the table's "ID" is the
+    stream's "id". Drives the real sink lifecycle on an in-memory catalog.
+    """
+
+    @staticmethod
+    def _load(
+        tmp_path: Path, load_method: str, batches: list[list[dict]]
+    ) -> duckdb.DuckDBPyConnection:
+        con = duckdb.connect()
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        con.execute("CREATE SCHEMA ducklake_catalog.s")
+        # Created by another tool, or an earlier version, with other casing.
+        con.execute(
+            'CREATE TABLE ducklake_catalog.s.t ("ID" BIGINT, "Name" VARCHAR, '
+            '"Legacy" INTEGER)'
+        )
+        con.execute("INSERT INTO ducklake_catalog.s.t VALUES (1, 'old', 7)")
+        config = {
+            "catalog_url": "test.db",
+            "data_path": str(tmp_path / "data"),
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging"),
+            "load_method": load_method,
+        }
+        schema = {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer"},
+                "name": {"type": ["null", "string"]},
+                "legacy": {"type": ["null", "integer"]},
+                "extra": {"type": ["null", "string"]},
+            },
+        }
+        target = Mock()
+        target.config = config
+        connector = DuckLakeConnector(config)
+        with patch.object(
+            connector, "execute", side_effect=lambda sql: con.execute(sql)
+        ):
+            sink = ducklakeSink(
+                target=target,
+                stream_name="t",
+                schema=schema,
+                key_properties=["id"],
+                connector=connector,
+            )
+            sink.setup()
+            for records in batches:
+                sink.process_batch({"records": records})
+        return con
+
+    @pytest.mark.parametrize("load_method", ["merge", "append"])
+    def test_existing_columns_with_other_case_are_not_re_added(
+        self, tmp_path: Path, load_method: str
+    ):
+        """Setup adds only the new column, and values land in the existing ones."""
+        batches = [
+            [{"id": 2, "name": "a", "legacy": 8, "extra": "x"}],
+            [{"id": 2, "name": "b", "legacy": 9, "extra": "y"}],
+        ]
+        con = self._load(tmp_path, load_method, batches)
+        columns = con.execute(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_name = 't' ORDER BY ordinal_position"
+        ).fetchall()
+        assert columns == [
+            ("ID", "BIGINT"),
+            ("Name", "VARCHAR"),
+            ("Legacy", "BIGINT"),  # widened in place for the stream's integer
+            ("extra", "VARCHAR"),
+        ]
+        rows = con.execute("SELECT * FROM ducklake_catalog.s.t ORDER BY ALL").fetchall()
+        if load_method == "merge":
+            assert rows == [(1, "old", 7, None), (2, "b", 9, "y")]
+        else:
+            assert rows == [(1, "old", 7, None), (2, "a", 8, "x"), (2, "b", 9, "y")]
+
+    def test_widening_matches_columns_case_insensitively(self):
+        """A safe widening applies to the existing column whatever its case."""
+        connector = DuckLakeConnector(
+            {"catalog_url": "test.db", "data_path": "/tmp/test"}
+        )
+        with patch.object(connector, "_alter_column_type") as alter:
+            connector._reconcile_column_types(
+                "s", "t", [{"name": "legacy", "type": "BIGINT"}], {"Legacy": "INTEGER"}
+            )
+        alter.assert_called_once_with("s", "t", "Legacy", "BIGINT")
+
+    def test_insert_columns_match_file_columns_case_insensitively(self):
+        """A table column is read from the file column of the same name in any case."""
+        sql = DuckLakeConnector._build_columns_sql(
+            Mock(), file_columns=["id", "name"], target_table_columns=["ID", "Gone"]
+        )
+        assert sql.split(", ") == [' "ID"', "NULL"]

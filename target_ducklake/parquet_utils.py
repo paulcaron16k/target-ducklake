@@ -118,10 +118,26 @@ def staging_schema(columns: list[dict[str, str]]) -> pa.Schema:
 
 
 def _normalize_datetime(value):
-    """Convert a timezone-aware datetime to UTC (used with convert_tz_to_utc)."""
+    """Convert a timezone-aware datetime to UTC (used with convert_tz_to_utc).
+
+    A date-time the singer-sdk didn't parse (it parses only top-level
+    properties, so a flattened nested value arrives as text) is converted too:
+    text with an offset, such as '2024-01-01T10:00:00+05:30', becomes UTC text
+    ('2024-01-01 04:30:00.000000Z'). It is parsed as the SDK parses date-times.
+    Text without an offset, text that doesn't parse, and text whose UTC time
+    leaves the year range are left as they are.
+    """
     if isinstance(value, datetime) and value.tzinfo is not None:
         # Convert to UTC timezone
         return value.astimezone(timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+            utc = parsed.astimezone(timezone.utc) if parsed.tzinfo else None
+        except (ValueError, OverflowError):
+            utc = None
+        if utc is not None:
+            return _datetime_text(utc)
     return value
 
 
@@ -227,6 +243,18 @@ def _has_fixed_offset(value: object) -> bool:
     )
 
 
+def _mixes_zones(values: list) -> bool:
+    """Whether a column's datetimes are in more than one zone (naive counts as one).
+
+    pyarrow converts such a column to the zone of its first value, so a
+    timestamp column's wall-clock times would depend on the order of the
+    records: [UTC 10:00, Paris 10:00] staged Paris as 09:00, and [Paris 10:00,
+    UTC 10:00] staged UTC as 11:00. A naive value was read as UTC after an
+    aware one, and an aware value lost its zone after a naive one.
+    """
+    return len({v.tzinfo for v in values if isinstance(v, datetime)}) > 1
+
+
 def _datetime_text(value: datetime) -> str:
     """Render a datetime as ISO text that DuckDB reads exactly.
 
@@ -315,8 +343,9 @@ def _integer_value(value: object, column: str) -> int | None:
     if isinstance(number, int):  # bool is an int
         integer: int | None = int(number)
     elif isinstance(number, Decimal) and number.is_finite():
-        if number.adjusted() >= _INT64_DIGITS:
+        if number and number.adjusted() >= _INT64_DIGITS:
             # Rejected on magnitude: int() of '1e1000000' would take minutes.
+            # (A zero's adjusted() is no magnitude: '0e100' is 0.)
             msg = f"Column {column!r} holds 64-bit integers; {value!r} is out of range."
             raise ValueError(msg)
         integer = int(number) if number == number.to_integral_value() else None
@@ -343,9 +372,10 @@ def _coerce_column(values: list, field: pa.Field) -> list:
         values = [_number_text(v) for v in values]
     if pa.types.is_string(field.type):
         values = [_scalar_text(v) for v in values]
-    if any(_has_fixed_offset(v) for v in values):
-        # pyarrow can't build this column, so render every datetime in it as
-        # text, each in its own offset. Columns without fixed offsets are left
+    if any(_has_fixed_offset(v) for v in values) or _mixes_zones(values):
+        # pyarrow can't build a column with a fixed offset, and moves a column
+        # mixing zones into its first value's zone, so render every datetime
+        # in it as text, each in its own offset. Columns in one zone are left
         # to pyarrow, so what loaded before stages byte-for-byte the same.
         values = [_datetime_text(v) if isinstance(v, datetime) else v for v in values]
     # Decimals in float columns become floats.
