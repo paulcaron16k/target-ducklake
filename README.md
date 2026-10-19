@@ -94,6 +94,18 @@ target is available by running:
 target-ducklake --about
 ```
 
+### Column types
+
+Each property's JSON Schema type and format give its column type: `integer` is BIGINT (INTEGER with 32-bit bounds), `number` is DECIMAL(38, 9) (or its `precision`/`scale`), `boolean` is BOOLEAN, `object` and `array` are JSON, and `string` is VARCHAR, or DATE, TIME, TIMESTAMP or UUID by its `format`. A property declaring several non-null types, such as `["integer", "string"]`, is VARCHAR, and each value is stored as its text (`5`, `1.50`, `true`). Values are staged at their column's own type, so any value a column can hold loads, and one it can't hold fails the batch instead of being changed.
+
+An `x-sql-datatype` annotation (as database taps emit, e.g. `smallint`, `numeric(12,4)`, `timestamptz`, `uuid`, `jsonb`) sets the column type instead, when the property's values can be loaded into it:
+
+- a `string` property takes any supported hint, so `"12.5"` loads into a `numeric(12,4)` column;
+- an `integer`, `number` or `boolean` property takes numeric hints and `json`/`jsonb`;
+- an `object` or `array` property takes only `json`/`jsonb`.
+
+Any other hint, such as `uuid` on an integer, is ignored with a warning, and the JSON type decides the column. Unsupported hints are ignored with the SDK's warning.
+
 ### Ducklake Schema Migration From 0.1 to 0.2
 Solution to this issue: https://github.com/duckdb/ducklake/issues/240
 The SQL to manually migrate your catalog schema (assuming Postgres) can be found in the `schema_migration.sql` file.

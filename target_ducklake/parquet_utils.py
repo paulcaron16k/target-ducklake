@@ -1,20 +1,14 @@
 # taken from https://github.com/Automattic/target-parquet/blob/master/target_parquet/utils/parquet.py
 import logging
+import math
+import re
 import warnings
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_HALF_EVEN, Context, Decimal
+from decimal import ROUND_HALF_EVEN, Context, Decimal, InvalidOperation
 
 import pyarrow as pa
 
-from target_ducklake.type_hints import decimal_hint, is_float_hint
-
-FIELD_TYPE_TO_PYARROW = {
-    "BOOLEAN": pa.bool_(),
-    "STRING": pa.string(),
-    "ARRAY": pa.string(),
-    "INTEGER": pa.int64(),
-    "OBJECT": pa.string(),
-}
+from target_ducklake.type_hints import decimal_hint
 
 # JSON Schema "number" maps to DECIMAL; DuckDB supports precision up to 38.
 DECIMAL_MAX_PRECISION = 38
@@ -31,8 +25,6 @@ EXTENSION_MAPPING = {
     "zstd": ".zstd",
     "lz4": ".lz4",
 }
-
-logger = logging.getLogger(__name__)
 
 
 def number_precision_and_scale(jsonschema: dict) -> tuple[int, int]:
@@ -82,63 +74,46 @@ def _capped_to_38(precision: int, scale: int) -> tuple[int, int]:
     return DECIMAL_MAX_PRECISION, capped_scale
 
 
-def _field_type_to_pyarrow_field(
-    field_name: str, input_types: dict, required_fields: list[str]
-) -> pa.Field:
-    types = input_types.get("type", [])
-    # If type is not defined, check if anyOf is defined
-    if not types:
-        for any_type in input_types.get("anyOf", []):
-            if t := any_type.get("type"):
-                if isinstance(t, list):
-                    types.extend(t)
-                else:
-                    types.append(t)
-    types = [types] if isinstance(types, str) else types
-    types_uppercase = [item.upper() for item in types]
-    nullable = "NULL" in types_uppercase or field_name not in required_fields
-    if "NULL" in types_uppercase:
-        types_uppercase.remove("NULL")
-    input_type = next(iter(types_uppercase)) if types_uppercase else ""
-    if input_type == "NUMBER" and is_float_hint(input_types):
-        # A REAL or DOUBLE column: decimal staging would round away digits
-        # beyond its scale (1.5e-12 would arrive as 0).
-        pyarrow_type = pa.float64()
-    elif input_type == "NUMBER":
-        # Stage numbers as decimals, not float64, so values keep their exact digits
-        # on the way into the DECIMAL column.
-        pyarrow_type = pa.decimal128(*number_precision_and_scale(input_types))
-    else:
-        pyarrow_type = FIELD_TYPE_TO_PYARROW.get(input_type, pa.string())
-    return pa.field(field_name, pyarrow_type, nullable)
+# DuckDB column types staged as int64 or float64. Every other type except
+# DECIMAL and BOOLEAN (VARCHAR, JSON, UUID, temporal types) is staged as text,
+# which DuckDB parses on insert.
+_INTEGER_COLUMN_TYPES = {"TINYINT", "SMALLINT", "INT", "INTEGER", "BIGINT"}
+_FLOAT_COLUMN_TYPES = {"REAL", "FLOAT", "FLOAT4", "DOUBLE", "FLOAT8"}
+_DECIMAL_COLUMN_TYPE = re.compile(
+    r"^(?:DECIMAL|NUMERIC)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)$"
+)
 
 
-def flatten_schema_to_pyarrow_schema(flatten_schema_dictionary: dict) -> pa.Schema:
-    """Function that converts a flatten schema to a pyarrow schema in a defined order.
+def staging_type(column_type: str) -> pa.DataType:
+    """Return the parquet type a column of this DuckDB type is staged as.
 
-    E.g:
-     dictionary = {
-         'key_1': {'type': ['null', 'integer']},
-         'key_2__key_3': {'type': ['null', 'string']},
-         'key_2__key_4__key_5': {'type': ['null', 'integer']},
-         'key_2__key_4__key_6': {'type': ['null', 'array']}
-     }
-    By calling the function with the dictionary above as parameter,
-    you will get the following structure:
-        pa.schema([
-             pa.field('key_1', pa.int64()),
-             pa.field('key_2__key_3', pa.string()),
-             pa.field('key_2__key_4__key_5', pa.int64()),
-             pa.field('key_2__key_4__key_6', pa.string())
-        ])
+    Staging follows the column's own type, so every value the column can hold
+    stages, and a value the column can't hold fails the batch at staging
+    instead of being changed: a DECIMAL column is staged at its exact
+    precision and scale, a REAL or DOUBLE column as float64 (decimal staging
+    would round 1.5e-12 to 0), and a VARCHAR column, such as one declared with
+    several JSON types, as text.
+    """
+    name = " ".join(column_type.upper().split())
+    if match := _DECIMAL_COLUMN_TYPE.match(name):
+        return pa.decimal128(int(match.group(1)), int(match.group(2)))
+    if name in _INTEGER_COLUMN_TYPES:
+        return pa.int64()
+    if name in _FLOAT_COLUMN_TYPES:
+        return pa.float64()
+    if name == "BOOLEAN":
+        return pa.bool_()
+    return pa.string()
+
+
+def staging_schema(columns: list[dict[str, str]]) -> pa.Schema:
+    """Return the parquet schema that stages these DuckLake columns.
+
+    ``columns`` is the ``[{"name": ..., "type": ...}]`` list the column DDL is
+    built from, so staging and DDL can't disagree.
     """
     return pa.schema(
-        [
-            _field_type_to_pyarrow_field(
-                field_name, field_input_types, required_fields=[]
-            )
-            for field_name, field_input_types in flatten_schema_dictionary.items()
-        ]
+        [pa.field(column["name"], staging_type(column["type"])) for column in columns]
     )
 
 
@@ -260,17 +235,92 @@ def _offset_text(offset: timedelta | None) -> str:
     return f"{text}:{secs:02d}" if secs else text
 
 
+def _scalar_text(value: object) -> object:
+    """Render a JSON scalar as the text a VARCHAR column stores for it.
+
+    Booleans as 'true'/'false' (DuckDB's spelling), numbers with their exact
+    digits ('1.50' stays '1.50', 1E+2 is '100'). Other values are left as
+    they are: strings, None, and datetimes, which are formatted below.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, float):
+        return repr(value)
+    return value
+
+
+def _number_text(value: object) -> object:
+    """Text holding a number as a Decimal, read as DuckDB's cast reads it.
+
+    Surrounding spaces, a sign, an exponent and trailing zeros are accepted
+    ('+5', ' 7 ', '1e2', '12.0'), so text that loaded through DuckDB's cast
+    when it was staged as text still loads. Anything else is left as it is.
+    """
+    if isinstance(value, str):
+        try:
+            return Decimal(value.strip())
+        except InvalidOperation:
+            pass
+    return value
+
+
+_INT64_RANGE = range(-(2**63), 2**63)
+_INT64_DIGITS = len(str(2**63))  # 19: a Decimal with more digits can't fit
+
+
+def _integer_value(value: object, column: str) -> int | None:
+    """A whole number (int, bool, Decimal, float or number text) as an exact int.
+
+    Raises ValueError naming the column for anything else (a fraction, a
+    non-finite number, text that isn't a number, a number outside int64), so
+    the batch fails instead of the value being changed.
+    """
+    number = _number_text(value)
+    if number is None:
+        return None
+    if isinstance(number, int):  # bool is an int
+        integer: int | None = int(number)
+    elif isinstance(number, Decimal) and number.is_finite():
+        if number and number.adjusted() >= _INT64_DIGITS:
+            # Rejected on magnitude: int() of '1e1000000' would take minutes.
+            # (A zero's adjusted() is no magnitude: '0e100' is 0.)
+            msg = f"Column {column!r} holds 64-bit integers; {value!r} is out of range."
+            raise ValueError(msg)
+        integer = int(number) if number == number.to_integral_value() else None
+    elif isinstance(number, float) and math.isfinite(number):
+        integer = int(number) if number.is_integer() else None
+    else:
+        integer = None
+    if integer is None:
+        msg = f"Column {column!r} holds whole numbers; {value!r} is not one."
+        raise ValueError(msg)
+    if integer not in _INT64_RANGE:
+        msg = f"Column {column!r} holds 64-bit integers; {value!r} is out of range."
+        raise ValueError(msg)
+    return integer
+
+
 def _coerce_column(values: list, field: pa.Field) -> list:
     """Coerce Python values so pyarrow can build the column with the field's type."""
     if pa.types.is_decimal(field.type):
         return [_to_decimal(v, field.type.scale) for v in values]
+    if pa.types.is_integer(field.type):
+        return [_integer_value(v, field.name) for v in values]
+    if pa.types.is_floating(field.type):
+        values = [_number_text(v) for v in values]
+    if pa.types.is_string(field.type):
+        values = [_scalar_text(v) for v in values]
     if any(_has_fixed_offset(v) for v in values) or _mixes_zones(values):
         # pyarrow can't build a column with a fixed offset, and moves a column
         # mixing zones into its first value's zone, so render every datetime
         # in it as text, each in its own offset. Columns in one zone are left
         # to pyarrow, so what loaded before stages byte-for-byte the same.
         values = [_datetime_text(v) if isinstance(v, datetime) else v for v in values]
-    # Decimals in non-number columns become floats (the previous behaviour).
+    # Decimals in float columns become floats.
     return [float(v) if isinstance(v, Decimal) else v for v in values]
 
 

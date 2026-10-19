@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import os
 import subprocess
 import sys
+import uuid
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -35,14 +37,20 @@ from target_ducklake.flatten import (
     truncate_column_names,
 )
 from target_ducklake.parquet_utils import (
-    _field_type_to_pyarrow_field,
     _normalize_data_for_pyarrow,
     create_pyarrow_table,
-    flatten_schema_to_pyarrow_schema,
     number_precision_and_scale,
+    staging_schema,
+    staging_type,
 )
 from target_ducklake.sinks import ducklakeSink
 from target_ducklake.target import Targetducklake
+
+
+def _staging_schema(flat: dict) -> pa.Schema:
+    """The staging schema the sink builds for a flattened schema: from its DDL."""
+    connector = DuckLakeConnector({"catalog_url": "x", "data_path": "/x"})
+    return staging_schema(connector.json_to_ducklake_schema(flat))
 
 
 class TestTargetducklakeConfig:
@@ -497,9 +505,7 @@ class TestUntypedAndChoiceProperties:
         values = [5, "abc", {"a": 1}, [1, 2], 1.5, True, None, Decimal("2.5"), at]
         records = [flatten_record({"c": v}, flatten_schema=flat) for v in values]
         path = tmp_path / "batch.parquet"
-        pq.write_table(
-            create_pyarrow_table(records, flatten_schema_to_pyarrow_schema(flat)), path
-        )
+        pq.write_table(create_pyarrow_table(records, _staging_schema(flat)), path)
         ddl = DuckLakeConnector(self.CONFIG).json_to_ducklake_schema(flat)[0]["type"]
         con = duckdb.connect()
         con.execute(f"CREATE TABLE t (c {ddl})")
@@ -532,9 +538,7 @@ class TestUntypedAndChoiceProperties:
         flat = flatten_schema({"type": "object", "properties": {"c": prop}})
         records = [flatten_record({"c": v}, flatten_schema=flat) for v in [None, inner]]
         path = tmp_path / "batch.parquet"
-        pq.write_table(
-            create_pyarrow_table(records, flatten_schema_to_pyarrow_schema(flat)), path
-        )
+        pq.write_table(create_pyarrow_table(records, _staging_schema(flat)), path)
         ddl = DuckLakeConnector(self.CONFIG).json_to_ducklake_schema(flat)[0]["type"]
         con = duckdb.connect()
         con.execute(f"CREATE TABLE t (n INTEGER, c {ddl})")
@@ -754,7 +758,7 @@ class TestUntypedAndChoiceProperties:
         """oneOf/allOf flatten like anyOf, and {} is a JSON column, not dropped."""
         flat = flatten_schema({"type": "object", "properties": {"c": prop}})
         ddl = DuckLakeConnector(self.CONFIG).json_to_ducklake_schema(flat)[0]["type"]
-        staging = flatten_schema_to_pyarrow_schema(flat).field("c").type
+        staging = _staging_schema(flat).field("c").type
         assert (flat["c"], ddl, staging) == expected
 
     def test_choice_values_are_staged(self):
@@ -769,7 +773,7 @@ class TestUntypedAndChoiceProperties:
         flat = flatten_schema(schema)
         table = create_pyarrow_table(
             [{"id": 1, "n": 5}, {"id": 2, "n": None}],
-            flatten_schema_to_pyarrow_schema(flat),
+            _staging_schema(flat),
         )
         assert table.column("n").to_pylist() == [5, None]
 
@@ -860,41 +864,238 @@ class TestUntypedAndChoiceProperties:
 class TestParquetUtils:
     """Test parquet utilities functionality."""
 
-    def test_field_type_to_pyarrow_field(self):
-        """Test PyArrow field conversion."""
-        # Test string field
-        field = _field_type_to_pyarrow_field(
-            "name", {"type": "string"}, required_fields=["name"]
-        )
-        assert field.name == "name"
-        assert field.type == pa.string()
-        assert not field.nullable
+    @pytest.mark.parametrize(
+        ("column_type", "expected"),
+        [
+            ("DECIMAL(12, 4)", pa.decimal128(12, 4)),
+            ("decimal(38,9)", pa.decimal128(38, 9)),
+            ("SMALLINT", pa.int64()),
+            ("INTEGER", pa.int64()),
+            ("BIGINT", pa.int64()),
+            ("REAL", pa.float64()),
+            ("DOUBLE", pa.float64()),
+            ("BOOLEAN", pa.bool_()),
+            ("VARCHAR", pa.string()),
+            ("VARCHAR(5)", pa.string()),
+            ("JSON", pa.string()),
+            ("UUID", pa.string()),
+            ("DATETIME", pa.string()),
+            ("TIMESTAMPTZ", pa.string()),
+            ("DATE", pa.string()),
+            ("TIME", pa.string()),
+        ],
+    )
+    def test_staging_type_follows_column_type(
+        self, column_type: str, expected: pa.DataType
+    ):
+        """Each DuckDB column type stages as the parquet type that holds its values."""
+        assert staging_type(column_type) == expected
 
-        # Test nullable field
-        field = _field_type_to_pyarrow_field(
-            "optional_field", {"type": "string"}, required_fields=["other_field"]
+    def test_staging_schema(self):
+        """The staging schema has one nullable field per column, in column order."""
+        schema = staging_schema(
+            [
+                {"name": "id", "type": "BIGINT"},
+                {"name": "name", "type": "VARCHAR"},
+                {"name": "amount", "type": "DECIMAL(10, 2)"},
+            ]
         )
-        assert field.nullable
-
-        # Test integer field
-        field = _field_type_to_pyarrow_field(
-            "id", {"type": "integer"}, required_fields=["id"]
+        assert schema == pa.schema(
+            [
+                pa.field("id", pa.int64()),
+                pa.field("name", pa.string()),
+                pa.field("amount", pa.decimal128(10, 2)),
+            ]
         )
-        assert field.type == pa.int64()
+        assert all(field.nullable for field in schema)
 
-    def test_flatten_schema_to_pyarrow_schema(self):
-        """Test converting flattened schema to PyArrow schema."""
-        flattened_schema = {
-            "id": {"type": "integer"},
-            "name": {"type": "string"},
-            "email": {"type": "string"},
-        }
-        schema = flatten_schema_to_pyarrow_schema(flattened_schema)
-        assert isinstance(schema, pa.Schema)
-        assert len(schema) == 3
-        assert schema.field("id").type == pa.int64()
-        assert schema.field("name").type == pa.string()
-        assert schema.field("email").type == pa.string()
+
+# One value of each JSON scalar type, and the text a VARCHAR column stores for it.
+_SCALAR_VALUES = {
+    "integer": (5, "5"),
+    "number": (Decimal("1.50"), "1.50"),
+    "boolean": (True, "true"),
+    "string": ("abc", "abc"),
+}
+_MULTI_TYPES = [
+    list(types)
+    for n in range(2, len(_SCALAR_VALUES) + 1)
+    for types in itertools.combinations(_SCALAR_VALUES, n)
+]
+
+
+class TestStagingFollowsColumnType:
+    """Each column is staged at the type its DDL gives, so the two always agree."""
+
+    CONFIG: ClassVar[dict[str, str]] = {"catalog_url": "x", "data_path": "/x"}
+    UUID = "6f1c2a3e-1b2c-4d5e-8f90-123456789abc"
+
+    def _load(self, prop: dict, values: list, tmp_path: Path) -> tuple[str, list]:
+        """Flatten, stage and insert values as the sink does; return DDL and rows."""
+        flat = flatten_schema({"type": "object", "properties": {"c": prop}})
+        ddl = DuckLakeConnector(self.CONFIG).json_to_ducklake_schema(flat)[0]["type"]
+        schema = _staging_schema(flat)
+        assert schema.field("c").type == staging_type(ddl)
+        records = [flatten_record({"c": v}, flatten_schema=flat) for v in values]
+        path = tmp_path / "batch.parquet"
+        pq.write_table(create_pyarrow_table(records, schema), path)
+        con = duckdb.connect()
+        con.execute(f"CREATE TABLE t (n INTEGER, c {ddl})")
+        con.execute(f"INSERT INTO t SELECT row_number() OVER (), c FROM '{path}'")
+        return ddl, [r[0] for r in con.execute("SELECT c FROM t ORDER BY n").fetchall()]
+
+    @pytest.mark.parametrize("types", _MULTI_TYPES, ids="-".join)
+    @pytest.mark.parametrize("shape", ["type-list", "anyof-branch"])
+    def test_multi_type_column_stages_every_value(
+        self, tmp_path: Path, types: list[str], shape: str
+    ):
+        """A column with several JSON types is VARCHAR, and every value loads."""
+        declared = ["null", *types]
+        prop: dict = (
+            {"type": declared}
+            if shape == "type-list"
+            else {"anyOf": [{"type": declared}]}
+        )
+        values = [_SCALAR_VALUES[t][0] for t in types] + [None]
+        ddl, rows = self._load(prop, values, tmp_path)
+        assert ddl == "VARCHAR"
+        assert rows == [_SCALAR_VALUES[t][1] for t in types] + [None]
+
+    def test_multi_type_with_object_is_still_json(self, tmp_path: Path):
+        """A type list containing object or array stays a JSON column."""
+        ddl, rows = self._load({"type": ["integer", "object"]}, [{"a": 1}], tmp_path)
+        assert ddl == "JSON"
+        assert [json.loads(r) for r in rows] == [{"a": 1}]
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            ("string", "numeric(12,4)", "12.5", "DECIMAL(12, 4)", Decimal("12.5")),
+            ("string", "bigint", "42", "BIGINT", 42),
+            # Number text loads as it did through DuckDB's cast.
+            ("string", "bigint", " +12.0 ", "BIGINT", 12),
+            ("string", "integer", "1e2", "INTEGER", 100),
+            ("string", "bigint", "0e100", "BIGINT", 0),
+            ("string", "double", " 1.5 ", "DOUBLE", 1.5),
+            ("string", "double", "1.5e-12", "DOUBLE", 1.5e-12),
+            ("string", "uuid", UUID, "UUID", uuid.UUID(UUID)),
+            ("integer", "numeric(12,4)", 5, "DECIMAL(12, 4)", Decimal(5)),
+            ("integer", "real", 5, "REAL", 5.0),
+            ("integer", "smallint", 5, "SMALLINT", 5),
+            ("integer", "jsonb", 5, "JSON", "5"),
+            # Exact beyond float64's 53 bits.
+            (
+                "number",
+                "bigint",
+                Decimal(9007199254740993),
+                "BIGINT",
+                9007199254740993,
+            ),
+            ("number", "double", Decimal("1.5E-12"), "DOUBLE", 1.5e-12),
+            ("number", "jsonb", Decimal("1.50"), "JSON", "1.50"),
+            ("boolean", "smallint", True, "SMALLINT", 1),
+        ],
+        ids=lambda case: f"{case[0]}-{case[1]}",
+    )
+    def test_hint_that_fits_the_json_type_sets_ddl_and_staging(
+        self, tmp_path: Path, recwarn: pytest.WarningsRecorder, case: tuple
+    ):
+        """A hint the JSON type's values load into is the column and staging type.
+
+        ``case`` is (JSON type, hint, value, DDL type, stored value).
+        """
+        json_type, hint, value, ddl, stored = case
+        prop = {"type": ["null", json_type], "x-sql-datatype": hint}
+        assert self._load(prop, [value], tmp_path) == (ddl, [stored])
+        assert not [w for w in recwarn.list if "x-sql-datatype" in str(w.message)]
+
+    @pytest.mark.parametrize(
+        ("prop", "ddl"),
+        [
+            ({"type": "integer", "x-sql-datatype": "uuid"}, "BIGINT"),
+            ({"type": "number", "x-sql-datatype": "timestamptz"}, "DECIMAL(38, 9)"),
+            ({"type": "boolean", "x-sql-datatype": "date"}, "BOOLEAN"),
+            # A plain object column drops the hint when flattened; a choice keeps it.
+            ({"anyOf": [{"type": "object"}], "x-sql-datatype": "uuid"}, "JSON"),
+            ({"type": ["integer", "string"], "x-sql-datatype": "uuid"}, "VARCHAR"),
+            (
+                {
+                    "anyOf": [{"type": "integer"}, {"type": "null"}],
+                    "x-sql-datatype": "uuid",
+                },
+                "BIGINT",
+            ),
+        ],
+        ids=[
+            "integer-uuid",
+            "number-timestamptz",
+            "boolean-date",
+            "object-uuid",
+            "multi-type-uuid",
+            "anyof-wrapper",
+        ],
+    )
+    def test_hint_that_cannot_hold_the_json_type_is_ignored(self, prop: dict, ddl: str):
+        """An impossible hint is ignored with a warning; the JSON type decides."""
+        flat = flatten_schema({"type": "object", "properties": {"c": prop}})
+        with pytest.warns(UserWarning, match="Ignoring x-sql-datatype"):
+            columns = DuckLakeConnector(self.CONFIG).json_to_ducklake_schema(flat)
+        with pytest.warns(UserWarning, match="Ignoring x-sql-datatype"):
+            staged = _staging_schema(flat).field("c").type
+        assert columns[0]["type"] == ddl
+        assert staged == staging_type(ddl)
+
+    @pytest.mark.parametrize(
+        ("prop", "value", "error"),
+        [
+            (
+                {"type": "string", "x-sql-datatype": "numeric(12,4)"},
+                "n/a",
+                InvalidOperation,
+            ),
+            (
+                {"type": "number", "x-sql-datatype": "bigint"},
+                Decimal("5.5"),
+                ValueError,
+            ),
+            ({"type": "string", "x-sql-datatype": "bigint"}, "abc", ValueError),
+            ({"type": "string", "x-sql-datatype": "bigint"}, "12.5", ValueError),
+            (
+                {"type": "number", "x-sql-datatype": "bigint"},
+                Decimal("NaN"),
+                ValueError,
+            ),
+            (
+                {"type": "number", "x-sql-datatype": "bigint"},
+                Decimal("Infinity"),
+                ValueError,
+            ),
+            ({"type": "string", "x-sql-datatype": "double"}, "abc", pa.ArrowInvalid),
+            ({"type": "string", "x-sql-datatype": "bigint"}, "1e30", ValueError),
+            ({"type": "integer", "x-sql-datatype": "bigint"}, 2**63, ValueError),
+            # Rejected at once, without building a million-digit int.
+            ({"type": "string", "x-sql-datatype": "bigint"}, "1e1000000", ValueError),
+        ],
+        ids=[
+            "string-decimal",
+            "number-bigint-fraction",
+            "string-bigint",
+            "string-bigint-fraction",
+            "number-bigint-nan",
+            "number-bigint-infinity",
+            "string-double",
+            "string-bigint-overflow",
+            "integer-bigint-overflow",
+            "string-bigint-huge-exponent",
+        ],
+    )
+    def test_value_the_column_cannot_hold_fails_the_batch(
+        self, prop: dict, value: object, error: type[Exception]
+    ):
+        """A value the hinted column can't hold fails staging; it is never changed."""
+        flat = flatten_schema({"type": "object", "properties": {"c": prop}})
+        with pytest.raises(error):
+            create_pyarrow_table([{"c": value}], _staging_schema(flat))
 
 
 class TestDecimalPrecision:
@@ -917,15 +1118,13 @@ class TestDecimalPrecision:
 
     def test_number_field_is_decimal(self):
         """Number columns are staged as decimal128, not float64."""
-        field = _field_type_to_pyarrow_field(
-            "amount", {"type": ["null", "number"]}, required_fields=[]
-        )
-        assert field.type == pa.decimal128(38, 9)
+        schema = _staging_schema({"amount": {"type": ["null", "number"]}})
+        assert schema.field("amount").type == pa.decimal128(38, 9)
 
     def test_parquet_type_matches_ducklake_column_type(self):
         """The staged parquet type and the DuckLake DDL type always agree."""
         jsonschema = {"type": "number", "precision": 12, "scale": 4}
-        field = _field_type_to_pyarrow_field("amount", jsonschema, required_fields=[])
+        field = _staging_schema({"amount": jsonschema}).field("amount")
         column_type = JSONSchemaToDuckLake().to_sql_type(jsonschema)
         assert (field.type.precision, field.type.scale) == (12, 4)
         assert str(column_type) == "DECIMAL(12, 4)"
@@ -963,7 +1162,7 @@ class TestDecimalPrecision:
 
     def test_decimal_round_trip_through_duckdb(self, tmp_path):
         """Staged parquet inserted into a DECIMAL(38, 9) column reads back exactly."""
-        schema = flatten_schema_to_pyarrow_schema({"amount": {"type": "number"}})
+        schema = _staging_schema({"amount": {"type": "number"}})
         table = create_pyarrow_table([{"amount": self.BIG}], schema)
         path = tmp_path / "batch.parquet"
         pq.write_table(table, path)
@@ -1020,7 +1219,7 @@ class TestDecimalPrecision:
         ddl = DuckLakeConnector(
             {"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
         ).json_to_ducklake_schema(props)[0]["type"]
-        schema = flatten_schema_to_pyarrow_schema(props)
+        schema = _staging_schema(props)
         table = create_pyarrow_table([{"amount": v} for v in values], schema)
         path = tmp_path / "batch.parquet"
         pq.write_table(table, path)
@@ -1257,7 +1456,7 @@ class TestTemporalMergeKeys:
         con.execute("ATTACH ':memory:' AS ducklake_catalog")
         con.execute("CREATE SCHEMA ducklake_catalog.s")
         con.execute(f"CREATE TABLE ducklake_catalog.s.t (k {column_type}, v VARCHAR)")
-        pyarrow_schema = flatten_schema_to_pyarrow_schema(flat_schema)
+        pyarrow_schema = _staging_schema(flat_schema)
 
         with patch.object(
             connector, "execute", side_effect=lambda sql: con.execute(sql)
@@ -1368,7 +1567,7 @@ class TestSqlDatatypeHints:
 
     def test_staging_matches_ddl(self):
         """Decimal hints stage at the hinted precision; float hints stage as float64."""
-        schema = flatten_schema_to_pyarrow_schema(
+        schema = _staging_schema(
             {
                 "d": {"type": "number", "x-sql-datatype": "numeric(12,4)"},
                 "f": {"type": "number", "x-sql-datatype": "double precision"},
@@ -1383,7 +1582,7 @@ class TestSqlDatatypeHints:
         """The DDL type and staging type a stream property gets, as in the sink."""
         flat = flatten_schema({"type": "object", "properties": {"c": prop}})
         ddl = DuckLakeConnector(self.CONFIG).json_to_ducklake_schema(flat)[0]["type"]
-        return ddl, flatten_schema_to_pyarrow_schema(flat).field("c").type
+        return ddl, _staging_schema(flat).field("c").type
 
     @pytest.mark.parametrize(
         ("prop", "expected"),
@@ -1567,7 +1766,7 @@ class TestSqlDatatypeHints:
             "doc": '{"a": 1}',
         }
         batch = tmp_path / "batch.parquet"
-        table = create_pyarrow_table([record], flatten_schema_to_pyarrow_schema(props))
+        table = create_pyarrow_table([record], _staging_schema(props))
         pq.write_table(table, batch)
 
         with patch.object(
@@ -1629,7 +1828,7 @@ class TestSqlDatatypeHints:
         con.execute("ATTACH ':memory:' AS ducklake_catalog")
         con.execute("CREATE SCHEMA ducklake_catalog.s")
         con.execute('CREATE TABLE ducklake_catalog.s.t ("at" TIMESTAMPTZ, v VARCHAR)')
-        pyarrow_schema = flatten_schema_to_pyarrow_schema(props)
+        pyarrow_schema = _staging_schema(props)
         value = datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc)
 
         with patch.object(
