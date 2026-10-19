@@ -45,6 +45,11 @@ def is_transient_error(error: duckdb.Error) -> bool:
     return any(pattern in msg for pattern in _TRANSIENT_ERROR_PATTERNS)
 
 
+def _by_lower_name(column_types: dict[str, str]) -> dict[str, tuple[str, str]]:
+    """Map each lowercased column name to the column's (name, type)."""
+    return {name.lower(): (name, typ) for name, typ in column_types.items()}
+
+
 class DuckLakeConnectorError(Exception):
     """Custom exception for DuckLake connector errors."""
 
@@ -458,15 +463,18 @@ class DuckLakeConnector(SQLConnector):
 
         current_types is a name->type snapshot taken before columns were added, so
         newly added columns are absent and skipped (already created as desired).
+        Names match case-insensitively, as DuckDB identifiers do.
         """
+        current_by_name = _by_lower_name(current_types)
         for col in columns:
-            current = current_types.get(col["name"])
+            current = current_by_name.get(col["name"].lower())
             if current is None:
                 continue
-            new_type = self._safe_widen_target(current, col["type"])
+            table_column, current_type = current
+            new_type = self._safe_widen_target(current_type, col["type"])
             if new_type is not None:
                 self._alter_column_type(
-                    target_schema_name, table_name, col["name"], new_type
+                    target_schema_name, table_name, table_column, new_type
                 )
 
     def _create_empty_table(
@@ -509,8 +517,11 @@ class DuckLakeConnector(SQLConnector):
             existing_column_types = self.get_table_column_types(
                 target_schema_name, table_name
             )
+            # DuckDB identifiers are case-insensitive: a stream's "id" is the
+            # table's existing "ID", and adding it again fails.
+            existing_names = _by_lower_name(existing_column_types)
             new_columns = [
-                col for col in columns if col["name"] not in existing_column_types
+                col for col in columns if col["name"].lower() not in existing_names
             ]
             if new_columns:
                 logger.info(f"Adding new columns to table {table_name}: {new_columns}")
@@ -578,10 +589,12 @@ class DuckLakeConnector(SQLConnector):
         """Build SQL column list for SELECT statement used for INSERT.
         Orders columns by which they appear in the target table.
         If a column is not found in the file, it is replaced with NULL.
+        Names match case-insensitively, as DuckDB identifiers do.
         """
+        file_names = {col.lower() for col in file_columns}
         columns_sql = ""
         for col in target_table_columns:
-            if col not in file_columns:
+            if col.lower() not in file_names:
                 logger.warning(f"Column {col} not found in source, using NULL")
                 columns_sql += "NULL, "
             else:
