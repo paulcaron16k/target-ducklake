@@ -611,7 +611,7 @@ Squash-merged into `xflow_dev` as `3798b52` through fork PR #76. A column whose 
 
 7 cases fail on the old code (6 orders; naive+UTC with the setting on); 3 pin unchanged behaviour. Real DuckLake, values sent as JSON text in both orders: the old code stored the UTC value 5 hours off (naive first) or read the naive value as UTC (UTC first); the new code gives the same, correct result in both orders. Independent Sonnet review: no blocking findings; nit 1 fixed (TIMESTAMPTZ pinned with the setting on, Acceptance difference stated), nit 2 answered in the description. Re-review: no findings.
 
-Seen while testing, unrelated: with a sqlite catalog, two streams draining in parallel can fail the run (`Failed to get extended data file list from DuckLake`); old and new code behave the same.
+Found, not fixed (pre-existing, filed): [DUCKLKD-79](https://github.com/paulcaron16k/target-ducklake-definite/issues/79). With a sqlite catalog, two streams draining in parallel fail the run (`database is locked` at commit, often followed by an abort); old and new code behave the same, and `parallel_draining: false` avoids it.
 
 Upstream PR: not opened.
 
