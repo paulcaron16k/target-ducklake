@@ -35,12 +35,15 @@ _INT_TYPE_RANK = {
     "HUGEINT": 5,
 }
 
-# Postgres error messages that indicate transient connectivity issues.
-# These surface as plain duckdb.Error (not IOException) when DuckLake's
-# internal snapshot query hits a dropped Postgres connection.
+# Catalog error messages that indicate transient issues. The Postgres ones
+# surface as plain duckdb.Error (not IOException) when DuckLake's internal
+# snapshot query hits a dropped Postgres connection. "database is locked" is
+# a SQLite catalog busy with another writer (e.g. another run): the DML runs in
+# one transaction, so retrying it is safe.
 _TRANSIENT_ERROR_PATTERNS = (
     "SSL connection has been closed unexpectedly",
-    "Failed to get data file list from DuckLake"
+    "Failed to get data file list from DuckLake",
+    "database is locked",
 )
 
 

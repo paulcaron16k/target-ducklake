@@ -18,10 +18,26 @@ class Targetducklake(SQLTarget):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.max_parallelism = 10 if self.config.get("parallel_draining", True) else 1
+        self.max_parallelism = 10 if self._drains_in_parallel() else 1
         self._MAX_RECORD_AGE_IN_MINUTES = float(
             self.config.get("max_record_age_minutes", 10.0)
         )
+
+    def _drains_in_parallel(self) -> bool:
+        """Whether sinks are drained in parallel: parallel_draining, except on SQLite.
+
+        A SQLite catalog allows one writer at a time, so two sinks committing
+        at once fail with 'database is locked'. Its sinks are always drained
+        one at a time.
+        """
+        parallel = bool(self.config.get("parallel_draining", True))
+        if parallel and self.config.get("catalog_type") == "sqlite":
+            self.logger.warning(
+                "catalog_type is sqlite, which allows one writer at a time: "
+                "sinks are drained one at a time (parallel_draining is ignored)."
+            )
+            return False
+        return parallel
 
     @property
     def config(self):
@@ -345,7 +361,9 @@ class Targetducklake(SQLTarget):
             description=(
                 "When True, enables parallel draining with max_parallelism=10 "
                 "(Meltano default). When False, sets max_parallelism=1 to "
-                "disable parallel draining."
+                "disable parallel draining. Ignored for a sqlite catalog, "
+                "which allows one writer at a time: its sinks are always "
+                "drained one at a time."
             ),
         ),
         th.Property(
