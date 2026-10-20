@@ -164,6 +164,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-68](https://github.com/paulcaron16k/target-ducklake-definite/issues/68) + [DUCKLKD-61](https://github.com/paulcaron16k/target-ducklake-definite/issues/61) Staging follows the column type; conflicting hints ignored | squash `2c668e9` (fork PR #74) | — | In fork, PR not opened |
 | [DUCKLKD-63](https://github.com/paulcaron16k/target-ducklake-definite/issues/63) Stage numbers at an existing column's type | squash `aac6968` (fork PR #77) | — | In fork, PR not opened |
 | [DUCKLKD-51](https://github.com/paulcaron16k/target-ducklake-definite/issues/51) More x-sql-datatype spellings | squash `ab371be` (fork PR #78) | — | In fork, PR not opened |
+| [DUCKLKD-79](https://github.com/paulcaron16k/target-ducklake-definite/issues/79) SQLite catalogs drain one sink at a time; failed parallel drains exit cleanly | squash `ebb2e28` (fork PR #80) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
