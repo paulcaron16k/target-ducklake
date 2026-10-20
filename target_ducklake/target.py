@@ -56,8 +56,9 @@ class Targetducklake(SQLTarget):
         CPython with ``pthread_exit``, which can't unwind through Rust or C++
         frames, so the process aborted (exit 134) instead of failing with the
         error. Here every drain finishes first; each failure is logged and the
-        first one is raised, so the run exits with it. Sinks that drain successfully commit their
-        batch, as on the serial path. Nothing changes when drains succeed.
+        first one is raised, so the run exits with it. Sinks that drain
+        successfully commit their batch, as on the serial path. Nothing
+        changes when drains succeed.
         """
         if parallelism == 1:
             super()._drain_all(sink_list, parallelism)
