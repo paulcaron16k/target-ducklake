@@ -49,11 +49,14 @@ class Targetducklake(SQLTarget):
     def _drain_all(self, sink_list: Iterable[Sink], parallelism: int) -> None:
         """Drain sinks in parallel threads, and wait for all of them before raising.
 
-        The SDK's parallel drain raises the first failure while other threads
-        may still be running DuckDB queries, and the process then aborted
-        (exit 134) instead of failing with the error. Here every drain
-        finishes first; each failure is logged and the first one is raised,
-        so the run exits with it. Sinks that drain successfully commit their
+        The SDK's parallel drain raises the first failure without waiting for
+        the other drains, which keep running in background threads. The
+        interpreter then shuts down under them: a thread that returns from
+        native code (here Polars' ``from_arrow``) during shutdown is ended by
+        CPython with ``pthread_exit``, which can't unwind through Rust or C++
+        frames, so the process aborted (exit 134) instead of failing with the
+        error. Here every drain finishes first; each failure is logged and the
+        first one is raised, so the run exits with it. Sinks that drain successfully commit their
         batch, as on the serial path. Nothing changes when drains succeed.
         """
         if parallelism == 1:
