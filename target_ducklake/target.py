@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING
 
 from singer_sdk import typing as th
 from singer_sdk.target_base import SQLTarget
@@ -12,16 +14,59 @@ from target_ducklake.sinks import (
     ducklakeSink,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from singer_sdk.sinks import Sink
+
 
 class Targetducklake(SQLTarget):
     name = "target-ducklake"
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.max_parallelism = 10 if self.config.get("parallel_draining", True) else 1
+        self.max_parallelism = 10 if self._drains_in_parallel() else 1
         self._MAX_RECORD_AGE_IN_MINUTES = float(
             self.config.get("max_record_age_minutes", 10.0)
         )
+
+    def _drains_in_parallel(self) -> bool:
+        """Whether sinks are drained in parallel: parallel_draining, except on SQLite.
+
+        A SQLite catalog allows one writer at a time, so two sinks committing
+        at once fail with 'database is locked'. Its sinks are always drained
+        one at a time.
+        """
+        parallel = bool(self.config.get("parallel_draining", True))
+        if parallel and self.config.get("catalog_type") == "sqlite":
+            self.logger.info(
+                "catalog_type is sqlite, which allows one writer at a time: "
+                "sinks are drained one at a time (parallel_draining is ignored)."
+            )
+            return False
+        return parallel
+
+    def _drain_all(self, sink_list: Iterable[Sink], parallelism: int) -> None:
+        """Drain sinks in parallel threads, and wait for all of them before raising.
+
+        The SDK's parallel drain raises the first failure while other threads
+        may still be running DuckDB queries, and the process then aborted
+        (exit 134) instead of failing with the error. Here every drain
+        finishes first; each failure is logged and the first one is raised,
+        so the run exits with it. Sinks that drain successfully commit their
+        batch, as on the serial path. Nothing changes when drains succeed.
+        """
+        if parallelism == 1:
+            super()._drain_all(sink_list, parallelism)
+            return
+        with ThreadPoolExecutor(max_workers=parallelism) as pool:
+            futures = [pool.submit(self.drain_one, sink) for sink in sink_list]
+        # Leaving the block waited for every drain.
+        errors = [error for future in futures if (error := future.exception())]
+        for error in errors[1:]:
+            self.logger.error("Another sink also failed to drain: %s", error)
+        if errors:
+            raise errors[0]
 
     @property
     def config(self):
@@ -345,7 +390,9 @@ class Targetducklake(SQLTarget):
             description=(
                 "When True, enables parallel draining with max_parallelism=10 "
                 "(Meltano default). When False, sets max_parallelism=1 to "
-                "disable parallel draining."
+                "disable parallel draining. Ignored for a sqlite catalog, "
+                "which allows one writer at a time: its sinks are always "
+                "drained one at a time."
             ),
         ),
         th.Property(

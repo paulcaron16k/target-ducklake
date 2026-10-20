@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import copy
+import io
 import itertools
 import json
 import os
 import subprocess
 import sys
+import threading
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -3470,3 +3472,127 @@ class TestCaseInsensitiveColumns:
             Mock(), file_columns=["id", "name"], target_table_columns=["ID", "Gone"]
         )
         assert sql.split(", ") == [' "ID"', "NULL"]
+
+
+class TestSqliteCatalogDraining:
+    """A SQLite catalog, which allows one writer at a time, loads several streams."""
+
+    @pytest.mark.parametrize(
+        ("catalog_type", "parallel_draining", "expected"),
+        [
+            ("sqlite", None, 1),
+            ("sqlite", True, 1),
+            ("sqlite", "true", 1),
+            ("sqlite", False, 1),
+            ("postgres", None, 10),
+            ("duckdb", None, 10),
+            ("mysql", None, 10),
+            ("postgres", False, 1),
+        ],
+    )
+    def test_sqlite_catalog_drains_one_sink_at_a_time(
+        self,
+        capfd: pytest.CaptureFixture[str],
+        catalog_type: str,
+        parallel_draining: object,
+        expected: int,
+    ):
+        """parallel_draining is ignored for sqlite, with a log line when it was on."""
+        config: dict[str, object] = {
+            "catalog_url": "test.db",
+            "data_path": "/tmp/test",
+            "storage_type": "local",
+            "catalog_type": catalog_type,
+        }
+        if parallel_draining is not None:
+            config["parallel_draining"] = parallel_draining
+        target = Targetducklake(config=config)
+        assert target.max_parallelism == expected
+        # The SDK's target logger writes to stderr without propagating.
+        logged = "drained one at a time" in capfd.readouterr().err
+        assert logged == (catalog_type == "sqlite" and parallel_draining is not False)
+
+    def test_several_streams_load_into_a_sqlite_catalog(self, tmp_path: Path):
+        """Two streams drained in one run both load (default config).
+
+        Drained in parallel, the second commit failed with 'database is locked'.
+        """
+        config = {
+            "catalog_type": "sqlite",
+            "catalog_url": str(tmp_path / "catalog.sqlite"),
+            "data_path": str(tmp_path / "data") + "/",
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging") + "/",
+        }
+        schema = {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}, "v": {"type": "string"}},
+        }
+        streams = ["a", "b", "c"]
+        messages = [
+            {"type": "SCHEMA", "stream": s, "schema": schema, "key_properties": ["id"]}
+            for s in streams
+        ] + [
+            {"type": "RECORD", "stream": s, "record": {"id": i, "v": s}}
+            for s in streams
+            for i in range(3)
+        ]
+        lines = "".join(json.dumps(m) + "\n" for m in messages)
+        target = Targetducklake(config=config)
+        target.listen(file_input=io.StringIO(lines))
+        target.target_connector.close()
+        con = duckdb.connect()
+        con.execute(
+            f"ATTACH 'ducklake:sqlite:{tmp_path / 'catalog.sqlite'}' AS lake "
+            f"(DATA_PATH '{tmp_path / 'data'}/')"
+        )
+        counts = [
+            con.execute(f"SELECT count(*) FROM lake.s.{s}").fetchone()[0]
+            for s in streams
+        ]
+        assert counts == [3, 3, 3]
+
+    def test_parallel_drain_waits_for_every_sink_before_raising(self):
+        """A failing sink's error is raised only after the other drains finish.
+
+        Raised while another thread was still inside DuckDB, the error made
+        the interpreter exit under that thread, and the process aborted
+        (exit 134) instead of failing with the error.
+        """
+        target = Targetducklake(
+            config={"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
+        )
+        finished = threading.Event()
+
+        def drain_one(sink: str) -> None:
+            if sink == "fails":
+                msg = "boom"
+                raise RuntimeError(msg)
+            threading.Event().wait(0.3)  # still draining when the other fails
+            finished.set()
+
+        with (
+            patch.object(target, "drain_one", side_effect=drain_one),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            target._drain_all(["fails", "slow"], parallelism=2)
+        assert finished.is_set()
+
+    def test_parallel_drain_reports_every_failure(
+        self, capfd: pytest.CaptureFixture[str]
+    ):
+        """With two failing sinks, the first error is raised and the other logged."""
+        target = Targetducklake(
+            config={"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
+        )
+
+        def drain_one(sink: str) -> None:
+            raise RuntimeError(sink)
+
+        with (
+            patch.object(target, "drain_one", side_effect=drain_one),
+            pytest.raises(RuntimeError, match="first"),
+        ):
+            target._drain_all(["first", "second"], parallelism=2)
+        assert "Another sink also failed to drain: second" in capfd.readouterr().err
