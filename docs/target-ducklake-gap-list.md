@@ -2,6 +2,8 @@
 
 As of 2026-10-16 · Paul Caron · Source doc: <https://claude.ai/code/artifact/8b044cac-c7c5-44ac-9cf8-8fdf7510ad02>
 
+> **Update 2026-10-21.** For comparisons with target-iceberg, see the two-way [parity matrix](target-parity-ducklake-iceberg.md), which supersedes list B. Fixed on `xflow_dev` since this list was written: A4 (DUCKLKD-18), A5 (DUCKLKD-20), B1 (DUCKLKD-16), B2 (DUCKLKD-17), B6 (DUCKLKD-20) and B7 (DUCKLKD-21/51). A3 is partly done: ACTIVATE_VERSION deletes (DUCKLKD-20); `_sdc_deleted_at` deletes remain DUCKLKD-23.
+
 For batch ingestion, current target-ducklake has 34 gaps: 9 High, 13 Medium and 12 Low. Streaming needs 16 more enhancements, 6 of them High.
 
 Three of the High batch items are data-correctness bugs to fix now, whatever the backend: lost decimal precision (B1), arbitrary duplicate choice (B2) and composite-key collisions (A4). The rest of the High list is what blocks hyperscaler deployments: Azure storage, keyless cloud identity, IAM catalog auth, the tenant guard, hard deletes and table maintenance.
