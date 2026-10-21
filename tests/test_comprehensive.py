@@ -38,6 +38,13 @@ from target_ducklake.flatten import (
     flatten_schema,
     truncate_column_names,
 )
+from target_ducklake.layout import (
+    LayoutError,
+    PartitionKey,
+    SortKey,
+    TableLayout,
+    resolve_layout,
+)
 from target_ducklake.parquet_utils import (
     _normalize_data_for_pyarrow,
     create_pyarrow_table,
@@ -3898,3 +3905,341 @@ class TestActivateVersion:
         ]
         self._run(tmp_path, self._sync(3, {}), hard_delete=True)
         assert self._rows(tmp_path) == []
+
+
+class TestTableLayout:
+    """Per-stream partition keys and sort order (target-iceberg's config shape)."""
+
+    COLUMNS: ClassVar[list[str]] = ["id", "Tenant", "occurred_at", "parent__v"]
+    ROWS = 40
+
+    def _layout(self, **config: object) -> TableLayout:
+        return resolve_layout(config, "orders", self.COLUMNS)
+
+    def test_partition_and_sort_render_duckdb_layout_sql(self):
+        """Entries become SET PARTITIONED BY / SET SORTED BY expressions."""
+        layout = self._layout(
+            stream_overrides={
+                "orders": {
+                    "partition": [
+                        {"column": "occurred_at", "transform": "day"},
+                        {"column": "tenant", "transform": "bucket", "num_buckets": 16},
+                        {"column": "parent__v"},
+                    ],
+                    "sort_order": ["id", "occurred_at DESC", "Tenant asc nulls first"],
+                }
+            }
+        )
+        assert [key.sql() for key in layout.partition] == [
+            'day("occurred_at")',
+            'bucket(16, "Tenant")',
+            '"parent__v"',
+        ]
+        assert [key.sql() for key in layout.sort] == [
+            '"id" ASC NULLS LAST',
+            '"occurred_at" DESC NULLS LAST',
+            '"Tenant" ASC NULLS FIRST',
+        ]
+
+    def test_overrides_merge_over_defaults_key_by_key(self):
+        """An override setting one key keeps the default's other key."""
+        layout = self._layout(
+            stream_defaults={"sort_order": ["id"], "partition": [{"column": "id"}]},
+            stream_overrides={"orders": {"partition": [{"column": "Tenant"}]}},
+        )
+        assert [key.sql() for key in layout.partition] == ['"Tenant"']
+        assert [key.sql() for key in layout.sort] == ['"id" ASC NULLS LAST']
+        assert resolve_layout({}, "orders", self.COLUMNS) == TableLayout()
+
+    def test_partition_fields_still_works_and_partition_replaces_it(self):
+        """The older form maps to the same keys; the new form wins for a stream."""
+        legacy = {
+            "partition_fields": {
+                "orders": [
+                    {
+                        "column_name": "occurred_at",
+                        "type": "timestamp",
+                        "granularity": ["year", "month"],
+                    },
+                    {"column_name": "id", "type": "identifier"},
+                ]
+            }
+        }
+        assert [key.sql() for key in self._layout(**legacy).partition] == [
+            'year("occurred_at")',
+            'month("occurred_at")',
+            '"id"',
+        ]
+        both = {
+            **legacy,
+            "stream_overrides": {"orders": {"partition": [{"column": "Tenant"}]}},
+        }
+        assert [key.sql() for key in self._layout(**both).partition] == ['"Tenant"']
+
+    @pytest.mark.parametrize(
+        ("layout", "message"),
+        [
+            (
+                {"partition": [{"column": "id", "transform": "truncate", "width": 4}]},
+                "not supported by DuckLake",
+            ),
+            (
+                {"partition": [{"column": "id", "transform": "void"}]},
+                "not supported by DuckLake",
+            ),
+            (
+                {"partition": [{"column": "id", "transform": "week"}]},
+                "unknown transform 'week'",
+            ),
+            (
+                {"partition": [{"column": "id", "transform": "bucket"}]},
+                "requires a positive integer 'num_buckets'",
+            ),
+            (
+                {
+                    "partition": [
+                        {"column": "id", "transform": "bucket", "num_buckets": 0}
+                    ]
+                },
+                "positive integer",
+            ),
+            (
+                {"partition": [{"column": "id", "transform": "day", "num_buckets": 4}]},
+                "applies only to the bucket",
+            ),
+            (
+                {"partition": [{"column": "id", "width": 4}]},
+                "applies only to the truncate",
+            ),
+            (
+                {"partition": [{"column": "id", "tranform": "day"}]},
+                "unknown key(s) ['tranform']",
+            ),
+            (
+                {"partition": [{"column": "nope"}]},
+                "column 'nope' is not in this stream",
+            ),
+            ({"partition": {"column": "id"}}, "must be a list"),
+            ({"sort_order": ["id sideways"]}, "is not a sort entry"),
+            ({"sort_order": ["nope"]}, "column 'nope' is not in this stream"),
+            ({"write_mode": "upsert"}, "DUCKLKD-41"),
+        ],
+        ids=[
+            "truncate",
+            "void",
+            "unknown-transform",
+            "bucket-without-count",
+            "bucket-zero",
+            "num-buckets-on-day",
+            "width",
+            "misspelt-key",
+            "missing-column",
+            "not-a-list",
+            "bad-sort-entry",
+            "missing-sort-column",
+            "unsupported-layout-key",
+        ],
+    )
+    def test_invalid_layout_is_rejected_with_the_fix(self, layout: dict, message: str):
+        """A layout mistake fails the stream with a message naming the problem."""
+        with pytest.raises(LayoutError) as error:
+            self._layout(stream_overrides={"orders": layout})
+        assert message in str(error.value)
+
+    def _run(
+        self, tmp_path: Path, *, quoted_column: bool = False, **config: object
+    ) -> None:
+        """Load ROWS records; quoted_column adds a "Foo Bar" column needing quotes."""
+        full_config = {
+            "catalog_type": "sqlite",
+            "catalog_url": str(tmp_path / "catalog.sqlite"),
+            "data_path": str(tmp_path / "data") + "/",
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging") + "/",
+            **config,
+        }
+        schema = {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer"},
+                "Tenant": {"type": "string"},
+                "occurred_at": {"type": "string", "format": "date-time"},
+                **({"Foo Bar": {"type": "integer"}} if quoted_column else {}),
+            },
+        }
+        messages = [
+            {
+                "type": "SCHEMA",
+                "stream": "orders",
+                "schema": schema,
+                "key_properties": ["id"],
+            },
+            *(
+                {
+                    "type": "RECORD",
+                    "stream": "orders",
+                    "record": {
+                        "id": i,
+                        "Tenant": f"t{i % 3}",
+                        "occurred_at": f"2024-01-0{i % 5 + 1}T10:00:00",
+                        **({"Foo Bar": i} if quoted_column else {}),
+                    },
+                }
+                for i in range(self.ROWS)
+            ),
+        ]
+        target = Targetducklake(config=full_config)
+        target.listen(
+            file_input=io.StringIO("".join(json.dumps(m) + "\n" for m in messages))
+        )
+        target.target_connector.close()
+
+    @staticmethod
+    def _catalog(tmp_path: Path) -> duckdb.DuckDBPyConnection:
+        con = duckdb.connect()
+        con.execute(
+            f"ATTACH 'ducklake:sqlite:{tmp_path / 'catalog.sqlite'}' "
+            f"AS ducklake_catalog (DATA_PATH '{tmp_path / 'data'}/')"
+        )
+        return con
+
+    def _state(self, tmp_path: Path) -> tuple[TableLayout, int, int]:
+        """The table's layout, its snapshot count, and its row count."""
+        con = self._catalog(tmp_path)
+        connector = DuckLakeConnector({"catalog_url": "x", "data_path": "/x"})
+        with patch.object(connector, "execute", side_effect=con.execute):
+            layout = connector.get_table_layout("s", "orders")
+        snapshots = con.execute(
+            "SELECT count(*) FROM ducklake_snapshots('ducklake_catalog')"
+        ).fetchone()[0]
+        rows = con.execute("SELECT count(*) FROM ducklake_catalog.s.orders").fetchone()[
+            0
+        ]
+        con.close()
+        return layout, snapshots, rows
+
+    def test_layout_is_applied_once_and_again_only_when_changed(self, tmp_path: Path):
+        """A new table gets the layout; an unchanged rerun adds no layout snapshot."""
+        overrides = {
+            "orders": {
+                "partition": [
+                    {"column": "tenant", "transform": "bucket", "num_buckets": 4},
+                    {"column": "occurred_at", "transform": "day"},
+                ],
+                "sort_order": ["occurred_at DESC"],
+            }
+        }
+        self._run(tmp_path, stream_overrides=overrides)
+        layout, snapshots, rows = self._state(tmp_path)
+        assert layout == TableLayout(
+            partition=(
+                PartitionKey("Tenant", "bucket(4)"),
+                PartitionKey("occurred_at", "day"),
+            ),
+            sort=(SortKey("occurred_at", "DESC", "NULLS_LAST"),),
+        )
+        assert rows == self.ROWS
+        # The same layout again: only the merge's own snapshot is added.
+        self._run(tmp_path, stream_overrides=overrides)
+        _, snapshots_after_rerun, _ = self._state(tmp_path)
+        assert snapshots_after_rerun == snapshots + 1
+        # A changed sort order is applied to the existing table.
+        changed = {"orders": {**overrides["orders"], "sort_order": ["id"]}}
+        self._run(tmp_path, stream_overrides=changed)
+        layout, _, rows = self._state(tmp_path)
+        assert layout.sort == (SortKey("id", "ASC", "NULLS_LAST"),)
+        assert layout.partition == (
+            PartitionKey("Tenant", "bucket(4)"),
+            PartitionKey("occurred_at", "day"),
+        )
+        assert rows == self.ROWS
+
+    def test_partition_fields_no_longer_adds_a_snapshot_every_run(self, tmp_path: Path):
+        """The older form is applied once, then left alone while unchanged."""
+        legacy = {
+            "orders": [
+                {
+                    "column_name": "occurred_at",
+                    "type": "timestamp",
+                    "granularity": ["month"],
+                }
+            ]
+        }
+        self._run(tmp_path, partition_fields=legacy)
+        layout, snapshots, _ = self._state(tmp_path)
+        assert layout.partition == (PartitionKey("occurred_at", "month"),)
+        self._run(tmp_path, partition_fields=legacy)
+        _, snapshots_after_rerun, _ = self._state(tmp_path)
+        assert snapshots_after_rerun == snapshots + 1
+
+    def test_layout_settings_accept_json_strings(self, tmp_path: Path):
+        """stream_overrides can arrive as a JSON string (env-var config)."""
+        overrides = json.dumps({"orders": {"sort_order": ["Tenant"]}})
+        self._run(tmp_path, stream_overrides=overrides)
+        layout, _, _ = self._state(tmp_path)
+        assert layout.sort == (SortKey("Tenant", "ASC", "NULLS_LAST"),)
+
+    def test_quoted_column_sort_is_not_reapplied(self, tmp_path: Path):
+        """A sort column needing quotes compares equal to DuckLake's stored form."""
+        overrides = {"orders": {"sort_order": ['"Foo Bar" DESC', "Tenant"]}}
+        self._run(tmp_path, stream_overrides=overrides, quoted_column=True)
+        _, snapshots, _ = self._state(tmp_path)
+        self._run(tmp_path, stream_overrides=overrides, quoted_column=True)
+        _, snapshots_after_rerun, _ = self._state(tmp_path)
+        assert snapshots_after_rerun == snapshots + 1
+
+    def test_an_empty_list_resets_the_layout(self, tmp_path: Path):
+        """partition: [] and sort_order: [] remove the table's keys."""
+        overrides = {
+            "orders": {"partition": [{"column": "id"}], "sort_order": ["Tenant"]}
+        }
+        self._run(tmp_path, stream_overrides=overrides)
+        self._run(
+            tmp_path, stream_overrides={"orders": {"partition": [], "sort_order": []}}
+        )
+        layout, _, rows = self._state(tmp_path)
+        assert layout == TableLayout(partition=(), sort=())
+        assert rows == self.ROWS
+
+    @pytest.mark.parametrize(
+        ("config", "message"),
+        [
+            (
+                {"stream_overrides": {"never_sent": {"sort_order": ["id sideways"]}}},
+                "stream 'never_sent' sort_order[0]",
+            ),
+            (
+                {
+                    "stream_defaults": {
+                        "partition": [{"column": "a", "transform": "void"}]
+                    }
+                },
+                "stream_defaults partition[0]",
+            ),
+            ({"stream_overrides": "{not json"}, "stream_overrides is not valid JSON"),
+        ],
+        ids=["override-for-another-stream", "defaults", "bad-json"],
+    )
+    def test_layout_config_is_checked_at_startup(self, config: dict, message: str):
+        """Every stream's layout is checked when the target starts, as in Iceberg."""
+        base = {"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
+        with pytest.raises(LayoutError) as error:
+            Targetducklake(config={**base, **config})
+        assert message in str(error.value)
+
+    def test_a_non_mapping_override_is_rejected_at_startup(self):
+        """The config schema already refuses an override that isn't a mapping."""
+        base = {"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
+        with pytest.raises(
+            ConfigValidationError, match=r"config\['stream_overrides'\]"
+        ):
+            Targetducklake(config={**base, "stream_overrides": {"orders": "day"}})
+        with pytest.raises(LayoutError, match="must be mappings"):
+            resolve_layout({"stream_overrides": {"orders": "day"}}, "orders", ["id"])
+
+    def test_a_legacy_entry_without_granularity_is_rejected(self):
+        """It used to fail; expanding to no key must not reset the partitioning."""
+        legacy = {"orders": [{"column_name": "occurred_at", "type": "timestamp"}]}
+        with pytest.raises(LayoutError, match="at least one granularity"):
+            self._layout(partition_fields=legacy)

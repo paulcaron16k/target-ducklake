@@ -13,6 +13,7 @@ from singer_sdk.connectors import SQLConnector
 from singer_sdk.connectors.sql import JSONSchemaToSQL
 from sqlalchemy.types import BIGINT, DECIMAL, INTEGER, JSON, TypeEngine, UserDefinedType
 
+from target_ducklake.layout import PartitionKey, SortKey, TableLayout
 from target_ducklake.parquet_utils import number_precision_and_scale
 from target_ducklake.type_hints import (
     hint_fits_json_type,
@@ -23,7 +24,6 @@ from target_ducklake.type_hints import (
 
 logger = logging.getLogger(__name__)
 
-PARTITION_GRANULARITIES = ["year", "month", "day", "hour"]
 
 # The SDK's record metadata columns: the record's table version, and the time
 # a row was deleted at the source. Short enough never to be truncated.
@@ -58,6 +58,33 @@ def is_transient_error(error: duckdb.Error) -> bool:
 def _by_lower_name(column_types: dict[str, str]) -> dict[str, tuple[str, str]]:
     """Map each lowercased column name to the column's (name, type)."""
     return {name.lower(): (name, typ) for name, typ in column_types.items()}
+
+
+def _same_keys(
+    wanted: tuple[PartitionKey, ...] | tuple[SortKey, ...],
+    current: tuple[PartitionKey, ...] | tuple[SortKey, ...] | None,
+) -> bool:
+    """Whether the wanted keys are the current ones, in order."""
+    return [key.compare_key() for key in wanted] == [
+        key.compare_key() for key in current or ()
+    ]
+
+
+def _sql_literal(value: str) -> str:
+    """A SQL string literal for the value, with single quotes escaped."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _unquoted(identifier: str) -> str:
+    """An identifier as DuckLake stores it in a sort expression, without quotes.
+
+    A name that needs quoting (``"Foo Bar"``) is stored quoted; a plain one
+    (``Tenant``) isn't. Comparing the unquoted name keeps an unchanged sort
+    order from being re-applied every run.
+    """
+    if len(identifier) > 1 and identifier[0] == identifier[-1] == '"':
+        return identifier[1:-1].replace('""', '"')
+    return identifier
 
 
 class DuckLakeConnectorError(Exception):
@@ -511,7 +538,7 @@ class DuckLakeConnector(SQLConnector):
         target_schema_name: str,
         table_name: str,
         columns: list[dict[str, str]],
-        partition_fields: list[dict[str, str]] | None = None,
+        layout: TableLayout | None = None,
     ) -> dict[str, str]:
         """Prepare the table for the target schema.
         If the table doesn't exist, create it.
@@ -544,46 +571,89 @@ class DuckLakeConnector(SQLConnector):
                 target_schema_name, table_name, columns, existing_column_types
             )
 
-        # Add partition fields if any
-        if partition_fields:
-            logger.info(
-                f"Adding partition fields to table {table_name}: {partition_fields}"
-            )
-            self._add_partition_fields(target_schema_name, table_name, partition_fields)
+        # Apply the configured partition keys and sort order, if they changed
+        if layout is not None:
+            self.apply_table_layout(target_schema_name, table_name, layout)
 
         return self.get_table_column_types(target_schema_name, table_name)
 
-    def _add_partition_fields(
-        self,
-        target_schema_name: str,
-        table_name: str,
-        partition_fields: list[dict[str, str]],
-    ) -> None:
-        """Add partition fields to the table."""
-        partitions_sql = ""
-        for partition_field in partition_fields:
-            column_type = partition_field["type"]
-            if column_type == "identifier":
-                partitions_sql += f"{partition_field['column_name']}, "
-            elif column_type == "timestamp":
-                for granularity in partition_field["granularity"]:
-                    if granularity not in PARTITION_GRANULARITIES:
-                        raise DuckLakeConnectorError(
-                            f"Unsupported granularity: {granularity}"
-                        )
-                    partitions_sql += (
-                        f"{granularity}({partition_field['column_name']}), "
-                    )
-            else:
-                raise DuckLakeConnectorError(
-                    f"Unsupported partition type: {column_type}"
-                )
-        partitions_sql = partitions_sql[:-2]
-        add_partition_query = f"ALTER TABLE {self.catalog_name}.{target_schema_name}.{table_name} SET PARTITIONED BY ({partitions_sql});"
-        logger.info(
-            f"Adding partition fields to table {table_name} with query {add_partition_query}"
+    def get_table_layout(self, target_schema_name: str, table_name: str) -> TableLayout:
+        """Read the table's current partition keys and sort order from the catalog.
+
+        DuckDB has no function that reports them, so they are read from
+        DuckLake's metadata tables. The metadata schema is looked up rather
+        than assumed, since it depends on the catalog type and META_SCHEMA.
+        """
+        metadata = f"__ducklake_metadata_{self.catalog_name}"
+        found = self.execute(
+            "SELECT schema_name FROM duckdb_tables() "  # noqa: S608 (identifiers only)
+            f"WHERE database_name = {_sql_literal(metadata)} "
+            "AND table_name = 'ducklake_partition_column'"
+        ).fetchone()
+        if found is None:
+            msg = f"DuckLake metadata tables not found in {metadata}"
+            raise DuckLakeConnectorError(msg)
+        m = f'"{metadata}"."{found[0]}"'
+        current_table = (
+            f"JOIN {m}.ducklake_table tb ON tb.table_id = info.table_id "
+            "AND tb.end_snapshot IS NULL "
+            f"JOIN {m}.ducklake_schema sc ON sc.schema_id = tb.schema_id "
+            "AND sc.end_snapshot IS NULL "
+            "WHERE info.end_snapshot IS NULL "
+            f"AND sc.schema_name = {_sql_literal(target_schema_name)} "
+            f"AND tb.table_name = {_sql_literal(table_name)}"
         )
-        self.execute(add_partition_query)
+        partition_rows = self.execute(
+            "SELECT col.column_name, pc.transform "  # noqa: S608 (identifiers only)
+            f"FROM {m}.ducklake_partition_info info "
+            f"JOIN {m}.ducklake_partition_column pc USING (partition_id, table_id) "
+            f"JOIN {m}.ducklake_column col ON col.table_id = pc.table_id "
+            "AND col.column_id = pc.column_id AND col.end_snapshot IS NULL "
+            f"{current_table} ORDER BY pc.partition_key_index"
+        ).fetchall()
+        sort_rows = self.execute(
+            "SELECT se.expression, se.sort_direction, se.null_order "  # noqa: S608
+            f"FROM {m}.ducklake_sort_info info "
+            f"JOIN {m}.ducklake_sort_expression se USING (sort_id, table_id) "
+            f"{current_table} ORDER BY se.sort_key_index"
+        ).fetchall()
+        return TableLayout(
+            partition=tuple(PartitionKey(*row) for row in partition_rows),
+            sort=tuple(
+                SortKey(_unquoted(expression), direction, nulls)
+                for expression, direction, nulls in sort_rows
+            ),
+        )
+
+    def apply_table_layout(
+        self, target_schema_name: str, table_name: str, layout: TableLayout
+    ) -> None:
+        """Set the configured partition keys and sort order, if they differ.
+
+        Only a configured part is applied (``None`` leaves the table's own
+        layout alone; an empty list removes its keys), and only when it
+        differs from the table's current layout: an unchanged
+        ``SET PARTITIONED BY`` still adds a snapshot, and an unchanged
+        ``SET SORTED BY`` a new sort version too, every run. DuckLake applies
+        a new layout to files written after it.
+        """
+        if layout.partition is None and layout.sort is None:
+            return
+        current = self.get_table_layout(target_schema_name, table_name)
+        table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
+        for kind, wanted, have in (
+            ("PARTITIONED", layout.partition, current.partition),
+            ("SORTED", layout.sort, current.sort),
+        ):
+            if wanted is None or _same_keys(wanted, have):
+                continue
+            if not wanted:  # an empty list removes the keys
+                logger.info("Resetting the %s keys of table %s", kind, table_name)
+                self.execute(f"ALTER TABLE {table_ref} RESET {kind} BY;")
+                continue
+            keys = ", ".join(key.sql() for key in wanted)
+            logger.info("Setting table %s %s BY %s", table_name, kind, keys)
+            self.execute(f"ALTER TABLE {table_ref} SET {kind} BY ({keys});")
 
     def _build_columns_sql(
         self,

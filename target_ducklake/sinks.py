@@ -23,6 +23,7 @@ from target_ducklake.flatten import (
     nullable_choices,
     truncate_column_names,
 )
+from target_ducklake.layout import resolve_layout
 from target_ducklake.parquet_utils import (
     concat_tables,
     staging_schema,
@@ -98,10 +99,13 @@ class ducklakeSink(SQLSink):
             f"DuckLake schema for stream '{stream_name}': {self.ducklake_schema}"
         )
 
-        # Initialize partition fields (if any)
-        partition_fields = self.config.get("partition_fields")
-        self.partition_fields = (
-            partition_fields.get(self.stream_name) if partition_fields else None
+        # Partition keys and sort order (stream_defaults / stream_overrides,
+        # or the older partition_fields), checked against the stream's columns.
+        self.layout = resolve_layout(
+            self.config,
+            self.stream_name,
+            [column["name"] for column in self.ducklake_schema],
+            self.logger,
         )
 
         if not self.config.get("load_method"):
@@ -224,7 +228,7 @@ class ducklakeSink(SQLSink):
             target_schema_name=self.target_schema,
             table_name=self.target_table,
             columns=self.ducklake_schema,
-            partition_fields=self.partition_fields,
+            layout=self.layout,
         )
         self._table_columns = list(table_types)
         # DuckDB matches identifiers case-insensitively, and the singer-sdk
