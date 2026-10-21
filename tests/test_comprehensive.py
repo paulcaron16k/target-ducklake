@@ -3828,3 +3828,41 @@ class TestActivateVersion:
         assert '"bookmarks"' not in capsys.readouterr().out
         self._run(tmp_path, messages, load_method="overwrite")
         assert '"bookmarks"' in capsys.readouterr().out
+
+    def test_state_is_held_while_an_overwrite_is_uncommitted(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """A mid-stream drain doesn't emit STATE before the overwrite commits.
+
+        Every message drains here (max_record_age_minutes near zero). If the
+        run then fails, the bookmark must not be out: a resumable tap would
+        skip rows that were never committed.
+        """
+        state = {"type": "STATE", "value": {"bookmarks": {"t": {"pk": 3}}}}
+        record = {"type": "RECORD", "stream": "t"}
+        self._run(tmp_path, self._sync(1, {1: "old"}))
+        failing = [
+            self._schema_message(),
+            {**record, "record": {"id": 3, "v": "new"}},
+            state,
+            {**record, "record": {"id": 4, "v": "new"}},
+            {**record, "record": {"id": "abc", "v": "bad"}},
+        ]
+        capsys.readouterr()
+        with pytest.raises(ValueError, match="whole numbers"):
+            self._run(
+                tmp_path, failing, load_method="overwrite", max_record_age_minutes=1e-9
+            )
+        assert '"bookmarks"' not in capsys.readouterr().out
+        assert self._rows(tmp_path) == [(1, "old")]
+        self._run(
+            tmp_path, failing[:-1], load_method="overwrite", max_record_age_minutes=1e-9
+        )
+        assert '"bookmarks"' in capsys.readouterr().out
+        assert self._rows(tmp_path) == [(3, "new"), (4, "new")]
+
+    def test_an_emptied_source_removes_every_row(self, tmp_path: Path):
+        """ACTIVATE_VERSION twice with no records between: the source is empty."""
+        self._run(tmp_path, self._sync(1, {1: "a", 2: "b"}))
+        self._run(tmp_path, self._sync(2, {}))
+        assert self._rows(tmp_path) == []

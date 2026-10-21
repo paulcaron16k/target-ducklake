@@ -72,6 +72,29 @@ class Targetducklake(SQLTarget):
         if errors:
             raise errors[0]
 
+    def _write_state_message(self, state: dict) -> None:
+        """Emit STATE, unless an overwrite hasn't committed its replace yet.
+
+        A mid-stream drain (a full batch, or max_record_age_minutes) only
+        stages an overwrite's batches; its rows reach the table when the
+        stream ends. STATE emitted before that would let a resumable tap skip
+        rows that were never committed if the run then fails. So STATE is held
+        until every overwrite has committed. The SDK writes the latest STATE
+        again after the final drain and clean-up.
+        """
+        sinks = [*self._sinks_to_clear, *self._sinks_active.values()]
+        pending = [
+            sink.stream_name
+            for sink in sinks
+            if getattr(sink, "has_uncommitted_overwrite", False)
+        ]
+        if pending:
+            self.logger.info(
+                "Holding STATE until the overwrite of %s commits.", ", ".join(pending)
+            )
+            return
+        super()._write_state_message(state)
+
     def _process_activate_version_message(self, message_dict: dict) -> None:
         """Drain the stream's sink, then let it activate the version.
 

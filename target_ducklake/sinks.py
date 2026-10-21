@@ -63,8 +63,10 @@ class ducklakeSink(SQLSink):
         self.files_saved = 0
         # Overwrite: each batch's parquet file, loaded together at clean_up.
         self._staged_files: list[str] = []
-        # ACTIVATE_VERSION: the table versions of the records received.
+        # ACTIVATE_VERSION: the table versions of the records received, and
+        # the versions already announced by an earlier ACTIVATE_VERSION.
         self._versions_received: set[int] = set()
+        self._versions_announced: set[int] = set()
         self.convert_tz_to_utc = self.config.get("convert_tz_to_utc", False)
 
         # NOTE: we probably don't need all this logging, but useful for debugging while target is in development
@@ -131,6 +133,7 @@ class ducklakeSink(SQLSink):
                 f"Load method is {self.load_method} for {self.stream_name}"
             )
             self.should_overwrite_table = False
+        self._overwrite_committed = False
 
     def get_validator(self) -> JSONSchemaValidator | None:
         """Validate records against the schema with anyOf/oneOf made nullable.
@@ -487,7 +490,7 @@ class ducklakeSink(SQLSink):
         replace fails the run with the old rows intact.
         """
         try:
-            if self.should_overwrite_table:
+            if self.has_uncommitted_overwrite:
                 self.connector.replace_table_contents(
                     file_locations=self._staged_files,
                     target_schema_name=self.target_schema,
@@ -495,9 +498,19 @@ class ducklakeSink(SQLSink):
                     file_columns=[col["name"] for col in self.ducklake_schema],
                     target_table_columns=self._table_columns,
                 )
+                self._overwrite_committed = True
             super().clean_up()
         finally:
             self._remove_temp_file_dir()
+
+    @property
+    def has_uncommitted_overwrite(self) -> bool:
+        """Whether this is an overwrite whose replace hasn't been committed yet.
+
+        Until it is, STATE must not be emitted (see
+        ``Targetducklake._write_state_message``).
+        """
+        return self.should_overwrite_table and not self._overwrite_committed
 
     def _remove_temp_file_dir(self) -> None:
         """Remove this stream's dedicated temp directory."""
@@ -524,9 +537,11 @@ class ducklakeSink(SQLSink):
 
         Nothing is deleted when:
         - records carry no version (``add_record_metadata`` is off);
-        - no record of this version has been received, as when a tap
-          announces the version before sending its records, which would
-          otherwise empty the table for the whole sync;
+        - no record of this version has been received and the version
+          wasn't announced before, as when a tap announces the version
+          before sending its records, which would otherwise empty the table
+          for the whole sync (a second ACTIVATE_VERSION with no records
+          between means the source is empty, and every other row goes);
         - the stream is an overwrite, which replaces the whole table at
           clean_up anyway, and must not empty it early.
         """
@@ -543,7 +558,13 @@ class ducklakeSink(SQLSink):
                 "overwrite replaces the whole table at the end of the stream."
             )
             return
-        if new_version not in self._versions_received:
+        if (
+            new_version not in self._versions_received
+            and new_version not in self._versions_announced
+        ):
+            # A second ACTIVATE_VERSION for the version, even with no records
+            # between, ends its sync: the source is then empty.
+            self._versions_announced.add(new_version)
             self.logger.info(
                 f"ACTIVATE_VERSION {new_version} for {self.stream_name} arrived "
                 "before any of its records; nothing to remove yet."

@@ -128,13 +128,16 @@ Existing tables keep their column types, apart from safe integer and float widen
 
 ### Overwrite and ACTIVATE_VERSION
 
-**Overwrite** (`load_method: overwrite`, or `overwrite_if_no_pk` for a stream without primary keys) replaces the table's rows atomically. Each batch is staged as a Parquet file in `temp_file_dir`, and at the end of the stream one transaction deletes the old rows and inserts every staged batch. Readers see the old table until that commit, and a run that fails or is interrupted leaves the old rows in place. STATE is emitted only after the commit. Two consequences:
-- `temp_file_dir` needs room for the whole stream, not one batch.
-- A stream with no records still empties the table, as before.
+**Overwrite** (`load_method: overwrite`, or `overwrite_if_no_pk` for a stream without primary keys) replaces the table's rows atomically. Each batch is staged as a Parquet file in `temp_file_dir`, and at the end of the stream one transaction deletes the old rows and inserts every staged batch. Readers see the old table until that commit. A run that fails or is interrupted in the target leaves the old rows in place. Some limits:
+- **STATE is held** while any overwrite stream hasn't committed: mid-run drains don't emit it, so a resumable tap can't skip rows that were never loaded. It is emitted after the commit.
+- **The swap happens at the end of the input.** If the tap dies but its output ends cleanly, the target swaps in what it received.
+- **`temp_file_dir` needs room for the whole stream,** not one batch.
+- **A stream with no records still empties the table,** as before.
+- **A schema change mid-stream** (a new SCHEMA for the stream) fails the run at the end, with the old rows intact.
 
 **ACTIVATE_VERSION**, as full-table taps send it, removes rows that are gone at the source. The tap tags each record with a table version, then sends `ACTIVATE_VERSION` for that version. The target first loads any buffered records, then deletes every row whose `_sdc_table_version` is not the activated version, including rows loaded without a version. Rows are hard-deleted. Some cases remove nothing:
 - **Without `add_record_metadata`:** records carry no version, so the message is ignored with a warning.
-- **A version announced before any of its records** (as taps do at the start of a sync) is a no-op, so the table never empties mid-sync.
+- **A version announced before any of its records** (as taps do at the start of a sync) is a no-op, so the table never empties mid-sync. A second `ACTIVATE_VERSION` for the same version, even with no records between, ends the sync: the source is empty, and every row goes.
 - **An overwrite stream** ignores versions, since it replaces the whole table anyway.
 
 Between a sync's first batch and its `ACTIVATE_VERSION`, readers see the new rows next to rows of the old version. Set `process_activate_version_messages: false` to ignore the message entirely.
