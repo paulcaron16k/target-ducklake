@@ -4237,3 +4237,9 @@ class TestTableLayout:
             Targetducklake(config={**base, "stream_overrides": {"orders": "day"}})
         with pytest.raises(LayoutError, match="must be mappings"):
             resolve_layout({"stream_overrides": {"orders": "day"}}, "orders", ["id"])
+
+    def test_a_legacy_entry_without_granularity_is_rejected(self):
+        """It used to fail; expanding to no key must not reset the partitioning."""
+        legacy = {"orders": [{"column_name": "occurred_at", "type": "timestamp"}]}
+        with pytest.raises(LayoutError, match="at least one granularity"):
+            self._layout(partition_fields=legacy)

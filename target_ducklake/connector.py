@@ -632,9 +632,10 @@ class DuckLakeConnector(SQLConnector):
 
         Only a configured part is applied (``None`` leaves the table's own
         layout alone; an empty list removes its keys), and only when it
-        differs from the table's current layout: an unchanged ``SET PARTITIONED BY`` still adds a snapshot, and
-        an unchanged ``SET SORTED BY`` a new sort version too, every run.
-        DuckLake applies a new layout to files written after it.
+        differs from the table's current layout: an unchanged
+        ``SET PARTITIONED BY`` still adds a snapshot, and an unchanged
+        ``SET SORTED BY`` a new sort version too, every run. DuckLake applies
+        a new layout to files written after it.
         """
         if layout.partition is None and layout.sort is None:
             return

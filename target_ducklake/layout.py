@@ -304,7 +304,11 @@ def _legacy_partition_keys(
         if kind == "identifier":
             keys.append(PartitionKey(column, "identity"))
         elif kind == "timestamp":
-            for granularity in entry.get("granularity") or []:
+            if not entry.get("granularity"):
+                # Expanding to no key would reset the table's partitioning.
+                msg = f"{at}: a timestamp entry needs at least one granularity."
+                raise LayoutError(msg)
+            for granularity in entry["granularity"]:
                 if granularity not in _TIME_TRANSFORMS:
                     msg = f"{at}: unsupported granularity {granularity!r}."
                     raise LayoutError(msg)

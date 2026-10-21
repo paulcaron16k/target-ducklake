@@ -85,7 +85,7 @@ stream_overrides:
 - **Column names** are the table's (flattened names use `__`), matched case-insensitively. An unknown key, transform or column fails the stream with a message naming it, rather than being ignored.
 - **When applied:** a new table gets the layout at creation. On an existing table, a changed layout is applied as metadata, and files written afterwards follow it (unlike target-iceberg, where partitioning is fixed at creation). An unchanged layout is left alone. A stream with no `partition` or `sort_order` keeps whatever layout its table already has; an empty list (`partition: []`, `sort_order: []`) removes the table's keys.
 - **`stream_defaults`/`stream_overrides` settings other than `partition` and `sort_order`** (target-iceberg's `write_mode`, `key_properties`, …) are rejected, as they are not implemented here.
-- **Checked at startup:** every stream's layout settings are checked when the target starts, including overrides for streams that never arrive. Column names are checked when each stream's schema arrives.
+- **Checked at startup:** the `stream_defaults`/`stream_overrides` settings of every stream are checked when the target starts, including overrides for streams that never arrive. Column names, and the older `partition_fields`, are checked when each stream's schema arrives.
 - **Both settings can be given as JSON strings** (for environment variables).
 
 The older `partition_fields` setting still works for a stream without a `partition`:
