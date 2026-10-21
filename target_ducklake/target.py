@@ -425,8 +425,8 @@ class Targetducklake(SQLTarget):
             th.StringType,
             title="Table Config Path",
             description=(
-                "Path to a Zamboni table-config.json, version 1 or 2, as "
-                "target-iceberg reads it. Its per-table partition, and an ordering in "
+                "Path to a Zamboni table-config.json (version 2), the file "
+                "target-iceberg reads. Its per-table partition, and an ordering in "
                 "sort mode, set the table layout; Iceberg-only and maintenance "
                 "sections are ignored. A stream's own partition and sort_order win."
             ),

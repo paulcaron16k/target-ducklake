@@ -54,6 +54,8 @@ Key files:
 
 Tests are in `tests/test_comprehensive.py`. All tests are unit tests using mocks — no external database connections needed. Run with `uv run pytest tests/ -v`.
 
+`tests/test_table_config_contract.py` checks `layout.py`'s `table_config` reader against Zamboni's published table-config spec, vendored in `tests/contracts/` at a pinned Zamboni tag. To move to a newer Zamboni format, bump `REF` in `bin/refresh-table-config-contract.sh`, run it, and let the contract tests name what changed; never edit the vendored files by hand.
+
 ## Retry Logic
 
 All queries go through `DuckLakeConnector.execute()`, which retries on two categories of transient errors with exponential backoff:

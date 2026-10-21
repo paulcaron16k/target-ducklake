@@ -72,6 +72,29 @@ _UNIMPLEMENTED_LAYOUT_KEYS = {
 # Revisit when DUCKLKD-43 implements type_source.
 _TYPE_SOURCE_ONLY_KEY = "on_error"
 
+# The Zamboni table-config version read here. tests/contracts holds Zamboni's
+# published spec, pinned by bin/refresh-table-config-contract.sh, and the
+# contract tests fail if it no longer matches the names below.
+TABLE_CONFIG_VERSION = 2
+_TABLE_CONFIG_ROOT_KEYS = frozenset({"version", "warehouse", "defaults", "namespaces"})
+# The keys of a table block (and of defaults): those applied, and those that
+# only configure Zamboni's maintenance.
+_TABLE_CONFIG_APPLIED_KEYS = frozenset({"partition", "ordering"})
+_TABLE_CONFIG_IGNORED_KEYS = frozenset(
+    {
+        "description",
+        "min_input_files",
+        "partition_evolution",
+        "retention",
+        "skip_partitions_newer_than_windows",
+        "target_file_size_bytes",
+    }
+)
+_ORDERING_MODES = frozenset({"none", "sort", "zorder"})
+_ORDERING_SORT_KEYS = frozenset({"column", "direction", "nulls"})
+_SORT_DIRECTIONS = frozenset({"asc", "desc"})
+_SORT_NULLS = frozenset({"first", "last"})
+
 # "column", or "column DESC", "column ASC NULLS FIRST": the sort entry forms.
 _SORT_ENTRY = re.compile(
     r'^\s*(?P<column>"[^"]+"|[^\s"]+)'
@@ -251,9 +274,21 @@ def check_layout_config(
 def _check_table_config(
     config: Mapping[str, t.Any], logger: logging.Logger | None
 ) -> None:
-    """Check the layout sections of every table block in ``table_config``."""
+    """Check the layout sections of every table block in ``table_config``.
+
+    Keys target-ducklake doesn't know are reported, not rejected: Zamboni
+    validates the file, and a key it adds for maintenance shouldn't stop
+    loads. The contract tests catch new keys when the spec is refreshed.
+    """
+    document = read_table_config(config["table_config"])
+    unknown = sorted(set(document) - _TABLE_CONFIG_ROOT_KEYS)
+    if logger is not None and unknown:
+        logger.info("table_config: ignoring unknown key(s) %s.", unknown)
+    known = _TABLE_CONFIG_APPLIED_KEYS | _TABLE_CONFIG_IGNORED_KEYS
     for table, block in _table_config_blocks(config):
         where = f"table_config {table}"
+        if logger is not None and (unknown := sorted(set(block) - known)):
+            logger.info("%s: ignoring unknown key(s) %s.", where, unknown)
         if block.get("partition"):
             _partition_keys(block["partition"], None, where, logger)
         if "ordering" in block:
@@ -346,7 +381,31 @@ def _read_table_config(path: str) -> dict[str, t.Any]:
     if not isinstance(document, dict):
         msg = f"table_config: {path!r} must hold a JSON object."
         raise LayoutError(msg)
+    _check_table_config_version(document, path)
     return document
+
+
+def _check_table_config_version(document: Mapping[str, t.Any], path: str) -> None:
+    """Refuse a file in a format other than ``TABLE_CONFIG_VERSION``, as Zamboni does.
+
+    A file Zamboni refuses isn't a shared config, so it isn't loaded here
+    either. The version 1 shape (tables keyed 'namespace.table') is named.
+    """
+    if "tables" in document and "namespaces" not in document:
+        msg = (
+            f"table_config: {path!r} has 'tables' at the top level, the version 1 "
+            "shape, which Zamboni no longer reads. Version 2 states the namespace: "
+            "{'version': 2, 'warehouse': ..., 'namespaces': {'<namespace>': "
+            "{'tables': {'<table>': {...}}}}}."
+        )
+        raise LayoutError(msg)
+    version = document.get("version", TABLE_CONFIG_VERSION)
+    if type(version) is not int or version != TABLE_CONFIG_VERSION:
+        msg = (
+            f"table_config: {path!r} has version {version!r}; target-ducklake reads "
+            f"version {TABLE_CONFIG_VERSION}."
+        )
+        raise LayoutError(msg)
 
 
 def _mapping(value: object, what: str) -> dict[str, t.Any]:
@@ -364,26 +423,17 @@ def _file_tables(
 ) -> dict[tuple[str, str], dict[str, t.Any]]:
     """Every table block of the file by (schema, table), shapes checked.
 
-    Version 2 nests tables under namespaces (the namespace is the target
-    schema); version 1 keys them 'namespace.table', as target-iceberg reads it,
-    split at the last dot as Zamboni's version 1 did.
+    Tables are nested under namespaces; the namespace is the target schema.
     """
     tables: dict[tuple[str, str], dict[str, t.Any]] = {}
-    if "namespaces" in document:
-        namespaces = _mapping(document["namespaces"], "namespaces")
-        for namespace, raw_entry in namespaces.items():
-            entry = _mapping(raw_entry, f"namespaces.{namespace}")
-            entry_tables = _mapping(
-                entry.get("tables"), f"namespaces.{namespace}.tables"
+    namespaces = _mapping(document.get("namespaces"), "namespaces")
+    for namespace, raw_entry in namespaces.items():
+        entry = _mapping(raw_entry, f"namespaces.{namespace}")
+        entry_tables = _mapping(entry.get("tables"), f"namespaces.{namespace}.tables")
+        for name, block in entry_tables.items():
+            tables[namespace, name] = _mapping(
+                block, f"namespaces.{namespace}.tables.{name}"
             )
-            for name, block in entry_tables.items():
-                tables[namespace, name] = _mapping(
-                    block, f"namespaces.{namespace}.tables.{name}"
-                )
-    else:
-        for key, block in _mapping(document.get("tables"), "tables").items():
-            namespace, _, name = key.rpartition(".")
-            tables[namespace, name] = _mapping(block, f"tables.{key}")
     return tables
 
 
@@ -614,14 +664,11 @@ def _ordering_sort_keys(
     """The sort keys of a table-config ``ordering``; ``None`` for z-order.
 
     ``mode: sort`` gives the keys (``column``, ``direction`` asc/desc,
-    ``nulls`` first/last); ``mode: none`` gives no keys, removing a sort
-    order; ``mode: zorder`` is Iceberg-only and skipped (reported, given a
-    logger).
+    ``nulls`` first/last); ``mode: none``, the default as in Zamboni, gives
+    no keys, removing a sort order; ``mode: zorder`` is Iceberg-only and
+    skipped (reported, given a logger).
     """
-    if not isinstance(ordering, dict):
-        msg = f"{where}: ordering must be an object with a mode."
-        raise LayoutError(msg)
-    mode = ordering.get("mode")
+    mode, sort = _ordering_mode(ordering, where)
     if mode == "none":
         return ()
     if mode == "zorder":
@@ -630,20 +677,39 @@ def _ordering_sort_keys(
                 "%s: skipping ordering mode 'zorder', which DuckLake lacks.", where
             )
         return None
-    if mode != "sort" or not isinstance(ordering.get("sort"), list):
-        msg = f"{where}: ordering mode must be sort (with a sort list), zorder or none."
-        raise LayoutError(msg)
     keys = []
-    for index, entry in enumerate(ordering["sort"]):
+    for index, entry in enumerate(sort):
         at = f"{where} ordering.sort[{index}]"
         if not isinstance(entry, dict):
             msg = f"{at}: each entry must be a mapping, e.g. {{column: ts}}."
             raise LayoutError(msg)
         column = _column(entry.get("column"), by_name, at)
-        direction = str(entry.get("direction", "asc")).upper()
-        nulls = str(entry.get("nulls", "last")).upper()
-        if direction not in {"ASC", "DESC"} or nulls not in {"FIRST", "LAST"}:
+        direction = entry.get("direction", "asc")
+        nulls = entry.get("nulls", "last")
+        if direction not in _SORT_DIRECTIONS or nulls not in _SORT_NULLS:
             msg = f"{at}: direction must be asc or desc, and nulls first or last."
             raise LayoutError(msg)
-        keys.append(SortKey(column, direction, f"NULLS_{nulls}"))
+        keys.append(SortKey(column, direction.upper(), f"NULLS_{nulls.upper()}"))
     return tuple(keys)
+
+
+def _ordering_mode(ordering: object, where: str) -> tuple[str, list[t.Any]]:
+    """The mode and sort list of an ``ordering``, checked as Zamboni checks them."""
+    if not isinstance(ordering, dict):
+        msg = f"{where}: ordering must be an object with a mode."
+        raise LayoutError(msg)
+    mode = ordering.get("mode", "none")
+    if mode not in _ORDERING_MODES:
+        msg = f"{where}: ordering mode must be one of {sorted(_ORDERING_MODES)}."
+        raise LayoutError(msg)
+    if mode == "none" and (ordering.get("sort") or ordering.get("zorder")):
+        msg = (
+            f"{where}: ordering mode is none but an ordering is defined; set "
+            "mode to sort or zorder to enable it, as Zamboni requires."
+        )
+        raise LayoutError(msg)
+    sort = ordering.get("sort")
+    if mode == "sort" and not (isinstance(sort, list) and sort):
+        msg = f"{where}: ordering mode sort requires a non-empty sort list."
+        raise LayoutError(msg)
+    return str(mode), sort if isinstance(sort, list) else []

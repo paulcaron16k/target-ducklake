@@ -44,6 +44,7 @@ from target_ducklake.layout import (
     SortKey,
     TableLayout,
     _read_table_config,
+    check_layout_config,
     resolve_layout,
 )
 from target_ducklake.parquet_utils import (
@@ -4336,18 +4337,10 @@ class TestTableLayout:
         },
     }
 
-    @pytest.mark.parametrize("version", [1, 2])
-    def test_table_config_partition_and_sort_order(self, tmp_path: Path, version: int):
+    def test_table_config_partition_and_sort_order(self, tmp_path: Path):
         """A table's block wins over defaults; ordering mode sort is the sort order."""
-        document = self.V2
-        if version == 1:
-            tables = document["namespaces"]["s"]["tables"]
-            document = {
-                "defaults": document["defaults"],
-                "tables": {f"s.{name}": block for name, block in tables.items()},
-            }
         # tenant_id is skipped with its truncate transform, so it needn't exist.
-        config = {"table_config": self._table_config(tmp_path, document)}
+        config = {"table_config": self._table_config(tmp_path, self.V2)}
         layout = resolve_layout(config, "orders", self.COLUMNS, table=("s", "orders"))
         assert layout == TableLayout(
             partition=(
@@ -4392,11 +4385,30 @@ class TestTableLayout:
                 "table_config defaults partition[0]: unknown transform 'week'",
             ),
             (
-                json.dumps({"tables": {"s.t": {"ordering": {"mode": "random"}}}}),
+                json.dumps(
+                    {"namespaces": {"s": {"tables": {"t": {"ordering": {"mode": 1}}}}}}
+                ),
                 "table_config s.t: ordering mode must be",
             ),
+            (
+                json.dumps({"tables": {"s.t": {}}}),
+                "the version 1 shape, which Zamboni no longer reads",
+            ),
+            (json.dumps({"version": 3}), "has version 3; target-ducklake reads"),
+            (json.dumps({"version": "2"}), "has version '2'; target-ducklake reads"),
+            (json.dumps({"version": True}), "has version True; target-ducklake reads"),
         ],
-        ids=["missing", "bad-json", "not-an-object", "bad-transform", "bad-ordering"],
+        ids=[
+            "missing",
+            "bad-json",
+            "not-an-object",
+            "bad-transform",
+            "bad-ordering",
+            "version-1-shape",
+            "version-3",
+            "version-string",
+            "version-bool",
+        ],
     )
     def test_a_bad_table_config_fails_at_startup(
         self, tmp_path: Path, content: str | None, message: str
@@ -4464,30 +4476,26 @@ class TestTableLayout:
                 self.COLUMNS,
             )
 
-    @pytest.mark.parametrize("version", [1, 2])
     @pytest.mark.parametrize(
         ("schema", "table"),
         [("S", "Orders"), ("s", "ORDERS"), ("s", "Orders Daily")],
         ids=["upper-schema", "upper-table", "conformed"],
     )
     def test_table_config_matches_tables_like_duckdb_and_target_iceberg(
-        self, tmp_path: Path, version: int, schema: str, table: str
+        self, tmp_path: Path, schema: str, table: str
     ):
         """Names match case-insensitively, and by target-iceberg's conformed name."""
         name = "orders_daily" if " " in table else "orders"
         block = {"partition": [{"column": "id"}]}
-        document: dict = (
-            {"tables": {f"s.{name}": block}}
-            if version == 1
-            else {"namespaces": {"s": {"tables": {name: block}}}}
-        )
+        document = {"namespaces": {"s": {"tables": {name: block}}}}
         config = {"table_config": self._table_config(tmp_path, document)}
         layout = resolve_layout(config, "x", self.COLUMNS, table=(schema, table))
         assert layout.partition == (PartitionKey("id", "identity"),)
 
     def test_a_table_missing_from_table_config_is_logged(self, tmp_path: Path):
         """A table with no block is logged, rather than silently taking defaults."""
-        config = {"table_config": self._table_config(tmp_path, {"tables": {}})}
+        document: dict = {"namespaces": {"s": {"tables": {}}}}
+        config = {"table_config": self._table_config(tmp_path, document)}
         logger = Mock()
         resolve_layout(config, "x", self.COLUMNS, logger, table=("s", "absent"))
         message, *args = logger.info.call_args.args
@@ -4499,8 +4507,6 @@ class TestTableLayout:
         [
             {"defaults": [1]},
             {"defaults": "x"},
-            {"tables": [1]},
-            {"tables": {"s.t": "x"}},
             {"version": 2, "namespaces": [1]},
             {"namespaces": {"s": {"tables": [1]}}},
             {"namespaces": {"s": "x"}},
@@ -4508,8 +4514,6 @@ class TestTableLayout:
         ids=[
             "defaults-list",
             "defaults-string",
-            "tables-list",
-            "table-string",
             "namespaces-list",
             "namespace-tables-list",
             "namespace-string",
@@ -4523,6 +4527,59 @@ class TestTableLayout:
         path = self._table_config(tmp_path, document)
         with pytest.raises(LayoutError, match="table_config"):
             Targetducklake(config={**base, "table_config": path})
+
+    @pytest.mark.parametrize(
+        ("ordering", "sort"),
+        [({}, ()), ({"mode": "none"}, ()), ({"mode": "zorder"}, None)],
+        ids=["mode-absent", "mode-none", "mode-zorder"],
+    )
+    def test_table_config_ordering_modes(
+        self, tmp_path: Path, ordering: dict, sort: tuple | None
+    ):
+        """As in Zamboni, an ordering without a mode is mode none: no sort order."""
+        document = {"namespaces": {"s": {"tables": {"t": {"ordering": ordering}}}}}
+        config = {"table_config": self._table_config(tmp_path, document)}
+        layout = resolve_layout(config, "x", self.COLUMNS, table=("s", "t"))
+        assert layout.sort == sort
+
+    @pytest.mark.parametrize(
+        ("ordering", "message"),
+        [
+            ({"sort": [{"column": "id"}]}, "mode is none but an ordering is defined"),
+            ({"mode": "sort", "sort": []}, "requires a non-empty sort list"),
+            (
+                {"mode": "sort", "sort": [{"column": "id", "direction": "DESC"}]},
+                "direction must be asc or desc",
+            ),
+        ],
+        ids=["sort-without-mode", "empty-sort", "uppercase-direction"],
+    )
+    def test_table_config_orderings_zamboni_refuses_are_refused(
+        self, tmp_path: Path, ordering: dict, message: str
+    ):
+        """An ordering Zamboni would refuse isn't read some other way here."""
+        document = {"namespaces": {"s": {"tables": {"t": {"ordering": ordering}}}}}
+        config = {"table_config": self._table_config(tmp_path, document)}
+        with pytest.raises(LayoutError, match=message):
+            check_layout_config(config)
+
+    def test_unknown_table_config_keys_are_logged_not_rejected(self, tmp_path: Path):
+        """A key Zamboni adds for maintenance is reported and loads carry on."""
+        document = {
+            "version": 2,
+            "compaction": {},
+            "namespaces": {"s": {"tables": {"t": {"zone_maps": True}}}},
+        }
+        config = {"table_config": self._table_config(tmp_path, document)}
+        logger = Mock()
+        check_layout_config(config, logger)
+        messages = [call.args for call in logger.info.call_args_list]
+        assert ("table_config: ignoring unknown key(s) %s.", ["compaction"]) in messages
+        assert (
+            "%s: ignoring unknown key(s) %s.",
+            "table_config s.t",
+            ["zone_maps"],
+        ) in messages
 
     def test_configured_names_match_through_column_truncation(self):
         """A column named in full in a shared config matches its truncated name."""
@@ -4539,9 +4596,13 @@ class TestTableLayout:
     def test_several_matching_table_blocks_use_the_first_and_log(self, tmp_path: Path):
         """Blocks that differ only by case: the first in file order wins, logged."""
         document = {
-            "tables": {
-                "s.Orders": {"partition": [{"column": "id"}]},
-                "s.orders": {"partition": [{"column": "Tenant"}]},
+            "namespaces": {
+                "s": {
+                    "tables": {
+                        "Orders": {"partition": [{"column": "id"}]},
+                        "orders": {"partition": [{"column": "Tenant"}]},
+                    }
+                }
             }
         }
         config = {"table_config": self._table_config(tmp_path, document)}
