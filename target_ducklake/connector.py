@@ -70,6 +70,23 @@ def _same_keys(
     ]
 
 
+def _sql_literal(value: str) -> str:
+    """A SQL string literal for the value, with single quotes escaped."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _unquoted(identifier: str) -> str:
+    """An identifier as DuckLake stores it in a sort expression, without quotes.
+
+    A name that needs quoting (``"Foo Bar"``) is stored quoted; a plain one
+    (``Tenant``) isn't. Comparing the unquoted name keeps an unchanged sort
+    order from being re-applied every run.
+    """
+    if len(identifier) > 1 and identifier[0] == identifier[-1] == '"':
+        return identifier[1:-1].replace('""', '"')
+    return identifier
+
+
 class DuckLakeConnectorError(Exception):
     """Custom exception for DuckLake connector errors."""
 
@@ -570,7 +587,7 @@ class DuckLakeConnector(SQLConnector):
         metadata = f"__ducklake_metadata_{self.catalog_name}"
         found = self.execute(
             "SELECT schema_name FROM duckdb_tables() "  # noqa: S608 (identifiers only)
-            f"WHERE database_name = '{metadata}' "
+            f"WHERE database_name = {_sql_literal(metadata)} "
             "AND table_name = 'ducklake_partition_column'"
         ).fetchone()
         if found is None:
@@ -583,8 +600,8 @@ class DuckLakeConnector(SQLConnector):
             f"JOIN {m}.ducklake_schema sc ON sc.schema_id = tb.schema_id "
             "AND sc.end_snapshot IS NULL "
             "WHERE info.end_snapshot IS NULL "
-            f"AND sc.schema_name = '{target_schema_name}' "
-            f"AND tb.table_name = '{table_name}'"
+            f"AND sc.schema_name = {_sql_literal(target_schema_name)} "
+            f"AND tb.table_name = {_sql_literal(table_name)}"
         )
         partition_rows = self.execute(
             "SELECT col.column_name, pc.transform "  # noqa: S608 (identifiers only)
@@ -602,7 +619,10 @@ class DuckLakeConnector(SQLConnector):
         ).fetchall()
         return TableLayout(
             partition=tuple(PartitionKey(*row) for row in partition_rows),
-            sort=tuple(SortKey(*row) for row in sort_rows),
+            sort=tuple(
+                SortKey(_unquoted(expression), direction, nulls)
+                for expression, direction, nulls in sort_rows
+            ),
         )
 
     def apply_table_layout(
@@ -611,8 +631,8 @@ class DuckLakeConnector(SQLConnector):
         """Set the configured partition keys and sort order, if they differ.
 
         Only a configured part is applied (``None`` leaves the table's own
-        layout alone), and only when it differs from the table's current
-        layout: an unchanged ``SET PARTITIONED BY`` still adds a snapshot, and
+        layout alone; an empty list removes its keys), and only when it
+        differs from the table's current layout: an unchanged ``SET PARTITIONED BY`` still adds a snapshot, and
         an unchanged ``SET SORTED BY`` a new sort version too, every run.
         DuckLake applies a new layout to files written after it.
         """
@@ -620,16 +640,19 @@ class DuckLakeConnector(SQLConnector):
             return
         current = self.get_table_layout(target_schema_name, table_name)
         table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
-        if layout.partition is not None and not _same_keys(
-            layout.partition, current.partition
+        for kind, wanted, have in (
+            ("PARTITIONED", layout.partition, current.partition),
+            ("SORTED", layout.sort, current.sort),
         ):
-            keys = ", ".join(key.sql() for key in layout.partition)
-            logger.info("Partitioning table %s by %s", table_name, keys)
-            self.execute(f"ALTER TABLE {table_ref} SET PARTITIONED BY ({keys});")
-        if layout.sort is not None and not _same_keys(layout.sort, current.sort):
-            keys = ", ".join(key.sql() for key in layout.sort)
-            logger.info("Sorting table %s by %s", table_name, keys)
-            self.execute(f"ALTER TABLE {table_ref} SET SORTED BY ({keys});")
+            if wanted is None or _same_keys(wanted, have):
+                continue
+            if not wanted:  # an empty list removes the keys
+                logger.info("Resetting the %s keys of table %s", kind, table_name)
+                self.execute(f"ALTER TABLE {table_ref} RESET {kind} BY;")
+                continue
+            keys = ", ".join(key.sql() for key in wanted)
+            logger.info("Setting table %s %s BY %s", table_name, kind, keys)
+            self.execute(f"ALTER TABLE {table_ref} SET {kind} BY ({keys});")
 
     def _build_columns_sql(
         self,

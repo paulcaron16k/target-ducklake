@@ -38,6 +38,7 @@ __all__ = [
     "PartitionKey",
     "SortKey",
     "TableLayout",
+    "check_layout_config",
     "resolve_layout",
 ]
 
@@ -161,13 +162,42 @@ def resolve_layout(
     return TableLayout(partition=partition, sort=sort)
 
 
+def check_layout_config(config: Mapping[str, t.Any]) -> None:
+    """Check every stream's layout settings, without their columns.
+
+    Run at startup, so a typo in the override of a stream whose records never
+    arrive is reported too, as target-iceberg does. Column names are checked
+    per stream by ``resolve_layout``, once the stream's schema is known.
+
+    Raises:
+        LayoutError: As ``resolve_layout``, except for unknown columns.
+    """
+    overrides = config.get("stream_overrides") or {}
+    if not isinstance(overrides, dict):
+        msg = "stream_overrides must map stream names to layout settings."
+        raise LayoutError(msg)
+    for stream_name in ["", *overrides]:
+        where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
+        layout = _stream_layout(config, stream_name, where)
+        if layout.get("partition") is not None:
+            _partition_keys(layout["partition"], None, where, None)
+        if layout.get("sort_order") is not None:
+            _sort_keys(layout["sort_order"], None, where)
+
+
 def _stream_layout(
     config: Mapping[str, t.Any], stream_name: str, where: str
 ) -> dict[str, t.Any]:
     """``stream_defaults`` with this stream's ``stream_overrides`` merged over it."""
-    defaults = dict(config.get("stream_defaults") or {})
-    overrides = dict(config.get("stream_overrides") or {})
-    layout = {**defaults, **(overrides.get(stream_name) or {})}
+    defaults = config.get("stream_defaults") or {}
+    override = (config.get("stream_overrides") or {}).get(stream_name) or {}
+    if not isinstance(defaults, dict) or not isinstance(override, dict):
+        msg = (
+            f"{where}: stream_defaults and each stream_overrides entry must be "
+            "mappings."
+        )
+        raise LayoutError(msg)
+    layout = {**defaults, **override}
     unknown = sorted(set(layout) - _LAYOUT_KEYS)
     if unknown:
         msg = (
@@ -180,10 +210,13 @@ def _stream_layout(
     return layout
 
 
-def _column(name: object, by_name: Mapping[str, str], at: str) -> str:
+def _column(name: object, by_name: Mapping[str, str] | None, at: str) -> str:
+    """The table's name for a configured column (any name, without columns)."""
     if not isinstance(name, str) or not name:
         msg = f"{at}: a column name is required."
         raise LayoutError(msg)
+    if by_name is None:
+        return name.strip('"')
     column = by_name.get(name.strip('"').lower())
     if column is None:
         msg = (
@@ -197,7 +230,7 @@ def _column(name: object, by_name: Mapping[str, str], at: str) -> str:
 
 def _partition_keys(
     entries: object,
-    by_name: Mapping[str, str],
+    by_name: Mapping[str, str] | None,
     where: str,
     logger: logging.Logger | None,
 ) -> tuple[PartitionKey, ...]:
@@ -283,7 +316,7 @@ def _legacy_partition_keys(
 
 
 def _sort_keys(
-    entries: object, by_name: Mapping[str, str], where: str
+    entries: object, by_name: Mapping[str, str] | None, where: str
 ) -> tuple[SortKey, ...]:
     if not isinstance(entries, list):
         msg = f"{where}: sort_order must be a list of column names."

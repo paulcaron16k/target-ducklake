@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from singer_sdk import typing as th
 from singer_sdk.target_base import SQLTarget
 
+from target_ducklake.layout import LayoutError, check_layout_config
 from target_ducklake.sinks import (
     ducklakeSink,
 )
@@ -50,7 +51,11 @@ def _parse_layout_settings(config: dict) -> None:
     """Parse table layout settings given as JSON strings (env vars), in place."""
     for key in ("stream_defaults", "stream_overrides"):
         if isinstance(config.get(key), str):
-            config[key] = json.loads(config[key])
+            try:
+                config[key] = json.loads(config[key])
+            except json.JSONDecodeError as error:
+                msg = f"{key} is not valid JSON: {error}"
+                raise LayoutError(msg) from None
 
 
 class Targetducklake(SQLTarget):
@@ -59,6 +64,9 @@ class Targetducklake(SQLTarget):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.max_parallelism = 10 if self._drains_in_parallel() else 1
+        # Fail at startup on a malformed layout for any stream, including one
+        # whose records never arrive; columns are checked per stream later.
+        check_layout_config(self.config)
         self._MAX_RECORD_AGE_IN_MINUTES = float(
             self.config.get("max_record_age_minutes", 10.0)
         )

@@ -4046,7 +4046,10 @@ class TestTableLayout:
             self._layout(stream_overrides={"orders": layout})
         assert message in str(error.value)
 
-    def _run(self, tmp_path: Path, **config: object) -> None:
+    def _run(
+        self, tmp_path: Path, *, quoted_column: bool = False, **config: object
+    ) -> None:
+        """Load ROWS records; quoted_column adds a "Foo Bar" column needing quotes."""
         full_config = {
             "catalog_type": "sqlite",
             "catalog_url": str(tmp_path / "catalog.sqlite"),
@@ -4062,6 +4065,7 @@ class TestTableLayout:
                 "id": {"type": "integer"},
                 "Tenant": {"type": "string"},
                 "occurred_at": {"type": "string", "format": "date-time"},
+                **({"Foo Bar": {"type": "integer"}} if quoted_column else {}),
             },
         }
         messages = [
@@ -4079,6 +4083,7 @@ class TestTableLayout:
                         "id": i,
                         "Tenant": f"t{i % 3}",
                         "occurred_at": f"2024-01-0{i % 5 + 1}T10:00:00",
+                        **({"Foo Bar": i} if quoted_column else {}),
                     },
                 }
                 for i in range(self.ROWS)
@@ -4174,3 +4179,61 @@ class TestTableLayout:
         self._run(tmp_path, stream_overrides=overrides)
         layout, _, _ = self._state(tmp_path)
         assert layout.sort == (SortKey("Tenant", "ASC", "NULLS_LAST"),)
+
+    def test_quoted_column_sort_is_not_reapplied(self, tmp_path: Path):
+        """A sort column needing quotes compares equal to DuckLake's stored form."""
+        overrides = {"orders": {"sort_order": ['"Foo Bar" DESC', "Tenant"]}}
+        self._run(tmp_path, stream_overrides=overrides, quoted_column=True)
+        _, snapshots, _ = self._state(tmp_path)
+        self._run(tmp_path, stream_overrides=overrides, quoted_column=True)
+        _, snapshots_after_rerun, _ = self._state(tmp_path)
+        assert snapshots_after_rerun == snapshots + 1
+
+    def test_an_empty_list_resets_the_layout(self, tmp_path: Path):
+        """partition: [] and sort_order: [] remove the table's keys."""
+        overrides = {
+            "orders": {"partition": [{"column": "id"}], "sort_order": ["Tenant"]}
+        }
+        self._run(tmp_path, stream_overrides=overrides)
+        self._run(
+            tmp_path, stream_overrides={"orders": {"partition": [], "sort_order": []}}
+        )
+        layout, _, rows = self._state(tmp_path)
+        assert layout == TableLayout(partition=(), sort=())
+        assert rows == self.ROWS
+
+    @pytest.mark.parametrize(
+        ("config", "message"),
+        [
+            (
+                {"stream_overrides": {"never_sent": {"sort_order": ["id sideways"]}}},
+                "stream 'never_sent' sort_order[0]",
+            ),
+            (
+                {
+                    "stream_defaults": {
+                        "partition": [{"column": "a", "transform": "void"}]
+                    }
+                },
+                "stream_defaults partition[0]",
+            ),
+            ({"stream_overrides": "{not json"}, "stream_overrides is not valid JSON"),
+        ],
+        ids=["override-for-another-stream", "defaults", "bad-json"],
+    )
+    def test_layout_config_is_checked_at_startup(self, config: dict, message: str):
+        """Every stream's layout is checked when the target starts, as in Iceberg."""
+        base = {"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
+        with pytest.raises(LayoutError) as error:
+            Targetducklake(config={**base, **config})
+        assert message in str(error.value)
+
+    def test_a_non_mapping_override_is_rejected_at_startup(self):
+        """The config schema already refuses an override that isn't a mapping."""
+        base = {"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
+        with pytest.raises(
+            ConfigValidationError, match=r"config\['stream_overrides'\]"
+        ):
+            Targetducklake(config={**base, "stream_overrides": {"orders": "day"}})
+        with pytest.raises(LayoutError, match="must be mappings"):
+            resolve_layout({"stream_overrides": {"orders": "day"}}, "orders", ["id"])
