@@ -114,6 +114,8 @@ class ducklakeSink(SQLSink):
                 if self.config.get("table_config")
                 else None
             ),
+            # A shared config names columns in full; Postgres catalogs truncate.
+            aliases=self._column_name_mapping,
         )
 
         if not self.config.get("load_method"):

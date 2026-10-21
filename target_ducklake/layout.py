@@ -53,6 +53,8 @@ TRANSFORMS = frozenset({"identity", *_TIME_TRANSFORMS, "bucket"})
 _ICEBERG_ONLY_TRANSFORMS = frozenset({"truncate", "void"})
 _PARTITION_KEYS = frozenset({"column", "transform", "num_buckets", "width", "name"})
 _LAYOUT_KEYS = frozenset({"partition", "sort_order"})
+# Characters target-iceberg's conform_name strips from identifiers.
+_NOT_KEPT = re.compile(r"[^a-zA-Z0-9_\-\.\s]")
 # target-iceberg's per-stream settings. Those that only configure Iceberg are
 # ignored, so a config shared with target-iceberg works; those that change
 # what data is loaded are rejected until implemented, never ignored.
@@ -63,8 +65,11 @@ _UNIMPLEMENTED_LAYOUT_KEYS = {
     "write_mode": "DUCKLKD-41",
     "key_properties": "DUCKLKD-41",
     "type_source": "DUCKLKD-43",
-    "on_error": "DUCKLKD-43",
 }
+# target-iceberg's on_error applies only to type_source columns, so without
+# type_source it changes nothing; its schema injects on_error: raise into
+# every stream_defaults. With type_source it is rejected along with it.
+_TYPE_SOURCE_ONLY_KEY = "on_error"
 
 # "column", or "column DESC", "column ASC NULLS FIRST": the sort entry forms.
 _SORT_ENTRY = re.compile(
@@ -130,12 +135,14 @@ def _quoted(column: str) -> str:
     return '"' + column.replace('"', '""') + '"'
 
 
-def resolve_layout(
+def resolve_layout(  # noqa: PLR0913 (the last two are optional stream context)
     config: Mapping[str, t.Any],
     stream_name: str,
     columns: Sequence[str],
     logger: logging.Logger | None = None,
+    *,
     table: tuple[str, str] | None = None,
+    aliases: Mapping[str, str] | None = None,
 ) -> TableLayout:
     """Resolve and validate one stream's layout from the target config.
 
@@ -153,6 +160,8 @@ def resolve_layout(
             declare it. Iceberg-only settings are reported once, at startup,
             by ``check_layout_config``.
         table: ``(schema, table)``, how ``table_config`` keys its tables.
+        aliases: Configured column names mapped to the table's, for columns
+            whose names were truncated (Postgres catalogs cap them at 63).
 
     Returns:
         The stream's layout.
@@ -166,7 +175,9 @@ def resolve_layout(
     where = f"stream {stream_name!r}"
     layout = _stream_layout(config, stream_name, where)
     by_name = {column.lower(): column for column in columns}
-    block = _table_config_block(config, table)
+    for name, column in (aliases or {}).items():
+        by_name.setdefault(name.lower(), column)
+    block = _table_config_block(config, table, logger)
     file_where = f"table_config {'.'.join(table or ())}"
 
     partition = None
@@ -227,14 +238,7 @@ def check_layout_config(
             own = overrides.get(stream_name) or {}
         else:
             own = config.get("stream_defaults") or {}
-        if (ignored := sorted(set(own) & _ICEBERG_ONLY_LAYOUT_KEYS)) and logger:
-            # Reported where it is set, not again for every override inheriting it.
-            logger.info(
-                "%s: ignoring the Iceberg-only setting(s) %s. DuckLake deletes always "
-                "write delete files (merge-on-read); compaction is maintenance.",
-                where,
-                ignored,
-            )
+        _report_ignored(own, where, logger)
         if layout.get("partition") is not None:
             _partition_keys(layout["partition"], None, where, logger)
         if layout.get("sort_order") is not None:
@@ -255,6 +259,29 @@ def _check_table_config(
             _ordering_sort_keys(block["ordering"], None, where, logger)
 
 
+def _report_ignored(
+    own: Mapping[str, t.Any], where: str, logger: logging.Logger | None
+) -> None:
+    """Report the ignored settings a stream_defaults/override entry sets itself.
+
+    Reported where they are set, not again for every override inheriting them.
+    """
+    if logger is None:
+        return
+    if ignored := sorted(set(own) & _ICEBERG_ONLY_LAYOUT_KEYS):
+        logger.info(
+            "%s: ignoring the Iceberg-only setting(s) %s. DuckLake deletes always "
+            "write delete files (merge-on-read); compaction is maintenance.",
+            where,
+            ignored,
+        )
+    if _TYPE_SOURCE_ONLY_KEY in own and "type_source" not in own:
+        logger.info(
+            "%s: ignoring 'on_error', which applies only to type_source columns.",
+            where,
+        )
+
+
 def _stream_layout(
     config: Mapping[str, t.Any], stream_name: str, where: str
 ) -> dict[str, t.Any]:
@@ -273,6 +300,8 @@ def _stream_layout(
         )
         raise LayoutError(msg)
     layout = {**defaults, **override}
+    if "type_source" not in layout:
+        layout.pop(_TYPE_SOURCE_ONLY_KEY, None)
     if unimplemented := sorted(set(layout) & set(_UNIMPLEMENTED_LAYOUT_KEYS)):
         issues = sorted({_UNIMPLEMENTED_LAYOUT_KEYS[key] for key in unimplemented})
         msg = (
@@ -282,7 +311,9 @@ def _stream_layout(
             "silently appends where upsert was meant."
         )
         raise LayoutError(msg)
-    if unknown := sorted(set(layout) - _LAYOUT_KEYS - _ICEBERG_ONLY_LAYOUT_KEYS):
+    if unknown := sorted(
+        set(layout) - _LAYOUT_KEYS - _ICEBERG_ONLY_LAYOUT_KEYS - {_TYPE_SOURCE_ONLY_KEY}
+    ):
         msg = (
             f"{where}: unknown stream_defaults/stream_overrides setting(s) "
             f"{unknown}. target-ducklake applies {sorted(_LAYOUT_KEYS)} and ignores "
@@ -317,6 +348,44 @@ def _read_table_config(path: str) -> dict[str, t.Any]:
     return document
 
 
+def _mapping(value: object, what: str) -> dict[str, t.Any]:
+    """``value`` as a mapping (``{}`` for null), or a LayoutError naming ``what``."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        msg = f"table_config: {what} must be an object, got {type(value).__name__}."
+        raise LayoutError(msg)
+    return value
+
+
+def _file_tables(
+    document: Mapping[str, t.Any],
+) -> dict[tuple[str, str], dict[str, t.Any]]:
+    """Every table block of the file by (schema, table), shapes checked.
+
+    Version 2 nests tables under namespaces (the namespace is the target
+    schema); version 1 keys them 'namespace.table', as target-iceberg reads it,
+    split at the last dot as Zamboni's version 1 did.
+    """
+    tables: dict[tuple[str, str], dict[str, t.Any]] = {}
+    if "namespaces" in document:
+        namespaces = _mapping(document["namespaces"], "namespaces")
+        for namespace, raw_entry in namespaces.items():
+            entry = _mapping(raw_entry, f"namespaces.{namespace}")
+            entry_tables = _mapping(
+                entry.get("tables"), f"namespaces.{namespace}.tables"
+            )
+            for name, block in entry_tables.items():
+                tables[namespace, name] = _mapping(
+                    block, f"namespaces.{namespace}.tables.{name}"
+                )
+    else:
+        for key, block in _mapping(document.get("tables"), "tables").items():
+            namespace, _, name = key.rpartition(".")
+            tables[namespace, name] = _mapping(block, f"tables.{key}")
+    return tables
+
+
 def _table_config_blocks(
     config: Mapping[str, t.Any],
 ) -> list[tuple[str, dict[str, t.Any]]]:
@@ -325,37 +394,61 @@ def _table_config_blocks(
     Includes ``defaults`` itself, so a malformed default is reported too.
     """
     document = read_table_config(config["table_config"])
-    defaults = document.get("defaults") or {}
+    defaults = _mapping(document.get("defaults"), "defaults")
     blocks = [("defaults", defaults)]
-    if "namespaces" in document:  # version 2
-        for namespace, entry in (document.get("namespaces") or {}).items():
-            for name, block in ((entry or {}).get("tables") or {}).items():
-                blocks.append((f"{namespace}.{name}", {**defaults, **(block or {})}))
-    else:  # version 1, as target-iceberg reads it
-        for key, block in (document.get("tables") or {}).items():
-            blocks.append((key, {**defaults, **(block or {})}))
+    blocks += [
+        (f"{schema}.{name}", {**defaults, **block})
+        for (schema, name), block in _file_tables(document).items()
+    ]
     return blocks
 
 
+def _conformed(name: str) -> str:
+    """A name conformed as target-iceberg (and the SQL SDK) conforms it."""
+    conformed = _NOT_KEPT.sub("", name).lower().strip()
+    conformed = re.sub(r"[.\- ]", "_", conformed)
+    if conformed and conformed[0].isdigit():
+        conformed = "abcdefghij"[int(conformed[0])] + conformed[1:]
+    return conformed
+
+
 def _table_config_block(
-    config: Mapping[str, t.Any], table: tuple[str, str] | None
+    config: Mapping[str, t.Any],
+    table: tuple[str, str] | None,
+    logger: logging.Logger | None = None,
 ) -> dict[str, t.Any]:
     """One table's block of the file, merged over ``defaults``; ``{}`` if unset.
 
     As in Zamboni, a key the table's block contains wins, whatever its value,
-    and lists replace whole. Version 2 nests tables under namespaces (the
-    namespace is the target schema); version 1 keys them 'namespace.table'.
+    and lists replace whole. The table is matched case-insensitively, as
+    DuckDB matches identifiers, then by target-iceberg's conformed name (a
+    file written for target-iceberg names ``Orders Daily`` ``orders_daily``).
+    A table with no block takes ``defaults``, which is logged.
     """
     if not config.get("table_config") or table is None:
         return {}
     document = read_table_config(config["table_config"])
+    defaults = _mapping(document.get("defaults"), "defaults")
+    tables = _file_tables(document)
     schema, name = table
-    if "namespaces" in document:
-        namespace = (document.get("namespaces") or {}).get(schema) or {}
-        block = (namespace.get("tables") or {}).get(name)
-    else:
-        block = (document.get("tables") or {}).get(f"{schema}.{name}")
-    return {**(document.get("defaults") or {}), **(block or {})}
+    block = None
+    for key_of in (str.lower, _conformed):
+        wanted = (key_of(schema), key_of(name))
+        block = next(
+            (
+                block
+                for (file_schema, file_name), block in tables.items()
+                if (key_of(file_schema), key_of(file_name)) == wanted
+            ),
+            None,
+        )
+        if block is not None:
+            break
+    if block is None and logger is not None:
+        logger.info(
+            "table_config has no block for %s.%s; using its defaults.", schema, name
+        )
+    return {**defaults, **(block or {})}
 
 
 def _column(name: object, by_name: Mapping[str, str] | None, at: str) -> str:

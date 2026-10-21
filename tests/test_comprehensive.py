@@ -4018,7 +4018,6 @@ class TestTableLayout:
             ({"write_mode": "upsert"}, "DUCKLKD-41"),
             ({"key_properties": ["id"]}, "DUCKLKD-41"),
             ({"type_source": {"id": "integer"}}, "DUCKLKD-43"),
-            ({"on_error": "null"}, "DUCKLKD-43"),
             ({"partiton": []}, "unknown stream_defaults/stream_overrides setting"),
         ],
         ids=[
@@ -4035,7 +4034,6 @@ class TestTableLayout:
             "write-mode",
             "key-properties",
             "type-source",
-            "on-error",
             "misspelt-layout-key",
         ],
     )
@@ -4443,3 +4441,97 @@ class TestTableLayout:
             sort=(SortKey("id", "ASC", "NULLS_LAST"),),
         )
         assert rows == self.ROWS
+
+    def test_target_iceberg_injected_defaults_are_accepted(
+        self, capfd: pytest.CaptureFixture[str]
+    ):
+        """stream_defaults as target-iceberg resolves it (its schema defaults) works."""
+        defaults = {
+            "partition": [{"column": "id"}],
+            "on_error": "raise",
+            "delete_strategy": "copy_on_write",
+            "merge_on_read_maintenance_acknowledged": False,
+        }
+        base = {"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
+        Targetducklake(config={**base, "stream_defaults": defaults})
+        assert "ignoring 'on_error'" in capfd.readouterr().err
+        layout = resolve_layout({"stream_defaults": defaults}, "orders", self.COLUMNS)
+        assert layout.partition == (PartitionKey("id", "identity"),)
+        with pytest.raises(LayoutError, match="DUCKLKD-43"):
+            resolve_layout(
+                {"stream_defaults": {"type_source": {}, "on_error": "null"}},
+                "orders",
+                self.COLUMNS,
+            )
+
+    @pytest.mark.parametrize("version", [1, 2])
+    @pytest.mark.parametrize(
+        ("schema", "table"),
+        [("S", "Orders"), ("s", "ORDERS"), ("s", "Orders Daily")],
+        ids=["upper-schema", "upper-table", "conformed"],
+    )
+    def test_table_config_matches_tables_like_duckdb_and_target_iceberg(
+        self, tmp_path: Path, version: int, schema: str, table: str
+    ):
+        """Names match case-insensitively, and by target-iceberg's conformed name."""
+        name = "orders_daily" if " " in table else "orders"
+        block = {"partition": [{"column": "id"}]}
+        document: dict = (
+            {"tables": {f"s.{name}": block}}
+            if version == 1
+            else {"namespaces": {"s": {"tables": {name: block}}}}
+        )
+        config = {"table_config": self._table_config(tmp_path, document)}
+        layout = resolve_layout(config, "x", self.COLUMNS, table=(schema, table))
+        assert layout.partition == (PartitionKey("id", "identity"),)
+
+    def test_a_table_missing_from_table_config_is_logged(self, tmp_path: Path):
+        """A table with no block is logged, rather than silently taking defaults."""
+        config = {"table_config": self._table_config(tmp_path, {"tables": {}})}
+        logger = Mock()
+        resolve_layout(config, "x", self.COLUMNS, logger, table=("s", "absent"))
+        message, *args = logger.info.call_args.args
+        assert message.startswith("table_config has no block for")
+        assert args == ["s", "absent"]
+
+    @pytest.mark.parametrize(
+        "document",
+        [
+            {"defaults": [1]},
+            {"defaults": "x"},
+            {"tables": [1]},
+            {"tables": {"s.t": "x"}},
+            {"version": 2, "namespaces": [1]},
+            {"namespaces": {"s": {"tables": [1]}}},
+            {"namespaces": {"s": "x"}},
+        ],
+        ids=[
+            "defaults-list",
+            "defaults-string",
+            "tables-list",
+            "table-string",
+            "namespaces-list",
+            "namespace-tables-list",
+            "namespace-string",
+        ],
+    )
+    def test_a_malformed_table_config_shape_is_a_layout_error(
+        self, tmp_path: Path, document: dict
+    ):
+        """Wrong JSON shapes fail at startup with the named message, not a traceback."""
+        base = {"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
+        path = self._table_config(tmp_path, document)
+        with pytest.raises(LayoutError, match="table_config"):
+            Targetducklake(config={**base, "table_config": path})
+
+    def test_configured_names_match_through_column_truncation(self):
+        """A column named in full in a shared config matches its truncated name."""
+        long_name = "c" * 70
+        config = {"stream_overrides": {"orders": {"sort_order": [long_name]}}}
+        layout = resolve_layout(
+            config,
+            "orders",
+            ["id", "c" * 63],
+            aliases={long_name: "c" * 63},
+        )
+        assert layout.sort == (SortKey("c" * 63, "ASC", "NULLS_LAST"),)

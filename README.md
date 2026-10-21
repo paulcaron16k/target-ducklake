@@ -84,10 +84,11 @@ stream_overrides:
 - **`sort_order`:** column names, each optionally followed by `ASC`/`DESC` and `NULLS FIRST`/`NULLS LAST`. DuckLake writes each new file's rows in this order.
 - **Column names** are the table's (flattened names use `__`), matched case-insensitively. An unknown key, transform or column fails the stream with a message naming it, rather than being ignored.
 - **When applied:** a new table gets the layout at creation. On an existing table, a changed layout is applied as metadata, and files written afterwards follow it (unlike target-iceberg, where partitioning is fixed at creation). An unchanged layout is left alone. A stream with no `partition` or `sort_order` keeps whatever layout its table already has; an empty list (`partition: []`, `sort_order: []`) removes the table's keys.
-- **`table_config`:** the path to a Zamboni `table-config.json`, the file target-iceberg reads. Both version 1 (tables keyed `namespace.table`) and version 2 (`namespaces.<ns>.tables.<table>`) work; the namespace is the target schema. A table's `partition` sets its partition keys, and an `ordering` with `mode: sort` (`[{column, direction, nulls}]`) sets its sort order (`mode: none` removes it). A key in the table's block wins over `defaults`, and lists replace whole, as in Zamboni. A stream's own `partition` and `sort_order` win over the file, and the file wins over `partition_fields`.
+- **`table_config`:** the path to a Zamboni `table-config.json`, the file target-iceberg reads. Tables are matched case-insensitively, then by target-iceberg's conformed name (`Orders Daily` → `orders_daily`); a table with no block takes `defaults` (logged), so a `defaults.partition` must name columns every stream has, as in target-iceberg. Both version 1 (tables keyed `namespace.table`) and version 2 (`namespaces.<ns>.tables.<table>`) work; the namespace is the target schema. A table's `partition` sets its partition keys, and an `ordering` with `mode: sort` (`[{column, direction, nulls}]`) sets its sort order (`mode: none` removes it). A key in the table's block wins over `defaults`, and lists replace whole, as in Zamboni. A stream's own `partition` and `sort_order` win over the file, and the file wins over `partition_fields`.
 
 **Configs shared with target-iceberg.** A config written for target-iceberg works here. What only configures Iceberg is accepted and ignored with a log line at startup:
 - `delete_strategy` and `merge_on_read_maintenance_acknowledged` (DuckLake deletes always write delete files, i.e. merge-on-read; compaction is maintenance);
+- `on_error` without `type_source`, which it alone applies to (target-iceberg injects `on_error: raise` into `stream_defaults`);
 - a partition `name`;
 - the `truncate` and `void` transforms (that entry is skipped);
 - `ordering` with `mode: zorder`;
@@ -97,9 +98,9 @@ If skipping `truncate`/`void` leaves no partition key, the partition counts as n
 
 Settings that would change what data is loaded are **rejected** until implemented, never ignored:
 - `write_mode` and `key_properties` (DUCKLKD-41);
-- `type_source` and `on_error` (DUCKLKD-43).
+- `type_source`, with any `on_error` (DUCKLKD-43).
 
-target-iceberg ignores `write_mode`, and silently appends where upsert was meant. Unknown keys, unknown transforms and columns the stream lacks are rejected too.
+target-iceberg ignores `write_mode`, and silently appends where upsert was meant. Unknown keys, unknown transforms and columns the stream lacks are rejected too. Column names may be given in full where a Postgres catalog truncates them to 63 characters.
 
 - **Checked at startup:** the `stream_defaults`/`stream_overrides` settings of every stream, and every table's layout sections in `table_config`, are checked when the target starts (a missing or invalid file fails here). Column names, and the older `partition_fields`, are checked when each stream's schema arrives.
 - **Both settings can be given as JSON strings** (for environment variables).
