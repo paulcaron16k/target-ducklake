@@ -35,6 +35,10 @@ def _is_fractional(staged: pa.DataType) -> bool:
     return pa.types.is_decimal(staged) or pa.types.is_floating(staged)
 
 
+# The SDK's record metadata column holding the record's table version.
+VERSION_COLUMN = "_sdc_table_version"
+
+
 class ducklakeSink(SQLSink):
     """ducklake target sink class."""
 
@@ -57,6 +61,10 @@ class ducklakeSink(SQLSink):
             self.base_temp_file_dir, f"{self.stream_name}_{uuid.uuid4()}"
         )
         self.files_saved = 0
+        # Overwrite: each batch's parquet file, loaded together at clean_up.
+        self._staged_files: list[str] = []
+        # ACTIVATE_VERSION: the table versions of the records received.
+        self._versions_received: set[int] = set()
         self.convert_tz_to_utc = self.config.get("convert_tz_to_utc", False)
 
         # NOTE: we probably don't need all this logging, but useful for debugging while target is in development
@@ -218,7 +226,6 @@ class ducklakeSink(SQLSink):
             table_name=self.target_table,
             columns=self.ducklake_schema,
             partition_fields=self.partition_fields,
-            overwrite_table=self.should_overwrite_table,
         )
         self._table_columns = list(table_types)
         # DuckDB matches identifiers case-insensitively, and the singer-sdk
@@ -292,6 +299,9 @@ class ducklakeSink(SQLSink):
 
     def process_record(self, record: dict, context: dict) -> None:
         """Process the record and flatten if necessary."""
+        # Present when add_record_metadata is on: the record's table version.
+        if (version := record.get(VERSION_COLUMN)) is not None:
+            self._versions_received.add(version)
         record_flatten = flatten_record(
             record,
             flatten_schema=self.flatten_schema,
@@ -430,17 +440,18 @@ class ducklakeSink(SQLSink):
         temp_file_path = self.write_temp_file(context)
         self.logger.info(f"Temp file path: {temp_file_path}")
 
+        if self.should_overwrite_table:
+            # Kept, and loaded with every other batch in one transaction at
+            # clean_up, so readers see the old table until the new one is whole.
+            self._staged_files.append(temp_file_path)
+            return
+
         # get the columns from the file and the table
         file_columns = [col["name"] for col in self.ducklake_schema]
         table_columns = self._table_columns
 
-        # If no key properties, load method is append or overwrite, or table should be overwritten
-        # we simply insert the data. Table is already truncated in setup if load method is overwrite
-        if (
-            not self.key_properties
-            or self.load_method in ["append", "overwrite"]
-            or self.should_overwrite_table
-        ):
+        # If no key properties, or load method is append, we simply insert the data.
+        if not self.key_properties or self.load_method == "append":
             self.connector.insert_into_table(
                 file_location=temp_file_path,
                 target_schema_name=self.target_schema,
@@ -468,9 +479,28 @@ class ducklakeSink(SQLSink):
         )
 
     def clean_up(self) -> None:
-        """Perform per-stream cleanup."""
-        super().clean_up()
-        # Remove this stream's dedicated temp directory
+        """Perform per-stream cleanup.
+
+        For an overwrite, replace the table's rows with every staged batch in
+        one transaction first. The SDK cleans up after the final drain and
+        before it writes STATE, so STATE follows the commit, and a failed
+        replace fails the run with the old rows intact.
+        """
+        try:
+            if self.should_overwrite_table:
+                self.connector.replace_table_contents(
+                    file_locations=self._staged_files,
+                    target_schema_name=self.target_schema,
+                    table_name=self.target_table,
+                    file_columns=[col["name"] for col in self.ducklake_schema],
+                    target_table_columns=self._table_columns,
+                )
+            super().clean_up()
+        finally:
+            self._remove_temp_file_dir()
+
+    def _remove_temp_file_dir(self) -> None:
+        """Remove this stream's dedicated temp directory."""
         if hasattr(self, "temp_file_dir"):
             self.logger.info(
                 f"Cleaning up temp directory for stream {self.stream_name}: {self.temp_file_dir}"
@@ -484,29 +514,48 @@ class ducklakeSink(SQLSink):
                 )
 
     def activate_version(self, new_version: int) -> None:
-        """Handle ACTIVATE_VERSION message.
+        """Handle ACTIVATE_VERSION: remove rows that are not in the activated version.
 
-        Override the base class method.
-        TODO: figure out if this affects other taps, for now we only needed to add this for tap-redshift:
-        https://github.com/definite-app/tap-redshift/blob/6f5b84471537dd8004cb54931e920163bb11d39e/tap_redshift/__init__.py#L366
+        A full-table tap sends its records with a table version, then
+        ACTIVATE_VERSION for it; rows of any other version (or none) are gone
+        at the source and are deleted. The target drains this sink first (see
+        ``Targetducklake._process_activate_version_message``), so no record
+        of the version is still buffered.
+
+        Nothing is deleted when:
+        - records carry no version (``add_record_metadata`` is off);
+        - no record of this version has been received, as when a tap
+          announces the version before sending its records, which would
+          otherwise empty the table for the whole sync;
+        - the stream is an overwrite, which replaces the whole table at
+          clean_up anyway, and must not empty it early.
         """
-        self.logger.info(
-            f"Activate version {new_version} for stream {self.stream_name}"
-        )
-
-        # Check if table exists using our DuckDB-based method
-        if not self.connector._check_if_table_exists(
-            self.target_schema, self.target_table
-        ):
-            self.logger.info(
-                f"Table {self.target_schema}.{self.target_table} does not exist, "
-                "skipping version activation"
+        if not self.include_sdc_metadata_properties:
+            self.logger.warning(
+                f"Ignoring ACTIVATE_VERSION {new_version} for {self.stream_name}: "
+                "records carry their table version only with add_record_metadata, "
+                "so rows of older versions can't be told apart."
             )
             return
-
-        # For now, just log the version activation
-        self.logger.info(
-            f"Version {new_version} activated for {self.target_schema}.{self.target_table}"
+        if self.should_overwrite_table:
+            self.logger.info(
+                f"ACTIVATE_VERSION {new_version} for {self.stream_name}: the "
+                "overwrite replaces the whole table at the end of the stream."
+            )
+            return
+        if new_version not in self._versions_received:
+            self.logger.info(
+                f"ACTIVATE_VERSION {new_version} for {self.stream_name} arrived "
+                "before any of its records; nothing to remove yet."
+            )
+            return
+        self.connector.delete_other_versions(
+            target_schema_name=self.target_schema,
+            table_name=self.target_table,
+            version_column=self._column_name_mapping.get(
+                VERSION_COLUMN, VERSION_COLUMN
+            ),
+            version=new_version,
         )
 
 

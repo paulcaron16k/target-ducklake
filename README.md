@@ -25,7 +25,7 @@ Supports append, merge, and overwrite load methods (default is merge). The load 
 | `default_target_schema` | string | ❌ | - | Default database schema where data should be written. If not provided schema will attempt to be inferred from the stream name (inferring schema only works for database extractors ) |
 | `target_schema_prefix` | string | ❌ | - | Prefix to add to the target schema name. If not provided, no prefix will be added |
 | `add_record_metadata` | boolean | ❌ | `false` | When True, automatically adds Singer Data Capture (SDC) metadata columns to target tables |
-| `load_method` | string | ❌ | `"merge"` | Method to use for loading data into the target table: append, merge, or overwrite |
+| `load_method` | string | ❌ | `"merge"` | Method to use for loading data into the target table: append, merge, or overwrite. See [Overwrite and ACTIVATE_VERSION](#overwrite-and-activate_version). |
 | `flatten_max_level` | integer | ❌ | `0` | Maximum depth for flattening nested fields. Set to 0 to disable flattening |
 | `temp_file_dir` | string | ❌ | `"temp_files/"` | Directory path for storing temporary parquet files |
 | `max_batch_size` | integer | ❌ | `10000` | Maximum number of records to process in a single batch |
@@ -33,7 +33,7 @@ Supports append, merge, and overwrite load methods (default is merge). The load 
 | `auto_cast_timestamps` | boolean | ❌ | `false` | When True, automatically attempts to cast timestamp-like fields to timestamp types in ducklake |
 | `convert_tz_to_utc` | boolean | ❌ | `false` | When True, converts timezone-aware date-time values to UTC before loading, so a timestamp column without time zone stores the UTC time. When False, such a column stores each value's local wall-clock time (its offset is dropped). With the default, a timestamp column fed values in different offsets holds local times that aren't directly comparable; turn this on, or declare the column `timestamptz` (via `x-sql-datatype`), to compare instants. Either way, a `timestamptz` column stores the correct instant, and values with any offset, such as `+05:30`, load. Values without a time zone are loaded as given; a `timestamptz` column reads them in the DuckDB session's time zone. |
 | `validate_records` | boolean | ❌ | `false` | Whether to validate the schema of the incoming streams |
-| `overwrite_if_no_pk` | boolean | ❌ | `false` | When True, truncates the target table before inserting records if no primary keys are defined in the stream. Overrides load_method. |
+| `overwrite_if_no_pk` | boolean | ❌ | `false` | When True, a stream without primary keys replaces the target table's rows, as `load_method: overwrite` does. Overrides load_method. |
 | `max_column_length` | integer | ❌ | `63` | Maximum length for column names. Only applied when `catalog_type` is `postgres`. Names exceeding this limit are truncated. Colliding truncated names get a `_{i}` suffix. Set to `0` to disable. See [ducklake#619](https://github.com/duckdb/ducklake/issues/619). |
 | `parallel_draining` | boolean | ❌ | `true` | When True, enables parallel draining with `max_parallelism=10` (Meltano default). When False, sets `max_parallelism=1` to disable parallel draining. Ignored when `catalog_type` is `sqlite`: SQLite allows one writer at a time, so its sinks are always drained one at a time (a log line says so). |
 | `max_record_age_minutes` | number | ❌ | `10.0` | Maximum age in minutes that records can sit in a sink before a drain is forced. Tune lower for more frequent flushes, higher for larger batches. |
@@ -125,6 +125,19 @@ Supported hints (case and spacing ignored):
 Hints naming the type a property gets anyway are accepted without a warning: a text type (`text`, `varchar(n)`, `varchar(max)`, `char(n)`, `nvarchar(n)`, `citext`) on a `string` property, and `boolean`/`bool` on a `boolean` property. On another JSON type they warn as unsupported. Deliberately unsupported, so they keep the JSON type's column: `tinyint` (MySQL uses `tinyint(1)` for booleans), `datetime` (MySQL's meaning is the opposite of ISO's), `timetz` and `time with time zone` (DuckLake's Parquet files drop the offset without converting it), `bit` and binary types.
 
 Existing tables keep their column types, apart from safe integer and float widenings. Values are staged at an existing column's own type where the stream's type would change them: a number column into an existing DECIMAL, REAL or DOUBLE column, a whole-number decimal (such as `bigint unsigned`) into an existing integer column, and a string property into an existing text column, whose text is kept as sent whatever its hint. So a `double` hint on a column that already exists as DECIMAL(38, 9) still stores DECIMAL(38, 9) values: `1.5e-12` is stored as 0, and a warning reports how many values were rounded. Recreate the column to store doubles.
+
+### Overwrite and ACTIVATE_VERSION
+
+**Overwrite** (`load_method: overwrite`, or `overwrite_if_no_pk` for a stream without primary keys) replaces the table's rows atomically. Each batch is staged as a Parquet file in `temp_file_dir`, and at the end of the stream one transaction deletes the old rows and inserts every staged batch. Readers see the old table until that commit, and a run that fails or is interrupted leaves the old rows in place. STATE is emitted only after the commit. Two consequences:
+- `temp_file_dir` needs room for the whole stream, not one batch.
+- A stream with no records still empties the table, as before.
+
+**ACTIVATE_VERSION**, as full-table taps send it, removes rows that are gone at the source. The tap tags each record with a table version, then sends `ACTIVATE_VERSION` for that version. The target first loads any buffered records, then deletes every row whose `_sdc_table_version` is not the activated version, including rows loaded without a version. Rows are hard-deleted. Some cases remove nothing:
+- **Without `add_record_metadata`:** records carry no version, so the message is ignored with a warning.
+- **A version announced before any of its records** (as taps do at the start of a sync) is a no-op, so the table never empties mid-sync.
+- **An overwrite stream** ignores versions, since it replaces the whole table anyway.
+
+Between a sync's first batch and its `ACTIVATE_VERSION`, readers see the new rows next to rows of the old version. Set `process_activate_version_messages: false` to ignore the message entirely.
 
 ### Ducklake Schema Migration From 0.1 to 0.2
 Solution to this issue: https://github.com/duckdb/ducklake/issues/240

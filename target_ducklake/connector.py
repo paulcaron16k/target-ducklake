@@ -507,7 +507,6 @@ class DuckLakeConnector(SQLConnector):
         table_name: str,
         columns: list[dict[str, str]],
         partition_fields: list[dict[str, str]] | None = None,
-        overwrite_table: bool = False,
     ) -> dict[str, str]:
         """Prepare the table for the target schema.
         If the table doesn't exist, create it.
@@ -538,13 +537,6 @@ class DuckLakeConnector(SQLConnector):
             # widen any existing column whose desired type is wider (uses pre-add snapshot)
             self._reconcile_column_types(
                 target_schema_name, table_name, columns, existing_column_types
-            )
-
-        # truncate the table if necessary
-        if overwrite_table:
-            logger.info(f"Truncating table {table_name} in schema {target_schema_name}")
-            self.execute(
-                f"TRUNCATE TABLE {self.catalog_name}.{target_schema_name}.{table_name};"
             )
 
         # Add partition fields if any
@@ -630,6 +622,60 @@ class DuckLakeConnector(SQLConnector):
         """
         logger.info(f"Inserting into table {table_name} with SQL {insert_sql}")
         self.execute(insert_sql)
+
+    def replace_table_contents(
+        self,
+        file_locations: list[str],
+        target_schema_name: str,
+        table_name: str,
+        file_columns: list[str],
+        target_table_columns: list[str],
+    ) -> None:
+        """Replace every row of the table with the rows of the parquet files.
+
+        The DELETE and the INSERT run in one transaction, so readers see the
+        old rows until the new ones are committed, and a failure leaves the
+        old rows in place. With no files, the table is emptied.
+        """
+        table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
+        statements = [f"DELETE FROM {table_ref};"]  # noqa: S608 (identifiers only)
+        if file_locations:
+            columns_sql = self._build_columns_sql(file_columns, target_table_columns)
+            files_sql = ", ".join(f"'{location}'" for location in file_locations)
+            statements.append(
+                # Identifiers from the config and local staging paths; no data.
+                f"INSERT INTO {table_ref} "  # noqa: S608
+                f"SELECT {columns_sql} FROM read_parquet([{files_sql}]);"
+            )
+        replace_sql = "\n".join(["BEGIN TRANSACTION;", *statements, "COMMIT;"])
+        logger.info(
+            "Replacing the contents of table %s with %d staged file(s)",
+            table_name,
+            len(file_locations),
+        )
+        self.execute(replace_sql)
+
+    def delete_other_versions(
+        self,
+        target_schema_name: str,
+        table_name: str,
+        version_column: str,
+        version: int,
+    ) -> None:
+        """Delete the rows whose version is not the given one, in one transaction.
+
+        Rows without a version (loaded before versions were recorded) are
+        deleted too: after a full refresh, the table holds that version only.
+        """
+        table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
+        delete_sql = (
+            "BEGIN TRANSACTION;\n"
+            f'DELETE FROM {table_ref} WHERE "{version_column}" '
+            f"IS DISTINCT FROM {int(version)};\n"
+            "COMMIT;"
+        )
+        logger.info("Deleting rows of %s not in version %s", table_name, version)
+        self.execute(delete_sql)
 
     @staticmethod
     def _build_key_match_sql(

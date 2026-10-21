@@ -3596,3 +3596,235 @@ class TestSqliteCatalogDraining:
         ):
             target._drain_all(["first", "second"], parallelism=2)
         assert "Another sink also failed to drain: second" in capfd.readouterr().err
+
+
+class TestAtomicOverwrite:
+    """An overwrite replaces the table in one transaction at the end of the stream.
+
+    Drives the real sink lifecycle on an in-memory catalog holding old rows.
+    """
+
+    @staticmethod
+    def _sink(
+        tmp_path: Path,
+        con: duckdb.DuckDBPyConnection,
+        key_properties: tuple[str, ...] = ("id",),
+        **config: object,
+    ) -> ducklakeSink:
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        con.execute("CREATE SCHEMA ducklake_catalog.s")
+        con.execute("CREATE TABLE ducklake_catalog.s.t (id BIGINT, v VARCHAR)")
+        con.execute("INSERT INTO ducklake_catalog.s.t VALUES (1, 'old'), (2, 'old')")
+        full_config = {
+            "catalog_url": "test.db",
+            "data_path": str(tmp_path / "data"),
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging"),
+            "load_method": "overwrite",
+            **config,
+        }
+        target = Mock()
+        target.config = full_config
+        connector = DuckLakeConnector(full_config)
+        patch.object(
+            connector, "execute", side_effect=lambda sql: con.execute(sql)
+        ).start()
+        schema = {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}, "v": {"type": "string"}},
+        }
+        sink = ducklakeSink(
+            target=target,
+            stream_name="t",
+            schema=schema,
+            key_properties=list(key_properties),
+            connector=connector,
+        )
+        sink.setup()
+        return sink
+
+    @staticmethod
+    def _rows(con: duckdb.DuckDBPyConnection) -> list[tuple]:
+        return con.execute("SELECT * FROM ducklake_catalog.s.t ORDER BY ALL").fetchall()
+
+    def teardown_method(self) -> None:
+        """Undo the execute() patch the sink helper started."""
+        patch.stopall()
+
+    @pytest.mark.parametrize(
+        "config",
+        [{}, {"load_method": "append", "overwrite_if_no_pk": True}],
+        ids=["load-method-overwrite", "overwrite-if-no-pk"],
+    )
+    def test_readers_see_the_old_table_until_the_new_one_is_complete(
+        self, tmp_path: Path, config: dict
+    ):
+        """Batches are staged; the table changes only at clean_up, all at once."""
+        con = duckdb.connect()
+        # overwrite_if_no_pk applies to a stream without key properties.
+        sink = self._sink(tmp_path, con, () if config else ("id",), **config)
+        sink.process_batch({"records": [{"id": 3, "v": "new"}]})
+        assert self._rows(con) == [(1, "old"), (2, "old")]
+        sink.process_batch({"records": [{"id": 4, "v": "new"}]})
+        assert self._rows(con) == [(1, "old"), (2, "old")]
+        sink.clean_up()
+        assert self._rows(con) == [(3, "new"), (4, "new")]
+        assert not Path(sink.temp_file_dir).exists()
+
+    def test_a_run_that_fails_before_the_end_leaves_the_old_table(
+        self, tmp_path: Path
+    ):
+        """Without clean_up (the run failed or was interrupted), nothing changed."""
+        con = duckdb.connect()
+        sink = self._sink(tmp_path, con)
+        sink.process_batch({"records": [{"id": 3, "v": "new"}]})
+        with pytest.raises(ValueError, match="whole numbers"):
+            sink.process_batch({"records": [{"id": "abc", "v": "bad"}]})
+        assert self._rows(con) == [(1, "old"), (2, "old")]
+
+    def test_a_failed_replace_leaves_the_old_table(self, tmp_path: Path):
+        """If the replace transaction fails, it rolls back: the old rows stay."""
+        con = duckdb.connect()
+        sink = self._sink(tmp_path, con)
+        sink.process_batch({"records": [{"id": 3, "v": "new"}]})
+        sink.process_batch({"records": [{"id": 4, "v": "new"}]})
+        Path(sink._staged_files[1]).unlink()  # the INSERT fails after the DELETE
+        with pytest.raises(duckdb.IOException):
+            sink.clean_up()
+        con.execute("ROLLBACK")  # the patched execute shares one connection
+        assert self._rows(con) == [(1, "old"), (2, "old")]
+        assert not Path(sink.temp_file_dir).exists()
+
+    def test_an_overwrite_with_no_records_empties_the_table(self, tmp_path: Path):
+        """As before, a stream with no records leaves an empty table."""
+        con = duckdb.connect()
+        sink = self._sink(tmp_path, con)
+        sink.clean_up()
+        assert self._rows(con) == []
+
+
+class TestActivateVersion:
+    """ACTIVATE_VERSION removes rows absent from the activated version.
+
+    Runs the target through ``listen()`` on a real SQLite DuckLake catalog,
+    with messages as a full-table tap sends them.
+    """
+
+    SCHEMA: ClassVar[dict] = {
+        "type": "object",
+        "properties": {"id": {"type": "integer"}, "v": {"type": "string"}},
+    }
+
+    def _run(self, tmp_path: Path, messages: list[dict], **config: object) -> None:
+        full_config = {
+            "catalog_type": "sqlite",
+            "catalog_url": str(tmp_path / "catalog.sqlite"),
+            "data_path": str(tmp_path / "data") + "/",
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging") + "/",
+            "add_record_metadata": True,
+            **config,
+        }
+        lines = "".join(json.dumps(m) + "\n" for m in messages)
+        target = Targetducklake(config=full_config)
+        target.listen(file_input=io.StringIO(lines))
+        target.target_connector.close()
+
+    def _rows(self, tmp_path: Path, columns: str = "id, v") -> list[tuple]:
+        con = duckdb.connect()
+        con.execute(
+            f"ATTACH 'ducklake:sqlite:{tmp_path / 'catalog.sqlite'}' AS lake "
+            f"(DATA_PATH '{tmp_path / 'data'}/')"
+        )
+        rows = con.execute(f"SELECT {columns} FROM lake.s.t ORDER BY id").fetchall()
+        con.close()
+        return rows
+
+    def _sync(self, version: int, rows: dict[int, str]) -> list[dict]:
+        """A full-table sync: announce the version, send its records, activate it."""
+        activate = {"type": "ACTIVATE_VERSION", "stream": "t", "version": version}
+        records = [
+            {"type": "RECORD", "stream": "t", "record": {"id": i, "v": v}}
+            for i, v in rows.items()
+        ]
+        return [
+            self._schema_message(),
+            activate,
+            *({**record, "version": version} for record in records),
+            activate,
+        ]
+
+    def _schema_message(self) -> dict:
+        return {
+            "type": "SCHEMA",
+            "stream": "t",
+            "schema": self.SCHEMA,
+            "key_properties": ["id"],
+        }
+
+    def test_rows_absent_from_the_new_version_are_removed(self, tmp_path: Path):
+        """Row 2, gone at the source, is removed; rows 1 and 3 hold version 2."""
+        self._run(tmp_path, self._sync(1, {1: "a", 2: "b", 3: "c"}))
+        assert self._rows(tmp_path) == [(1, "a"), (2, "b"), (3, "c")]
+        self._run(tmp_path, self._sync(2, {1: "a2", 3: "c2"}))
+        assert self._rows(tmp_path, "id, v, _sdc_table_version") == [
+            (1, "a2", 2),
+            (3, "c2", 2),
+        ]
+
+    def test_announcing_a_version_removes_nothing(self, tmp_path: Path):
+        """The ACTIVATE_VERSION sent before the records doesn't empty the table."""
+        self._run(tmp_path, self._sync(1, {1: "a", 2: "b"}))
+        announce_only = self._sync(2, {})[:2]
+        self._run(tmp_path, announce_only)
+        assert self._rows(tmp_path) == [(1, "a"), (2, "b")]
+
+    def test_rows_without_a_version_are_removed_too(self, tmp_path: Path):
+        """Rows loaded before versions were recorded are not in the new version."""
+        self._run(
+            tmp_path,
+            [
+                self._schema_message(),
+                {"type": "RECORD", "stream": "t", "record": {"id": 9, "v": "old"}},
+            ],
+        )
+        self._run(tmp_path, self._sync(5, {1: "a"}))
+        assert self._rows(tmp_path) == [(1, "a")]
+
+    def test_without_record_metadata_nothing_is_removed(
+        self, tmp_path: Path, capfd: pytest.CaptureFixture[str]
+    ):
+        """Records carry no version, so ACTIVATE_VERSION is ignored with a warning."""
+        self._run(tmp_path, self._sync(1, {1: "a", 2: "b"}), add_record_metadata=False)
+        self._run(tmp_path, self._sync(2, {1: "a2"}), add_record_metadata=False)
+        assert self._rows(tmp_path) == [(1, "a2"), (2, "b")]
+        assert "Ignoring ACTIVATE_VERSION 2" in capfd.readouterr().err
+
+    def test_overwrite_with_activate_version_replaces_the_table_once(
+        self, tmp_path: Path
+    ):
+        """An overwrite stream ignores the version; the table is replaced at the end."""
+        self._run(tmp_path, self._sync(1, {1: "a", 2: "b"}), load_method="overwrite")
+        self._run(tmp_path, self._sync(2, {3: "c"}), load_method="overwrite")
+        assert self._rows(tmp_path) == [(3, "c")]
+
+    def test_state_is_not_emitted_when_the_overwrite_fails(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """STATE follows the overwrite's commit: a failed replace emits none."""
+        state = {"type": "STATE", "value": {"bookmarks": {"t": {"done": True}}}}
+        messages = [*self._sync(1, {1: "a"}), state]
+        with (
+            patch.object(
+                DuckLakeConnector,
+                "replace_table_contents",
+                side_effect=DuckLakeConnectorError("replace failed"),
+            ),
+            pytest.raises(DuckLakeConnectorError, match="replace failed"),
+        ):
+            self._run(tmp_path, messages, load_method="overwrite")
+        assert '"bookmarks"' not in capsys.readouterr().out
+        self._run(tmp_path, messages, load_method="overwrite")
+        assert '"bookmarks"' in capsys.readouterr().out
