@@ -72,6 +72,55 @@ class Targetducklake(SQLTarget):
         if errors:
             raise errors[0]
 
+    def _write_state_message(self, state: dict) -> None:
+        """Emit STATE, unless an overwrite hasn't committed its replace yet.
+
+        A mid-stream drain (a full batch, or max_record_age_minutes) only
+        stages an overwrite's batches; its rows reach the table when the
+        stream ends. STATE emitted before that would let a resumable tap skip
+        rows that were never committed if the run then fails. So STATE is held
+        until every overwrite has committed. The SDK writes the latest STATE
+        again after the final drain and clean-up.
+        """
+        sinks = [*self._sinks_to_clear, *self._sinks_active.values()]
+        pending = [
+            sink.stream_name
+            for sink in sinks
+            if getattr(sink, "has_uncommitted_overwrite", False)
+        ]
+        if pending:
+            self.logger.info(
+                "Holding STATE until the overwrite of %s commits.", ", ".join(pending)
+            )
+            return
+        super()._write_state_message(state)
+
+    def _process_activate_version_message(self, message_dict: dict) -> None:
+        """Drain the stream's sink, then let it activate the version.
+
+        Draining first writes any buffered records of the version, so rows
+        the sink is about to keep are in the table before rows of other
+        versions are deleted. The SDK neither drains nor checks whether the
+        version can be honoured; the sink decides (``activate_version``).
+        """
+        stream_name = message_dict["stream"]
+        for stream_map in self.mapper.stream_maps[stream_name]:
+            sink = self._sinks_active.get(stream_map.stream_alias)
+            if sink is None:
+                self.logger.info(
+                    "ACTIVATE_VERSION for %s before its SCHEMA; ignored.", stream_name
+                )
+                continue
+            if not sink.process_activate_version_messages:
+                self.logger.info(
+                    "process_activate_version_messages is off; ignoring "
+                    "ACTIVATE_VERSION for %s.",
+                    stream_name,
+                )
+                continue
+            self.drain_one(sink)
+            sink.activate_version(message_dict["version"])
+
     @property
     def config(self):
         """Get config dict with JSON string parsing for complex types."""
@@ -211,7 +260,7 @@ class Targetducklake(SQLTarget):
             "load_method",
             th.StringType(allowed_values=["append", "merge", "overwrite"]),
             title="Load Method",
-            description="Method to use for loading data into the target table: append, merge, or overwrite",
+            description="Method to use for loading data into the target table: append, merge, or overwrite. An overwrite stages every batch and replaces the table's rows in one transaction at the end of the stream.",
         ),
         th.Property(
             "flatten_max_level",
@@ -374,7 +423,7 @@ class Targetducklake(SQLTarget):
             ),
             default=False,
             title="Overwrite If No Primary Key",
-            description="When True, truncates the target table before inserting records if no primary keys are defined in the stream. Overrides load_method.",
+            description="When True, a stream without primary keys replaces the target table's rows (as load_method overwrite does, in one transaction at the end of the stream). Overrides load_method.",
         ),
         th.Property(
             "parallel_draining",
