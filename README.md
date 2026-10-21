@@ -65,26 +65,35 @@ plugins:
         partition_fields: {"my_stream": [{"column_name": "created_at", "type": "timestamp", "granularity": ["year", "month"]}]} # Optional
 ```
 
-### Partitioning
+### Partitioning and sort order
 
-Partitioning is supported by providing a `partition_fields` configuration object. Each stream name maps to an array of column definitions.
+Each stream's table layout is set with `stream_defaults` (every stream) and `stream_overrides` (keyed by stream name, merged over the defaults key by key). This is the same shape as target-iceberg, so both targets can be configured alike:
 
-Example:
+```yaml
+stream_defaults:
+  sort_order: [updated_at]
+stream_overrides:
+  orders:
+    partition:
+      - {column: occurred_at, transform: day}
+      - {column: tenant_id, transform: bucket, num_buckets: 16}
+    sort_order: [customer_id, "occurred_at DESC NULLS LAST"]
+```
+
+- **`partition`:** a list of `{column, transform}` entries. Transforms are `identity` (the default), `year`, `month`, `day`, `hour` and `bucket`; `bucket` requires `num_buckets`. DuckLake has no `truncate` or `void` transform, so those are rejected; an Iceberg partition `name` is accepted and not used.
+- **`sort_order`:** column names, each optionally followed by `ASC`/`DESC` and `NULLS FIRST`/`NULLS LAST`. DuckLake writes each new file's rows in this order.
+- **Column names** are the table's (flattened names use `__`), matched case-insensitively. An unknown key, transform or column fails the stream with a message naming it, rather than being ignored.
+- **When applied:** a new table gets the layout at creation. On an existing table, a changed layout is applied as metadata, and files written afterwards follow it (unlike target-iceberg, where partitioning is fixed at creation). An unchanged layout is left alone. A stream with no `partition` or `sort_order` keeps whatever layout its table already has.
+- **`stream_defaults`/`stream_overrides` settings other than `partition` and `sort_order`** (target-iceberg's `write_mode`, `key_properties`, …) are rejected, as they are not implemented here.
+- **Both settings can be given as JSON strings** (for environment variables).
+
+The older `partition_fields` setting still works for a stream without a `partition`:
 
 ```json
 {
-    "stream_name": [    
-        {
-            "column_name": "created_at", # The column name to partition on
-            "type": "timestamp", # The partition type (timestamp or identifier)
-            "granularity": ["year", "month"] # The granularity of the partition (only for timestamp type)
-        }
-    ],
-    "stream_name_2": [
-        {
-            "column_name": "status", # The column name to partition on
-            "type": "identifier", # The partition type (timestamp or identifier)
-        }
+    "stream_name": [
+        {"column_name": "created_at", "type": "timestamp", "granularity": ["year", "month"]},
+        {"column_name": "status", "type": "identifier"}
     ]
 }
 ```

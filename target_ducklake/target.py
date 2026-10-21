@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
@@ -18,6 +19,38 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from singer_sdk.sinks import Sink
+
+
+# One stream's table layout (target-iceberg's shape). Values are checked by
+# layout.resolve_layout, which names the fix; the schema stays permissive so a
+# truncate transform or an unknown key gets that message, not a schema error.
+_LAYOUT_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "partition": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "column": {"type": "string"},
+                    "transform": {"type": "string"},
+                    "num_buckets": {"type": "integer"},
+                    "width": {"type": "integer"},
+                    "name": {"type": "string"},
+                },
+                "required": ["column"],
+            },
+        },
+        "sort_order": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+
+def _parse_layout_settings(config: dict) -> None:
+    """Parse table layout settings given as JSON strings (env vars), in place."""
+    for key in ("stream_defaults", "stream_overrides"):
+        if isinstance(config.get(key), str):
+            config[key] = json.loads(config[key])
 
 
 class Targetducklake(SQLTarget):
@@ -136,6 +169,7 @@ class Targetducklake(SQLTarget):
             logging.info(
                 f"Successfully parsed partition_fields from string to object: {parsed_partition_fields}"
             )
+        _parse_layout_settings(config)
         if "max_batch_size" in config:
             logging.warning(f"max_batch_size: {config.get('max_batch_size')}")
             config["max_batch_size"] = int(config.get("max_batch_size", 10000))
@@ -343,6 +377,39 @@ class Targetducklake(SQLTarget):
                 "Object mapping stream names to arrays of partition column definitions. "
                 "Each stream key maps directly to an array of column definitions. "
                 "Can be provided as a JSON string or object."
+            ),
+        ),
+        th.Property(
+            "stream_defaults",
+            th.CustomType(
+                {"oneOf": [{"type": "string"}, _LAYOUT_SCHEMA, {"type": "null"}]}
+            ),
+            nullable=True,
+            title="Stream Defaults",
+            description=(
+                "Table layout for every stream, as in target-iceberg: partition "
+                "([{column, transform, num_buckets}], transforms identity, year, "
+                "month, day, hour, bucket) and sort_order (column names, optionally "
+                "with ASC/DESC and NULLS FIRST/LAST). Can be a JSON string."
+            ),
+        ),
+        th.Property(
+            "stream_overrides",
+            th.CustomType(
+                {
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "object", "additionalProperties": _LAYOUT_SCHEMA},
+                        {"type": "null"},
+                    ]
+                }
+            ),
+            nullable=True,
+            title="Stream Overrides",
+            description=(
+                "Per-stream table layout, keyed by stream name, merged over "
+                "stream_defaults key by key; same shape. partition replaces "
+                "partition_fields for that stream. Can be a JSON string."
             ),
         ),
         th.Property(

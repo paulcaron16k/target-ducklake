@@ -105,7 +105,17 @@ plugins:
     - name: partition_fields
       kind: object
       label: Partition Fields
-      description: Object mapping stream names to arrays of partition column definitions. Each stream key maps directly to an array of column definitions.
+      description: Older form of per-stream partitioning; see stream_overrides. Object mapping stream names to arrays of partition column definitions.
+
+    - name: stream_defaults
+      kind: object
+      label: Stream Defaults
+      description: Table layout for every stream, as in target-iceberg. partition ([{column, transform, num_buckets}]; identity, year, month, day, hour, bucket) and sort_order (column names, optionally with ASC/DESC and NULLS FIRST/LAST).
+
+    - name: stream_overrides
+      kind: object
+      label: Stream Overrides
+      description: Per-stream table layout keyed by stream name, merged over stream_defaults key by key.
 
     - name: auto_cast_timestamps
       kind: boolean
