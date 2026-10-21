@@ -4535,3 +4535,19 @@ class TestTableLayout:
             aliases={long_name: "c" * 63},
         )
         assert layout.sort == (SortKey("c" * 63, "ASC", "NULLS_LAST"),)
+
+    def test_several_matching_table_blocks_use_the_first_and_log(self, tmp_path: Path):
+        """Blocks that differ only by case: the first in file order wins, logged."""
+        document = {
+            "tables": {
+                "s.Orders": {"partition": [{"column": "id"}]},
+                "s.orders": {"partition": [{"column": "Tenant"}]},
+            }
+        }
+        config = {"table_config": self._table_config(tmp_path, document)}
+        logger = Mock()
+        layout = resolve_layout(
+            config, "x", self.COLUMNS, logger, table=("s", "ORDERS")
+        )
+        assert layout.partition == (PartitionKey("id", "identity"),)
+        assert logger.info.call_args.args[1:] == (2, "s", "ORDERS", "s.Orders")

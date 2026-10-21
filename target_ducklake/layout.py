@@ -69,6 +69,7 @@ _UNIMPLEMENTED_LAYOUT_KEYS = {
 # target-iceberg's on_error applies only to type_source columns, so without
 # type_source it changes nothing; its schema injects on_error: raise into
 # every stream_defaults. With type_source it is rejected along with it.
+# Revisit when DUCKLKD-43 implements type_source.
 _TYPE_SOURCE_ONLY_KEY = "on_error"
 
 # "column", or "column DESC", "column ASC NULLS FIRST": the sort entry forms.
@@ -434,15 +435,21 @@ def _table_config_block(
     block = None
     for key_of in (str.lower, _conformed):
         wanted = (key_of(schema), key_of(name))
-        block = next(
-            (
-                block
-                for (file_schema, file_name), block in tables.items()
-                if (key_of(file_schema), key_of(file_name)) == wanted
-            ),
-            None,
-        )
-        if block is not None:
+        matches = [
+            (key, block)
+            for key, block in tables.items()
+            if (key_of(key[0]), key_of(key[1])) == wanted
+        ]
+        if matches:
+            if len(matches) > 1 and logger is not None:
+                logger.info(
+                    "table_config has %d blocks matching %s.%s; using %s.",
+                    len(matches),
+                    schema,
+                    name,
+                    ".".join(matches[0][0]),
+                )
+            block = matches[0][1]
             break
     if block is None and logger is not None:
         logger.info(
