@@ -131,7 +131,7 @@ Existing tables keep their column types, apart from safe integer and float widen
 ### Overwrite and ACTIVATE_VERSION
 
 **Overwrite** (`load_method: overwrite`, or `overwrite_if_no_pk` for a stream without primary keys) replaces the table's rows atomically. Each batch is staged as a Parquet file in `temp_file_dir`, and at the end of the stream one transaction deletes the old rows and inserts every staged batch. Readers see the old table until that commit. A run that fails or is interrupted in the target leaves the old rows in place. Some limits:
-- **STATE is held** while any overwrite stream hasn't committed: mid-run drains don't emit it, so a resumable tap can't skip rows that were never loaded. It is emitted after the commit.
+- **STATE is held** while any overwrite stream hasn't committed: mid-run drains don't emit it, so a resumable tap can't skip rows that were never loaded. It is emitted after the commit. STATE is one message for all streams, so other streams' checkpoints wait too. After a crash during a long overwrite, they resume from their last emitted STATE.
 - **The swap happens at the end of the input.** If the tap dies but its output ends cleanly, the target swaps in what it received.
 - **`temp_file_dir` needs room for the whole stream,** not one batch.
 - **A stream with no records still empties the table,** as before.
