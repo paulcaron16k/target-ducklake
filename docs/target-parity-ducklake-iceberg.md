@@ -87,13 +87,17 @@ Each side was inventoried from its code against the same checklist, with `file:l
 
 These are recorded here for target-iceberg's own tracker and are not filed on the DUCKLKD board.
 
-1. **Per-stream settings accepted but never applied.** `sort_order`, `write_mode` and `key_properties` in `stream_defaults`/`stream_overrides` are declared (target.py:112-157) and advertised in the README and design docs, but nothing reads them. The test that claims to cover `write_mode` (tests/test_upsert.py:270-289) only checks that it is unset.
+1. **Per-stream settings accepted but never applied.** `sort_order`, `write_mode` and `key_properties` in `stream_defaults`/`stream_overrides` are declared (target.py:112-157) and advertised in the README and design docs, but nothing reads them. The test that claims to cover `write_mode` (tests/test_upsert.py:270-289) only checks that it is unset. `write_mode` is the worst of the three: a stream set to `write_mode: upsert` under `load_method: append-only` silently appends and duplicates every key (confirmed by the target-iceberg agent, 2026-10-21).
 2. **STATE during a staged full refresh.** A mid-run drain commits to the staging branch and can emit STATE before the swap makes the data visible. target-ducklake holds STATE until its overwrite commits (DUCKLKD-20).
 3. **`anyOf` / `oneOf` / `allOf`.** They become string columns with a warning; target-ducklake takes the first typed branch (DUCKLKD-60/65).
 4. **Nullable keys.** A key the tap declares nullable is dropped from the identifier fields, and upsert then refuses. target-ducklake matches NULL keys (DUCKLKD-49).
 5. **Transient errors.** Only commit conflicts are retried; network errors fail the run.
 6. **Parallel-drain failures.** The SDK raises the first error while other drains run; target-ducklake found this can abort the process (exit 134, Python 3.12) and waits for every drain (DUCKLKD-79). target-iceberg uses the SDK drain on Python ≥ 3.12, so the same abort may apply; not checked there.
 7. **Smaller items.** In-batch dedup compares raw values (`"1"` vs `1`); `py-io-impl` is read but not declared; stale comments on `delete_strategy`; BATCH chunks skip conforming and `type_source` coercion.
+
+**Two different "write modes".** In xflow, "write mode" per table means Iceberg's `write.delete.mode`/`write.update.mode` table properties. target-iceberg sets them from the per-stream `delete_strategy` (`copy_on_write` or `merge_on_read`; sinks.py:273-279, 535-546), and that works. target-iceberg's per-stream `write_mode` is a different, Singer-level idea: a per-stream override of `load_method` (append, upsert, overwrite), and it is the dead key above. For target-ducklake:
+- **`write_mode` is a cautionary tale.** target-ducklake rejects it at startup (DUCKLKD-38), pointing to DUCKLKD-41, so it can't silently fall back to the global `load_method`. DUCKLKD-41 must honour any per-stream load method it accepts, or reject it.
+- **`delete_strategy` has no DuckLake counterpart.** A DuckLake DELETE (and so a merge) always writes delete files that readers apply, which is merge-on-read; rewriting them away is maintenance (DUCKLKD-33). target-ducklake currently rejects `delete_strategy` like any other unsupported layout key.
 
 ## Divergences for xflow
 
