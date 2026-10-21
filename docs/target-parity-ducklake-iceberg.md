@@ -56,9 +56,9 @@ Each side was inventoried from its code against the same checklist, with `file:l
 | | type widening | ◐ int family, float→double | ◐ accepts an already-wider table; never alters | — |
 | | name conforming | ✗ raw names; truncation to 63 on Postgres | ✅ SDK `conform_name` parity, clash detection | Divergence · **DUCKLKD-87** |
 | | case handling | ✅ case-insensitive matching | ✅ lowercased | — |
-| **Layout** | partition transforms | ◐ identity, year–hour; bucket supported by DuckLake but not configurable | ✅ identity, year–hour, bucket, truncate, void | DuckLake · DUCKLKD-38 (no truncate/void in DuckLake 1.5.2) |
-| | when applied | every run (re-sets the spec, one snapshot per run) | at creation only | DuckLake · DUCKLKD-38 |
-| | sort order | ✗ | ⚠ `sort_order` declared, never applied | Both · DUCKLKD-38 |
+| **Layout** | partition transforms | ✅ identity, year–hour, bucket (DUCKLKD-38); no truncate/void in DuckLake 1.5.2 | ✅ identity, year–hour, bucket, truncate, void | — |
+| | when applied | at creation, then only when changed (DUCKLKD-38) | at creation only | — (deliberate difference) |
+| | sort order | ✅ `sort_order` (DUCKLKD-38) | ⚠ `sort_order` declared, never applied | Iceberg |
 | | shared `table-config.json` | ✗ | ◐ `partition` only | DuckLake · DUCKLKD-38 (optional) |
 | | small-file control | ✗ inlining forced off | ✗ (format v2, object-storage layout) | DuckLake · DUCKLKD-39 |
 | **Catalog & storage** | catalog types | Postgres, SQLite, MySQL, DuckDB | REST, SQL | — |
@@ -106,7 +106,7 @@ Each of these is a design choice in one target; xflow sees different tables for 
 | `hard_delete` | SDK default false; ACTIVATE_VERSION soft-deletes unless true | default true; `false` refused | — (document) |
 | schema routing | `default_target_schema`, else derived from `schema-table` stream names | `default_target_schema`, default `elt_raw` | — (document) |
 | batch size | `max_batch_size` | `batch_size_rows` | DUCKLKD-92 |
-| per-stream config | `partition_fields` (top level) | `stream_defaults` / `stream_overrides` | DUCKLKD-38 adopts target-iceberg's shape |
+| per-stream config | `stream_defaults` / `stream_overrides` (DUCKLKD-38); `partition_fields` still accepted | `stream_defaults` / `stream_overrides` | aligned |
 
 ## For DUCKLKD-38
 

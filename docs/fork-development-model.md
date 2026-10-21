@@ -166,6 +166,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-51](https://github.com/paulcaron16k/target-ducklake-definite/issues/51) More x-sql-datatype spellings | squash `ab371be` (fork PR #78) | — | In fork, PR not opened |
 | [DUCKLKD-79](https://github.com/paulcaron16k/target-ducklake-definite/issues/79) SQLite catalogs drain one sink at a time; failed parallel drains exit cleanly | squash `ebb2e28` (fork PR #80) | — | In fork, PR not opened |
 | [DUCKLKD-20](https://github.com/paulcaron16k/target-ducklake-definite/issues/20) Atomic overwrite; ACTIVATE_VERSION retires other versions (soft by default) | squash `87f8e9f` (fork PR #83) | — | In fork, PR not opened |
+| [DUCKLKD-38](https://github.com/paulcaron16k/target-ducklake-definite/issues/38) Sort keys and bucket partitions (target-iceberg config shape) | squash `72a97db` (fork PR #93) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
