@@ -16,7 +16,7 @@ from singer_sdk import Target
 from singer_sdk.sinks import SQLSink
 from singer_sdk.sinks.core import JSONSchemaValidator
 
-from target_ducklake.connector import DuckLakeConnector
+from target_ducklake.connector import VERSION_COLUMN, DuckLakeConnector
 from target_ducklake.flatten import (
     flatten_record,
     flatten_schema,
@@ -33,10 +33,6 @@ from target_ducklake.parquet_utils import (
 def _is_fractional(staged: pa.DataType) -> bool:
     """Whether a staging type holds fractions: a decimal or a float."""
     return pa.types.is_decimal(staged) or pa.types.is_floating(staged)
-
-
-# The SDK's record metadata column holding the record's table version.
-VERSION_COLUMN = "_sdc_table_version"
 
 
 class ducklakeSink(SQLSink):
@@ -527,11 +523,12 @@ class ducklakeSink(SQLSink):
                 )
 
     def activate_version(self, new_version: int) -> None:
-        """Handle ACTIVATE_VERSION: remove rows that are not in the activated version.
+        """Handle ACTIVATE_VERSION: retire rows that are not in the activated version.
 
         A full-table tap sends its records with a table version, then
         ACTIVATE_VERSION for it; rows of any other version (or none) are gone
-        at the source and are deleted. The target drains this sink first (see
+        at the source. As in the SDK, they are marked deleted
+        (``_sdc_deleted_at`` set) by default, and removed with ``hard_delete``. The target drains this sink first (see
         ``Targetducklake._process_activate_version_message``), so no record
         of the version is still buffered.
 
@@ -570,13 +567,16 @@ class ducklakeSink(SQLSink):
                 "before any of its records; nothing to remove yet."
             )
             return
-        self.connector.delete_other_versions(
-            target_schema_name=self.target_schema,
-            table_name=self.target_table,
-            version_column=self._column_name_mapping.get(
-                VERSION_COLUMN, VERSION_COLUMN
-            ),
-            version=new_version,
+        if self.config.get("hard_delete", False):
+            self.connector.delete_other_versions(
+                self.target_schema, self.target_table, new_version
+            )
+            return
+        # As the SDK does by default: mark them deleted, at the current UTC
+        # time, and keep them. A row the source sends again is revived when
+        # it is next loaded (its own _sdc_deleted_at is empty).
+        self.connector.mark_other_versions_deleted(
+            self.target_schema, self.target_table, new_version
         )
 
 

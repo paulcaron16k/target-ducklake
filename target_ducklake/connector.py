@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 
 PARTITION_GRANULARITIES = ["year", "month", "day", "hour"]
 
+# The SDK's record metadata columns: the record's table version, and the time
+# a row was deleted at the source. Short enough never to be truncated.
+VERSION_COLUMN = "_sdc_table_version"
+DELETED_AT_COLUMN = "_sdc_deleted_at"
+
 # Integer type widths for deciding safe in-place widening (e.g. INTEGER -> BIGINT).
 _INT_TYPE_RANK = {
     "TINYINT": 1,
@@ -656,13 +661,9 @@ class DuckLakeConnector(SQLConnector):
         self.execute(replace_sql)
 
     def delete_other_versions(
-        self,
-        target_schema_name: str,
-        table_name: str,
-        version_column: str,
-        version: int,
+        self, target_schema_name: str, table_name: str, version: int
     ) -> None:
-        """Delete the rows whose version is not the given one, in one transaction.
+        """Delete the rows whose table version is not the given one, in one transaction.
 
         Rows without a version (loaded before versions were recorded) are
         deleted too: after a full refresh, the table holds that version only.
@@ -670,12 +671,35 @@ class DuckLakeConnector(SQLConnector):
         table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
         delete_sql = (
             "BEGIN TRANSACTION;\n"
-            f'DELETE FROM {table_ref} WHERE "{version_column}" '
+            f'DELETE FROM {table_ref} WHERE "{VERSION_COLUMN}" '
             f"IS DISTINCT FROM {int(version)};\n"
             "COMMIT;"
         )
         logger.info("Deleting rows of %s not in version %s", table_name, version)
         self.execute(delete_sql)
+
+    def mark_other_versions_deleted(
+        self, target_schema_name: str, table_name: str, version: int
+    ) -> None:
+        """Soft-delete the rows whose table version is not the given one.
+
+        Sets their ``_sdc_deleted_at`` to the current UTC time in one
+        transaction, keeping the time of rows already marked deleted. Rows
+        without a version are marked too, as in ``delete_other_versions``.
+        """
+        table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
+        update_sql = (
+            "BEGIN TRANSACTION;\n"
+            f'UPDATE {table_ref} SET "{DELETED_AT_COLUMN}" = '
+            "now() AT TIME ZONE 'UTC' "
+            f'WHERE "{VERSION_COLUMN}" IS DISTINCT FROM {int(version)} '
+            f'AND "{DELETED_AT_COLUMN}" IS NULL;\n'
+            "COMMIT;"
+        )
+        logger.info(
+            "Marking rows of %s not in version %s as deleted", table_name, version
+        )
+        self.execute(update_sql)
 
     @staticmethod
     def _build_key_match_sql(

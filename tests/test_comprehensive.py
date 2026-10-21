@@ -3764,11 +3764,38 @@ class TestActivateVersion:
             "key_properties": ["id"],
         }
 
-    def test_rows_absent_from_the_new_version_are_removed(self, tmp_path: Path):
-        """Row 2, gone at the source, is removed; rows 1 and 3 hold version 2."""
+    def test_rows_absent_from_the_new_version_are_marked_deleted(
+        self, tmp_path: Path
+    ):
+        """By default row 2, gone at the source, is kept with _sdc_deleted_at set.
+
+        When the source sends it again, its next load revives it.
+        """
+        columns = "id, v, _sdc_table_version, _sdc_deleted_at IS NOT NULL"
         self._run(tmp_path, self._sync(1, {1: "a", 2: "b", 3: "c"}))
-        assert self._rows(tmp_path) == [(1, "a"), (2, "b"), (3, "c")]
         self._run(tmp_path, self._sync(2, {1: "a2", 3: "c2"}))
+        assert self._rows(tmp_path, columns) == [
+            (1, "a2", 2, False),
+            (2, "b", 1, True),
+            (3, "c2", 2, False),
+        ]
+        deleted_at = self._rows(tmp_path, "id, _sdc_deleted_at")[1][1]
+        assert abs(datetime.now(timezone.utc).replace(tzinfo=None) - deleted_at) < (
+            timedelta(minutes=5)
+        )
+        self._run(tmp_path, self._sync(3, {1: "a3", 2: "b3", 3: "c3"}))
+        assert self._rows(tmp_path, columns) == [
+            (1, "a3", 3, False),
+            (2, "b3", 3, False),
+            (3, "c3", 3, False),
+        ]
+
+    def test_rows_absent_from_the_new_version_are_removed_with_hard_delete(
+        self, tmp_path: Path
+    ):
+        """With hard_delete, row 2 is removed; rows 1 and 3 hold version 2."""
+        self._run(tmp_path, self._sync(1, {1: "a", 2: "b", 3: "c"}), hard_delete=True)
+        self._run(tmp_path, self._sync(2, {1: "a2", 3: "c2"}), hard_delete=True)
         assert self._rows(tmp_path, "id, v, _sdc_table_version") == [
             (1, "a2", 2),
             (3, "c2", 2),
@@ -3781,7 +3808,7 @@ class TestActivateVersion:
         self._run(tmp_path, announce_only)
         assert self._rows(tmp_path) == [(1, "a"), (2, "b")]
 
-    def test_rows_without_a_version_are_removed_too(self, tmp_path: Path):
+    def test_rows_without_a_version_are_retired_too(self, tmp_path: Path):
         """Rows loaded before versions were recorded are not in the new version."""
         self._run(
             tmp_path,
@@ -3790,7 +3817,7 @@ class TestActivateVersion:
                 {"type": "RECORD", "stream": "t", "record": {"id": 9, "v": "old"}},
             ],
         )
-        self._run(tmp_path, self._sync(5, {1: "a"}))
+        self._run(tmp_path, self._sync(5, {1: "a"}), hard_delete=True)
         assert self._rows(tmp_path) == [(1, "a")]
 
     def test_without_record_metadata_nothing_is_removed(
@@ -3865,4 +3892,9 @@ class TestActivateVersion:
         """ACTIVATE_VERSION twice with no records between: the source is empty."""
         self._run(tmp_path, self._sync(1, {1: "a", 2: "b"}))
         self._run(tmp_path, self._sync(2, {}))
+        assert self._rows(tmp_path, "id, _sdc_deleted_at IS NOT NULL") == [
+            (1, True),
+            (2, True),
+        ]
+        self._run(tmp_path, self._sync(3, {}), hard_delete=True)
         assert self._rows(tmp_path) == []

@@ -25,6 +25,8 @@ Supports append, merge, and overwrite load methods (default is merge). The load 
 | `default_target_schema` | string | ❌ | - | Default database schema where data should be written. If not provided schema will attempt to be inferred from the stream name (inferring schema only works for database extractors ) |
 | `target_schema_prefix` | string | ❌ | - | Prefix to add to the target schema name. If not provided, no prefix will be added |
 | `add_record_metadata` | boolean | ❌ | `false` | When True, automatically adds Singer Data Capture (SDC) metadata columns to target tables |
+| `hard_delete` | boolean | ❌ | `false` | When True, `ACTIVATE_VERSION` deletes rows absent from the activated version; when False, it sets their `_sdc_deleted_at`. See [Overwrite and ACTIVATE_VERSION](#overwrite-and-activate_version). |
+| `process_activate_version_messages` | boolean | ❌ | `true` | When False, `ACTIVATE_VERSION` messages are ignored. |
 | `load_method` | string | ❌ | `"merge"` | Method to use for loading data into the target table: append, merge, or overwrite. See [Overwrite and ACTIVATE_VERSION](#overwrite-and-activate_version). |
 | `flatten_max_level` | integer | ❌ | `0` | Maximum depth for flattening nested fields. Set to 0 to disable flattening |
 | `temp_file_dir` | string | ❌ | `"temp_files/"` | Directory path for storing temporary parquet files |
@@ -135,9 +137,13 @@ Existing tables keep their column types, apart from safe integer and float widen
 - **A stream with no records still empties the table,** as before.
 - **A schema change mid-stream** (a new SCHEMA for the stream) fails the run at the end, with the old rows intact.
 
-**ACTIVATE_VERSION**, as full-table taps send it, removes rows that are gone at the source. The tap tags each record with a table version, then sends `ACTIVATE_VERSION` for that version. The target first loads any buffered records, then deletes every row whose `_sdc_table_version` is not the activated version, including rows loaded without a version. Rows are hard-deleted. Some cases remove nothing:
+**ACTIVATE_VERSION**, as full-table taps send it, retires rows that are gone at the source. The tap tags each record with a table version, then sends `ACTIVATE_VERSION` for that version. The target first loads any buffered records, then handles every row whose `_sdc_table_version` is not the activated version, including rows loaded without a version:
+- **By default,** as in the Singer SDK, it sets their `_sdc_deleted_at` to the current UTC time and keeps them. A row the source sends again is revived when it is next loaded.
+- **With `hard_delete: true`,** it deletes them.
+
+Some cases retire nothing:
 - **Without `add_record_metadata`:** records carry no version, so the message is ignored with a warning.
-- **A version announced before any of its records** (as taps do at the start of a sync) is a no-op, so the table never empties mid-sync. A second `ACTIVATE_VERSION` for the same version, even with no records between, ends the sync: the source is empty, and every row goes.
+- **A version announced before any of its records** (as taps do at the start of a sync) is a no-op, so the table never empties mid-sync. A second `ACTIVATE_VERSION` for the same version, even with no records between, ends the sync: the source is empty, and every row is retired.
 - **An overwrite stream** ignores versions, since it replaces the whole table anyway.
 
 Between a sync's first batch and its `ACTIVATE_VERSION`, readers see the new rows next to rows of the old version. Set `process_activate_version_messages: false` to ignore the message entirely.
