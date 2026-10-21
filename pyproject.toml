@@ -45,6 +45,7 @@ dev = [
     { include-group = "test" },
 ]
 test = [
+    "jsonschema>=4.24",
     "pytest>=8",
     "singer-sdk[testing]",
 ]

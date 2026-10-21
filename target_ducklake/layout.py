@@ -584,7 +584,8 @@ def _partition_transform(entry: Mapping[str, t.Any], at: str) -> str | None:
 
     ``None`` for an Iceberg-only transform (truncate, void), which is skipped.
     """
-    transform = str(entry.get("transform", "identity")).lower()
+    # Exact, as in Zamboni's spec and target-iceberg: "Day" is refused.
+    transform = str(entry.get("transform", "identity"))
     if transform in _ICEBERG_ONLY_TRANSFORMS:
         return None
     if transform not in TRANSFORMS:
@@ -683,10 +684,16 @@ def _ordering_sort_keys(
         if not isinstance(entry, dict):
             msg = f"{at}: each entry must be a mapping, e.g. {{column: ts}}."
             raise LayoutError(msg)
+        if unknown := sorted(set(entry) - _ORDERING_SORT_KEYS):
+            msg = (
+                f"{at}: unknown key(s) {unknown}. "
+                f"Valid keys: {sorted(_ORDERING_SORT_KEYS)}."
+            )
+            raise LayoutError(msg)
         column = _column(entry.get("column"), by_name, at)
         direction = entry.get("direction", "asc")
         nulls = entry.get("nulls", "last")
-        if direction not in _SORT_DIRECTIONS or nulls not in _SORT_NULLS:
+        if not _one_of(direction, _SORT_DIRECTIONS) or not _one_of(nulls, _SORT_NULLS):
             msg = f"{at}: direction must be asc or desc, and nulls first or last."
             raise LayoutError(msg)
         keys.append(SortKey(column, direction.upper(), f"NULLS_{nulls.upper()}"))
@@ -699,17 +706,29 @@ def _ordering_mode(ordering: object, where: str) -> tuple[str, list[t.Any]]:
         msg = f"{where}: ordering must be an object with a mode."
         raise LayoutError(msg)
     mode = ordering.get("mode", "none")
-    if mode not in _ORDERING_MODES:
+    if not _one_of(mode, _ORDERING_MODES):
         msg = f"{where}: ordering mode must be one of {sorted(_ORDERING_MODES)}."
         raise LayoutError(msg)
-    if mode == "none" and (ordering.get("sort") or ordering.get("zorder")):
+    sort, zorder = ordering.get("sort"), ordering.get("zorder")
+    # A zorder block counts when present, even empty, as in Zamboni.
+    if mode == "none" and (sort or zorder is not None):
         msg = (
             f"{where}: ordering mode is none but an ordering is defined; set "
             "mode to sort or zorder to enable it, as Zamboni requires."
         )
         raise LayoutError(msg)
-    sort = ordering.get("sort")
-    if mode == "sort" and not (isinstance(sort, list) and sort):
-        msg = f"{where}: ordering mode sort requires a non-empty sort list."
+    if mode == "sort" and (not (isinstance(sort, list) and sort) or zorder is not None):
+        msg = (
+            f"{where}: ordering mode sort requires a non-empty sort list and no "
+            "zorder block."
+        )
         raise LayoutError(msg)
-    return str(mode), sort if isinstance(sort, list) else []
+    if mode == "zorder" and (zorder is None or sort):
+        msg = f"{where}: ordering mode zorder requires a zorder block and no sort list."
+        raise LayoutError(msg)
+    return mode, sort if isinstance(sort, list) else []
+
+
+def _one_of(value: object, choices: frozenset[str]) -> t.TypeGuard[str]:
+    """Whether ``value`` is one of the string ``choices`` (any JSON value)."""
+    return isinstance(value, str) and value in choices

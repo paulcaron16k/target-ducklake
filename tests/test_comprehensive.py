@@ -4386,6 +4386,12 @@ class TestTableLayout:
             ),
             (
                 json.dumps(
+                    {"defaults": {"partition": [{"column": "a", "transform": "Day"}]}}
+                ),
+                "table_config defaults partition[0]: unknown transform 'Day'",
+            ),
+            (
+                json.dumps(
                     {"namespaces": {"s": {"tables": {"t": {"ordering": {"mode": 1}}}}}}
                 ),
                 "table_config s.t: ordering mode must be",
@@ -4403,6 +4409,7 @@ class TestTableLayout:
             "bad-json",
             "not-an-object",
             "bad-transform",
+            "capitalised-transform",
             "bad-ordering",
             "version-1-shape",
             "version-3",
@@ -4530,7 +4537,11 @@ class TestTableLayout:
 
     @pytest.mark.parametrize(
         ("ordering", "sort"),
-        [({}, ()), ({"mode": "none"}, ()), ({"mode": "zorder"}, None)],
+        [
+            ({}, ()),
+            ({"mode": "none"}, ()),
+            ({"mode": "zorder", "zorder": {"columns": ["id", "Tenant"]}}, None),
+        ],
         ids=["mode-absent", "mode-none", "mode-zorder"],
     )
     def test_table_config_ordering_modes(
@@ -4546,13 +4557,50 @@ class TestTableLayout:
         ("ordering", "message"),
         [
             ({"sort": [{"column": "id"}]}, "mode is none but an ordering is defined"),
+            ({"zorder": {}}, "mode is none but an ordering is defined"),
             ({"mode": "sort", "sort": []}, "requires a non-empty sort list"),
+            (
+                {"mode": "sort", "sort": [{"column": "id"}], "zorder": {}},
+                "and no zorder block",
+            ),
+            ({"mode": "zorder"}, "requires a zorder block"),
+            (
+                {"mode": "zorder", "zorder": {}, "sort": [{"column": "id"}]},
+                "and no sort list",
+            ),
             (
                 {"mode": "sort", "sort": [{"column": "id", "direction": "DESC"}]},
                 "direction must be asc or desc",
             ),
+            (
+                {"mode": "sort", "sort": [{"column": "id", "directon": "desc"}]},
+                r"unknown key\(s\) \['directon'\]",
+            ),
+            ({"mode": ["sort"]}, "ordering mode must be one of"),
+            ({"mode": {}}, "ordering mode must be one of"),
+            (
+                {"mode": "sort", "sort": [{"column": "id", "direction": ["asc"]}]},
+                "direction must be asc or desc",
+            ),
+            (
+                {"mode": "sort", "sort": [{"column": "id", "nulls": {}}]},
+                "nulls first or last",
+            ),
         ],
-        ids=["sort-without-mode", "empty-sort", "uppercase-direction"],
+        ids=[
+            "sort-without-mode",
+            "zorder-without-mode",
+            "empty-sort",
+            "sort-with-zorder",
+            "zorder-without-block",
+            "zorder-with-sort",
+            "uppercase-direction",
+            "misspelt-key",
+            "mode-list",
+            "mode-dict",
+            "direction-list",
+            "nulls-dict",
+        ],
     )
     def test_table_config_orderings_zamboni_refuses_are_refused(
         self, tmp_path: Path, ordering: dict, message: str

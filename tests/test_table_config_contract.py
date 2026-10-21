@@ -4,8 +4,9 @@ Zamboni owns the table-config.json format. tests/contracts holds a pinned copy
 of its spec and example file (bin/refresh-table-config-contract.sh), and these
 tests check layout.py against it: the version it reads, and every key,
 transform and ordering mode it applies or ignores. When the copy is refreshed,
-a format change fails here, naming what moved, instead of surfacing as a
-lookup that silently finds nothing.
+a change to a key, transform, mode or version fails here, naming what moved,
+instead of surfacing as a lookup that silently finds nothing. Constraints
+(required keys, numeric bounds) are not pinned: Zamboni validates those.
 """
 
 from __future__ import annotations
