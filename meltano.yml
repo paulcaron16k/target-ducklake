@@ -117,6 +117,11 @@ plugins:
       label: Stream Overrides
       description: Per-stream table layout keyed by stream name, merged over stream_defaults key by key.
 
+    - name: table_config
+      kind: string
+      label: Table Config Path
+      description: Path to a Zamboni table-config.json (version 2), the file target-iceberg reads. Its per-table partition and sort-mode ordering set the table layout; Iceberg-only and maintenance sections are ignored.
+
     - name: auto_cast_timestamps
       kind: boolean
       label: Auto Cast Timestamps

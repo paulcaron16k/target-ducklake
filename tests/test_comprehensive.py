@@ -43,6 +43,8 @@ from target_ducklake.layout import (
     PartitionKey,
     SortKey,
     TableLayout,
+    _read_table_config,
+    check_layout_config,
     resolve_layout,
 )
 from target_ducklake.parquet_utils import (
@@ -3980,14 +3982,6 @@ class TestTableLayout:
         ("layout", "message"),
         [
             (
-                {"partition": [{"column": "id", "transform": "truncate", "width": 4}]},
-                "not supported by DuckLake",
-            ),
-            (
-                {"partition": [{"column": "id", "transform": "void"}]},
-                "not supported by DuckLake",
-            ),
-            (
                 {"partition": [{"column": "id", "transform": "week"}]},
                 "unknown transform 'week'",
             ),
@@ -4023,10 +4017,11 @@ class TestTableLayout:
             ({"sort_order": ["id sideways"]}, "is not a sort entry"),
             ({"sort_order": ["nope"]}, "column 'nope' is not in this stream"),
             ({"write_mode": "upsert"}, "DUCKLKD-41"),
+            ({"key_properties": ["id"]}, "DUCKLKD-41"),
+            ({"type_source": {"id": "integer"}}, "DUCKLKD-43"),
+            ({"partiton": []}, "unknown stream_defaults/stream_overrides setting"),
         ],
         ids=[
-            "truncate",
-            "void",
             "unknown-transform",
             "bucket-without-count",
             "bucket-zero",
@@ -4037,7 +4032,10 @@ class TestTableLayout:
             "not-a-list",
             "bad-sort-entry",
             "missing-sort-column",
-            "unsupported-layout-key",
+            "write-mode",
+            "key-properties",
+            "type-source",
+            "misspelt-layout-key",
         ],
     )
     def test_invalid_layout_is_rejected_with_the_fix(self, layout: dict, message: str):
@@ -4212,7 +4210,7 @@ class TestTableLayout:
             (
                 {
                     "stream_defaults": {
-                        "partition": [{"column": "a", "transform": "void"}]
+                        "partition": [{"column": "a", "transform": "week"}]
                     }
                 },
                 "stream_defaults partition[0]",
@@ -4243,3 +4241,422 @@ class TestTableLayout:
         legacy = {"orders": [{"column_name": "occurred_at", "type": "timestamp"}]}
         with pytest.raises(LayoutError, match="at least one granularity"):
             self._layout(partition_fields=legacy)
+
+    def test_iceberg_only_settings_are_ignored_in_a_shared_config(
+        self, capfd: pytest.CaptureFixture[str]
+    ):
+        """A config written for target-iceberg works: Iceberg-only parts are skipped."""
+        config = {
+            "stream_defaults": {
+                "delete_strategy": "merge_on_read",
+                "merge_on_read_maintenance_acknowledged": True,
+            },
+            "stream_overrides": {
+                "orders": {
+                    "partition": [
+                        {"column": "Tenant", "transform": "truncate", "width": 4},
+                        {
+                            "column": "id",
+                            "transform": "bucket",
+                            "num_buckets": 8,
+                            "name": "id_bucket",
+                        },
+                        {"column": "occurred_at", "transform": "void"},
+                    ],
+                    "delete_strategy": "copy_on_write",
+                }
+            },
+        }
+        base = {"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
+        Targetducklake(config={**base, **config})
+        err = capfd.readouterr().err
+        assert "ignoring the Iceberg-only setting(s) ['delete_strategy'" in err
+        assert "skipping the Iceberg-only transform 'truncate'" in err
+        assert "ignoring 'name'" in err
+        layout = resolve_layout(config, "orders", self.COLUMNS)
+        assert layout.partition == (PartitionKey("id", "bucket(8)"),)
+
+    def test_only_iceberg_only_partition_entries_leave_partition_unset(self):
+        """Skipping every entry must not reset a table's partitioning."""
+        only_truncate = {
+            "stream_overrides": {
+                "orders": {
+                    "partition": [{"column": "id", "transform": "truncate", "width": 2}]
+                }
+            }
+        }
+        assert resolve_layout(only_truncate, "orders", self.COLUMNS).partition is None
+        explicit_empty = {"stream_overrides": {"orders": {"partition": []}}}
+        assert resolve_layout(explicit_empty, "orders", self.COLUMNS).partition == ()
+
+    @staticmethod
+    def _table_config(tmp_path: Path, document: dict) -> str:
+        path = tmp_path / "table-config.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        _read_table_config.cache_clear()
+        return str(path)
+
+    V2: ClassVar[dict] = {
+        "version": 2,
+        "warehouse": "acme",
+        "defaults": {
+            "partition": [{"column": "occurred_at", "transform": "day"}],
+            "retention": {"expire_snapshots": {"max_snapshot_age_days": 30}},
+        },
+        "namespaces": {
+            "s": {
+                "tables": {
+                    "orders": {
+                        "partition": [
+                            {"column": "occurred_at", "transform": "month"},
+                            {
+                                "column": "tenant_id",
+                                "transform": "truncate",
+                                "width": 3,
+                            },
+                            {
+                                "column": "Tenant",
+                                "transform": "bucket",
+                                "num_buckets": 4,
+                            },
+                        ],
+                        "ordering": {
+                            "mode": "sort",
+                            "sort": [
+                                {"column": "id", "direction": "desc", "nulls": "first"}
+                            ],
+                        },
+                        "target_file_size_bytes": 268435456,
+                    },
+                    "flat": {"partition": []},
+                    "zorder": {
+                        "ordering": {"mode": "zorder", "zorder": {"columns": ["id"]}}
+                    },
+                }
+            }
+        },
+    }
+
+    def test_table_config_partition_and_sort_order(self, tmp_path: Path):
+        """A table's block wins over defaults; ordering mode sort is the sort order."""
+        # tenant_id is skipped with its truncate transform, so it needn't exist.
+        config = {"table_config": self._table_config(tmp_path, self.V2)}
+        layout = resolve_layout(config, "orders", self.COLUMNS, table=("s", "orders"))
+        assert layout == TableLayout(
+            partition=(
+                PartitionKey("occurred_at", "month"),
+                PartitionKey("Tenant", "bucket(4)"),
+            ),
+            sort=(SortKey("id", "DESC", "NULLS_FIRST"),),
+        )
+        flat = resolve_layout(config, "flat", self.COLUMNS, table=("s", "flat"))
+        assert flat == TableLayout(partition=(), sort=None)
+        zorder = resolve_layout(config, "z", self.COLUMNS, table=("s", "zorder"))
+        assert zorder == TableLayout(partition=(PartitionKey("occurred_at", "day"),))
+        other = resolve_layout(config, "x", self.COLUMNS, table=("other", "t"))
+        assert other.partition == (PartitionKey("occurred_at", "day"),)
+
+    def test_stream_settings_win_over_table_config(self, tmp_path: Path):
+        """Stream settings win over the file, which wins over partition_fields."""
+        config = {
+            "table_config": self._table_config(tmp_path, self.V2),
+            "stream_overrides": {"orders": {"sort_order": ["Tenant"]}},
+            "partition_fields": {
+                "orders": [{"column_name": "id", "type": "identifier"}]
+            },
+        }
+        layout = resolve_layout(config, "orders", self.COLUMNS, table=("s", "orders"))
+        assert layout.sort == (SortKey("Tenant", "ASC", "NULLS_LAST"),)
+        assert layout.partition == (
+            PartitionKey("occurred_at", "month"),
+            PartitionKey("Tenant", "bucket(4)"),
+        )
+
+    @pytest.mark.parametrize(
+        ("content", "message"),
+        [
+            (None, "no such file"),
+            ("{not json", "is not valid JSON"),
+            ("[]", "must hold a JSON object"),
+            (
+                json.dumps(
+                    {"defaults": {"partition": [{"column": "a", "transform": "week"}]}}
+                ),
+                "table_config defaults partition[0]: unknown transform 'week'",
+            ),
+            (
+                json.dumps(
+                    {"defaults": {"partition": [{"column": "a", "transform": "Day"}]}}
+                ),
+                "table_config defaults partition[0]: unknown transform 'Day'",
+            ),
+            (
+                json.dumps(
+                    {"namespaces": {"s": {"tables": {"t": {"ordering": {"mode": 1}}}}}}
+                ),
+                "table_config s.t: ordering mode must be",
+            ),
+            (
+                json.dumps({"tables": {"s.t": {}}}),
+                "the version 1 shape, which Zamboni no longer reads",
+            ),
+            (json.dumps({"version": 3}), "has version 3; target-ducklake reads"),
+            (json.dumps({"version": "2"}), "has version '2'; target-ducklake reads"),
+            (json.dumps({"version": True}), "has version True; target-ducklake reads"),
+        ],
+        ids=[
+            "missing",
+            "bad-json",
+            "not-an-object",
+            "bad-transform",
+            "capitalised-transform",
+            "bad-ordering",
+            "version-1-shape",
+            "version-3",
+            "version-string",
+            "version-bool",
+        ],
+    )
+    def test_a_bad_table_config_fails_at_startup(
+        self, tmp_path: Path, content: str | None, message: str
+    ):
+        """The file is read and its layout sections checked when the target starts."""
+        path = tmp_path / "table-config.json"
+        if content is not None:
+            path.write_text(content, encoding="utf-8")
+        _read_table_config.cache_clear()
+        base = {"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
+        with pytest.raises(LayoutError) as error:
+            Targetducklake(config={**base, "table_config": str(path)})
+        assert message in str(error.value)
+
+    def test_table_config_layout_reaches_the_table(self, tmp_path: Path):
+        """Through listen() on a real catalog, the file's layout is applied."""
+        document = {
+            "version": 2,
+            "warehouse": "acme",
+            "namespaces": {
+                "s": {
+                    "tables": {
+                        "orders": {
+                            "partition": [
+                                {
+                                    "column": "Tenant",
+                                    "transform": "bucket",
+                                    "num_buckets": 4,
+                                }
+                            ],
+                            "ordering": {"mode": "sort", "sort": [{"column": "id"}]},
+                            "partition_evolution": {"enabled": False},
+                        }
+                    }
+                }
+            },
+        }
+        self._run(tmp_path, table_config=self._table_config(tmp_path, document))
+        layout, _, rows = self._state(tmp_path)
+        assert layout == TableLayout(
+            partition=(PartitionKey("Tenant", "bucket(4)"),),
+            sort=(SortKey("id", "ASC", "NULLS_LAST"),),
+        )
+        assert rows == self.ROWS
+
+    def test_target_iceberg_injected_defaults_are_accepted(
+        self, capfd: pytest.CaptureFixture[str]
+    ):
+        """stream_defaults as target-iceberg resolves it (its schema defaults) works."""
+        defaults = {
+            "partition": [{"column": "id"}],
+            "on_error": "raise",
+            "delete_strategy": "copy_on_write",
+            "merge_on_read_maintenance_acknowledged": False,
+        }
+        base = {"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
+        Targetducklake(config={**base, "stream_defaults": defaults})
+        assert "ignoring 'on_error'" in capfd.readouterr().err
+        layout = resolve_layout({"stream_defaults": defaults}, "orders", self.COLUMNS)
+        assert layout.partition == (PartitionKey("id", "identity"),)
+        with pytest.raises(LayoutError, match="DUCKLKD-43"):
+            resolve_layout(
+                {"stream_defaults": {"type_source": {}, "on_error": "null"}},
+                "orders",
+                self.COLUMNS,
+            )
+
+    @pytest.mark.parametrize(
+        ("schema", "table"),
+        [("S", "Orders"), ("s", "ORDERS"), ("s", "Orders Daily")],
+        ids=["upper-schema", "upper-table", "conformed"],
+    )
+    def test_table_config_matches_tables_like_duckdb_and_target_iceberg(
+        self, tmp_path: Path, schema: str, table: str
+    ):
+        """Names match case-insensitively, and by target-iceberg's conformed name."""
+        name = "orders_daily" if " " in table else "orders"
+        block = {"partition": [{"column": "id"}]}
+        document = {"namespaces": {"s": {"tables": {name: block}}}}
+        config = {"table_config": self._table_config(tmp_path, document)}
+        layout = resolve_layout(config, "x", self.COLUMNS, table=(schema, table))
+        assert layout.partition == (PartitionKey("id", "identity"),)
+
+    def test_a_table_missing_from_table_config_is_logged(self, tmp_path: Path):
+        """A table with no block is logged, rather than silently taking defaults."""
+        document: dict = {"namespaces": {"s": {"tables": {}}}}
+        config = {"table_config": self._table_config(tmp_path, document)}
+        logger = Mock()
+        resolve_layout(config, "x", self.COLUMNS, logger, table=("s", "absent"))
+        message, *args = logger.info.call_args.args
+        assert message.startswith("table_config has no block for")
+        assert args == ["s", "absent"]
+
+    @pytest.mark.parametrize(
+        "document",
+        [
+            {"defaults": [1]},
+            {"defaults": "x"},
+            {"version": 2, "namespaces": [1]},
+            {"namespaces": {"s": {"tables": [1]}}},
+            {"namespaces": {"s": "x"}},
+        ],
+        ids=[
+            "defaults-list",
+            "defaults-string",
+            "namespaces-list",
+            "namespace-tables-list",
+            "namespace-string",
+        ],
+    )
+    def test_a_malformed_table_config_shape_is_a_layout_error(
+        self, tmp_path: Path, document: dict
+    ):
+        """Wrong JSON shapes fail at startup with the named message, not a traceback."""
+        base = {"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
+        path = self._table_config(tmp_path, document)
+        with pytest.raises(LayoutError, match="table_config"):
+            Targetducklake(config={**base, "table_config": path})
+
+    @pytest.mark.parametrize(
+        ("ordering", "sort"),
+        [
+            ({}, ()),
+            ({"mode": "none"}, ()),
+            ({"mode": "zorder", "zorder": {"columns": ["id", "Tenant"]}}, None),
+        ],
+        ids=["mode-absent", "mode-none", "mode-zorder"],
+    )
+    def test_table_config_ordering_modes(
+        self, tmp_path: Path, ordering: dict, sort: tuple | None
+    ):
+        """As in Zamboni, an ordering without a mode is mode none: no sort order."""
+        document = {"namespaces": {"s": {"tables": {"t": {"ordering": ordering}}}}}
+        config = {"table_config": self._table_config(tmp_path, document)}
+        layout = resolve_layout(config, "x", self.COLUMNS, table=("s", "t"))
+        assert layout.sort == sort
+
+    @pytest.mark.parametrize(
+        ("ordering", "message"),
+        [
+            ({"sort": [{"column": "id"}]}, "mode is none but an ordering is defined"),
+            ({"zorder": {}}, "mode is none but an ordering is defined"),
+            ({"mode": "sort", "sort": []}, "requires a non-empty sort list"),
+            (
+                {"mode": "sort", "sort": [{"column": "id"}], "zorder": {}},
+                "and no zorder block",
+            ),
+            ({"mode": "zorder"}, "requires a zorder block"),
+            (
+                {"mode": "zorder", "zorder": {}, "sort": [{"column": "id"}]},
+                "and no sort list",
+            ),
+            (
+                {"mode": "sort", "sort": [{"column": "id", "direction": "DESC"}]},
+                "direction must be asc or desc",
+            ),
+            (
+                {"mode": "sort", "sort": [{"column": "id", "directon": "desc"}]},
+                r"unknown key\(s\) \['directon'\]",
+            ),
+            ({"mode": ["sort"]}, "ordering mode must be one of"),
+            ({"mode": {}}, "ordering mode must be one of"),
+            (
+                {"mode": "sort", "sort": [{"column": "id", "direction": ["asc"]}]},
+                "direction must be asc or desc",
+            ),
+            (
+                {"mode": "sort", "sort": [{"column": "id", "nulls": {}}]},
+                "nulls first or last",
+            ),
+        ],
+        ids=[
+            "sort-without-mode",
+            "zorder-without-mode",
+            "empty-sort",
+            "sort-with-zorder",
+            "zorder-without-block",
+            "zorder-with-sort",
+            "uppercase-direction",
+            "misspelt-key",
+            "mode-list",
+            "mode-dict",
+            "direction-list",
+            "nulls-dict",
+        ],
+    )
+    def test_table_config_orderings_zamboni_refuses_are_refused(
+        self, tmp_path: Path, ordering: dict, message: str
+    ):
+        """An ordering Zamboni would refuse isn't read some other way here."""
+        document = {"namespaces": {"s": {"tables": {"t": {"ordering": ordering}}}}}
+        config = {"table_config": self._table_config(tmp_path, document)}
+        with pytest.raises(LayoutError, match=message):
+            check_layout_config(config)
+
+    def test_unknown_table_config_keys_are_logged_not_rejected(self, tmp_path: Path):
+        """A key Zamboni adds for maintenance is reported and loads carry on."""
+        document = {
+            "version": 2,
+            "compaction": {},
+            "namespaces": {"s": {"tables": {"t": {"zone_maps": True}}}},
+        }
+        config = {"table_config": self._table_config(tmp_path, document)}
+        logger = Mock()
+        check_layout_config(config, logger)
+        messages = [call.args for call in logger.info.call_args_list]
+        assert ("table_config: ignoring unknown key(s) %s.", ["compaction"]) in messages
+        assert (
+            "%s: ignoring unknown key(s) %s.",
+            "table_config s.t",
+            ["zone_maps"],
+        ) in messages
+
+    def test_configured_names_match_through_column_truncation(self):
+        """A column named in full in a shared config matches its truncated name."""
+        long_name = "c" * 70
+        config = {"stream_overrides": {"orders": {"sort_order": [long_name]}}}
+        layout = resolve_layout(
+            config,
+            "orders",
+            ["id", "c" * 63],
+            aliases={long_name: "c" * 63},
+        )
+        assert layout.sort == (SortKey("c" * 63, "ASC", "NULLS_LAST"),)
+
+    def test_several_matching_table_blocks_use_the_first_and_log(self, tmp_path: Path):
+        """Blocks that differ only by case: the first in file order wins, logged."""
+        document = {
+            "namespaces": {
+                "s": {
+                    "tables": {
+                        "Orders": {"partition": [{"column": "id"}]},
+                        "orders": {"partition": [{"column": "Tenant"}]},
+                    }
+                }
+            }
+        }
+        config = {"table_config": self._table_config(tmp_path, document)}
+        logger = Mock()
+        layout = resolve_layout(
+            config, "x", self.COLUMNS, logger, table=("s", "ORDERS")
+        )
+        assert layout.partition == (PartitionKey("id", "identity"),)
+        assert logger.info.call_args.args[1:] == (2, "s", "ORDERS", "s.Orders")

@@ -66,7 +66,7 @@ class Targetducklake(SQLTarget):
         self.max_parallelism = 10 if self._drains_in_parallel() else 1
         # Fail at startup on a malformed layout for any stream, including one
         # whose records never arrive; columns are checked per stream later.
-        check_layout_config(self.config)
+        check_layout_config(self.config, self.logger)
         self._MAX_RECORD_AGE_IN_MINUTES = float(
             self.config.get("max_record_age_minutes", 10.0)
         )
@@ -418,6 +418,17 @@ class Targetducklake(SQLTarget):
                 "Per-stream table layout, keyed by stream name, merged over "
                 "stream_defaults key by key; same shape. partition replaces "
                 "partition_fields for that stream. Can be a JSON string."
+            ),
+        ),
+        th.Property(
+            "table_config",
+            th.StringType,
+            title="Table Config Path",
+            description=(
+                "Path to a Zamboni table-config.json (version 2), the file "
+                "target-iceberg reads. Its per-table partition, and an ordering in "
+                "sort mode, set the table layout; Iceberg-only and maintenance "
+                "sections are ignored. A stream's own partition and sort_order win."
             ),
         ),
         th.Property(

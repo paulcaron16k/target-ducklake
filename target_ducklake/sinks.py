@@ -100,12 +100,22 @@ class ducklakeSink(SQLSink):
         )
 
         # Partition keys and sort order (stream_defaults / stream_overrides,
-        # or the older partition_fields), checked against the stream's columns.
+        # table_config, or the older partition_fields), checked against the
+        # stream's columns.
         self.layout = resolve_layout(
             self.config,
             self.stream_name,
             [column["name"] for column in self.ducklake_schema],
             self.logger,
+            # Only table_config needs the target table; deriving it raises for
+            # a stream without a schema name, which may not be needed yet.
+            table=(
+                (self.target_schema, self.target_table)
+                if self.config.get("table_config")
+                else None
+            ),
+            # A shared config names columns in full; Postgres catalogs truncate.
+            aliases=self._column_name_mapping,
         )
 
         if not self.config.get("load_method"):
