@@ -274,7 +274,7 @@ class ducklakeSink(SQLSink):
           kept as sent, whatever its hint (a ``numeric`` hint would otherwise
           store '1.5' as '1.500000000');
         - an ``x-singer.decimal`` string the table has as DECIMAL, such as an
-          unbounded one in a table created as DECIMAL(18, 3) before it became
+          unsized one in a table created as DECIMAL(18, 3) before it became
           VARCHAR: staged as text, DuckDB's cast rounded it silently, and a
           value too large failed with a bare conversion error.
 

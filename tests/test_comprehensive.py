@@ -1461,19 +1461,46 @@ class TestSingerDecimal:
             ({"precision": 0}, "VARCHAR"),
             ({"precision": "10"}, "VARCHAR"),
             ({"precision": 20, "scale": 9}, "DECIMAL(20, 9)"),
-            ({"precision": 10}, "DECIMAL(10, 0)"),
+            ({"precision": 10, "scale": 0}, "DECIMAL(10, 0)"),
+            ({"precision": 10}, "VARCHAR"),
+            ({"precision": 10, "scale": "2"}, "VARCHAR"),
+            ({"precision": 10, "scale": -1}, "VARCHAR"),
+            ({"precision": 10, "scale": 12}, "VARCHAR"),
+            ({"precision": 10, "scale": True}, "VARCHAR"),
+            ({"x-sql-datatype": "numeric"}, "VARCHAR"),
+            ({"x-sql-datatype": "decimal"}, "VARCHAR"),
+            (
+                {"precision": 20, "scale": 9, "x-sql-datatype": "numeric"},
+                "DECIMAL(20, 9)",
+            ),
+            ({"x-sql-datatype": "numeric(12,4)"}, "DECIMAL(12, 4)"),
+            ({"x-sql-datatype": "double"}, "DOUBLE"),
         ],
         ids=[
-            "unbounded",
+            "unsized",
             "precision-bool",
             "precision-zero",
             "precision-text",
-            "bounded",
+            "sized",
+            "scale-zero",
             "no-scale",
+            "scale-text",
+            "scale-negative",
+            "scale-above-precision",
+            "scale-bool",
+            "bare-numeric-hint",
+            "bare-decimal-hint",
+            "sized-with-bare-hint",
+            "sized-hint",
+            "double-hint",
         ],
     )
     def test_column_type(self, extra: dict, expected: str):
-        """Without a usable precision, VARCHAR; with one, an explicit DECIMAL."""
+        """Without usable precision and scale, VARCHAR, as target-iceberg does.
+
+        A bare numeric/decimal hint doesn't size it; a sized or non-decimal
+        hint decides the column.
+        """
         assert str(JSONSchemaToDuckLake().to_sql_type({**self.D, **extra})) == expected
 
     def test_precision_above_38_is_capped_with_a_warning(self):
@@ -1484,7 +1511,7 @@ class TestSingerDecimal:
             )
         assert str(column) == "DECIMAL(38, 9)"
 
-    def test_an_unbounded_decimal_is_logged_by_name(
+    def test_an_unsized_decimal_is_logged_by_name(
         self, caplog: pytest.LogCaptureFixture
     ):
         """The VARCHAR fallback is reported, naming the property."""
@@ -1494,6 +1521,7 @@ class TestSingerDecimal:
         with caplog.at_level("WARNING", logger="target_ducklake.connector"):
             connector.json_to_ducklake_schema({"amount": self.D})
         assert "Property 'amount' is an x-singer.decimal string" in caplog.text
+        assert "precision=None, scale=None" in caplog.text
 
     @staticmethod
     def _load(tmp_path: Path, prop: dict, values: list) -> list[tuple]:
@@ -1531,7 +1559,7 @@ class TestSingerDecimal:
         con.close()
         return rows
 
-    def test_unbounded_values_keep_every_digit(self, tmp_path: Path):
+    def test_unsized_values_keep_every_digit(self, tmp_path: Path):
         """'1.123456789' isn't rounded to 1.123, and 20 digits don't fail."""
         values = ["1.123456789", "12345678901234567890", None]
         rows = self._load(tmp_path, self.D, values)
@@ -1547,11 +1575,24 @@ class TestSingerDecimal:
         rows = self._load(tmp_path, prop, ["1.123456789"])
         assert rows == [("1.123456789", "DECIMAL(20,9)")]
 
-    def test_rounding_to_a_missing_scale_is_reported(
+    @pytest.mark.parametrize(
+        "extra",
+        [{"precision": 10}, {"x-sql-datatype": "numeric"}],
+        ids=["no-scale", "bare-numeric-hint"],
+    )
+    def test_a_missing_scale_or_bare_hint_keeps_every_digit(
+        self, tmp_path: Path, extra: dict
+    ):
+        """'1.5' isn't rounded to 2 (scale 0), nor 15 fraction digits to 9."""
+        values = ["1.5", "1.123456789012345"]
+        rows = self._load(tmp_path, {**self.D, **extra}, values)
+        assert rows == [("1.5", "VARCHAR"), ("1.123456789012345", "VARCHAR")]
+
+    def test_bounded_rounding_is_reported(
         self, tmp_path: Path, capfd: pytest.CaptureFixture[str]
     ):
-        """DECIMAL(10) is scale 0, as before, but rounding it is now logged."""
-        prop = {**self.D, "precision": 10}
+        """A sized decimal is staged at its type, so rounding is logged."""
+        prop = {**self.D, "precision": 10, "scale": 0}
         rows = self._load(tmp_path, prop, ["1.5"])
         assert rows == [("2", "DECIMAL(10,0)")]
         assert "1 value(s) in column 'amount'" in capfd.readouterr().err
