@@ -59,7 +59,7 @@ Each side was inventoried from its code against the same checklist, with `file:l
 | **Layout** | partition transforms | ✅ identity, year–hour, bucket (DUCKLKD-38); no truncate/void in DuckLake 1.5.2 | ✅ identity, year–hour, bucket, truncate, void | — |
 | | when applied | at creation, then only when changed (DUCKLKD-38) | at creation only | — (deliberate difference) |
 | | sort order | ✅ `sort_order` (DUCKLKD-38) | ⚠ `sort_order` declared, never applied | Iceberg |
-| | shared `table-config.json` | ✗ | ◐ `partition` only | DuckLake · DUCKLKD-38 (optional) |
+| | shared `table-config.json` | ✅ version 2 only, as Zamboni v0.7.0; `partition` and sort-mode `ordering`; pinned to Zamboni's spec by contract tests (DUCKLKD-94) | ◐ `partition` only, version 1 only, so a v2 file's partitions are silently not applied (being fixed there) | Iceberg |
 | | small-file control | ✗ inlining forced off | ✗ (format v2, object-storage layout) | DuckLake · DUCKLKD-39 |
 | **Catalog & storage** | catalog types | Postgres, SQLite, MySQL, DuckDB | REST, SQL | — |
 | | catalog auth | password in URL | OAuth2, bearer token, TLS settings | DuckLake · DUCKLKD-26 |
@@ -97,7 +97,9 @@ These are recorded here for target-iceberg's own tracker and are not filed on th
 
 **Two different "write modes".** In xflow, "write mode" per table means Iceberg's `write.delete.mode`/`write.update.mode` table properties. target-iceberg sets them from the per-stream `delete_strategy` (`copy_on_write` or `merge_on_read`; sinks.py:273-279, 535-546), and that works. target-iceberg's per-stream `write_mode` is a different, Singer-level idea: a per-stream override of `load_method` (append, upsert, overwrite), and it is the dead key above. For target-ducklake:
 - **`write_mode` is a cautionary tale.** target-ducklake rejects it at startup (DUCKLKD-38), pointing to DUCKLKD-41, so it can't silently fall back to the global `load_method`. DUCKLKD-41 must honour any per-stream load method it accepts, or reject it.
-- **`delete_strategy` has no DuckLake counterpart.** A DuckLake DELETE (and so a merge) always writes delete files that readers apply, which is merge-on-read; rewriting them away is maintenance (DUCKLKD-33). target-ducklake currently rejects `delete_strategy` like any other unsupported layout key.
+- **`delete_strategy` has no DuckLake counterpart.** A DuckLake DELETE (and so a merge) always writes delete files that readers apply, which is merge-on-read; rewriting them away is maintenance (DUCKLKD-33). Since DUCKLKD-94, target-ducklake accepts and ignores `delete_strategy` and `merge_on_read_maintenance_acknowledged` (logged), so a shared config works.
+
+**Shared config (DUCKLKD-94).** A target-iceberg config now loads on target-ducklake: Iceberg-only settings (`delete_strategy`, `on_error` without `type_source`, partition `name`, `truncate`/`void` entries, `zorder`) are ignored with a log line, and settings that change what is loaded (`write_mode`, `key_properties`, `type_source`) are rejected naming DUCKLKD-41/43. `table_config` reads Zamboni's version 2 only; Zamboni v0.7.0 refuses version 1, so accepting it would make a "shared" file work in one place only. target-ducklake vendors Zamboni's published spec in `tests/contracts/` and asserts `TABLE_CONFIG_VERSION = 2`, target-iceberg's vendor-and-assert-version pattern; target-iceberg's own reader is v1-only and its agent is fixing that.
 
 ## Divergences for xflow
 
@@ -110,7 +112,7 @@ Each of these is a design choice in one target; xflow sees different tables for 
 | `hard_delete` | SDK default false; ACTIVATE_VERSION soft-deletes unless true | default true; `false` refused | — (document) |
 | schema routing | `default_target_schema`, else derived from `schema-table` stream names | `default_target_schema`, default `elt_raw` | — (document) |
 | batch size | `max_batch_size` | `batch_size_rows` | DUCKLKD-92 |
-| per-stream config | `stream_defaults` / `stream_overrides` (DUCKLKD-38); `partition_fields` still accepted | `stream_defaults` / `stream_overrides` | aligned |
+| per-stream config | `stream_defaults` / `stream_overrides` (DUCKLKD-38); `partition_fields` still accepted; target-iceberg's keys accepted (DUCKLKD-94) | `stream_defaults` / `stream_overrides` | aligned |
 
 ## For DUCKLKD-38
 
