@@ -11,7 +11,15 @@ from typing import Any
 import duckdb
 from singer_sdk.connectors import SQLConnector
 from singer_sdk.connectors.sql import JSONSchemaToSQL
-from sqlalchemy.types import BIGINT, DECIMAL, INTEGER, JSON, TypeEngine, UserDefinedType
+from sqlalchemy.types import (
+    BIGINT,
+    DECIMAL,
+    INTEGER,
+    JSON,
+    VARCHAR,
+    TypeEngine,
+    UserDefinedType,
+)
 
 from target_ducklake.layout import PartitionKey, SortKey, TableLayout
 from target_ducklake.parquet_utils import number_precision_and_scale
@@ -109,6 +117,21 @@ class DuckDBType(UserDefinedType):
         return self.name
 
 
+SINGER_DECIMAL_FORMAT = "x-singer.decimal"
+
+
+def is_unbounded_singer_decimal(schema: dict) -> bool:
+    """Whether a property is an ``x-singer.decimal`` string without a precision.
+
+    A precision that isn't a positive integer (``true``, ``0``, ``"10"``) is no
+    precision.
+    """
+    precision = schema.get("precision")
+    return schema.get("format") == SINGER_DECIMAL_FORMAT and not (
+        isinstance(precision, int) and not isinstance(precision, bool) and precision > 0
+    )
+
+
 class JSONSchemaToDuckLake(JSONSchemaToSQL):
     """Convert JSON Schema types to DuckLake compatible types."""
 
@@ -148,6 +171,34 @@ class JSONSchemaToDuckLake(JSONSchemaToSQL):
         self.register_type_handler("integer", self._handle_integer_type)
         # Override number handling to use high-precision decimals by default
         self.register_type_handler("number", self._handle_number_type)
+        self.register_format_handler(
+            SINGER_DECIMAL_FORMAT, self._handle_singer_decimal_format
+        )
+
+    def _handle_singer_decimal_format(self, jsonschema: dict) -> TypeEngine:
+        """Handle a string with format ``x-singer.decimal``.
+
+        With a precision, ``DECIMAL(precision, scale)``, a missing scale being
+        0 as in SQL (and as the SDK's ``DECIMAL(precision)`` is in DuckDB). Both
+        are spelt out so the values are staged at that type, and any rounding is
+        reported; a precision above 38 is capped, as for a JSON number. Without
+        a precision the decimal is unbounded, which no DuckDB DECIMAL holds: the
+        SDK's bare ``DECIMAL`` is DECIMAL(18, 3) in DuckDB, which rounds to 3
+        places and fails on more than 15 integer digits. So the column is
+        VARCHAR, keeping the text digit for digit, as target-iceberg keeps it as
+        a string.
+        """
+        if is_unbounded_singer_decimal(jsonschema):
+            return VARCHAR()
+        scale = jsonschema.get("scale")
+        return DECIMAL(
+            *number_precision_and_scale(
+                {
+                    "precision": jsonschema["precision"],
+                    "scale": 0 if scale is None else scale,
+                }
+            )
+        )
 
     def _handle_integer_type(self, jsonschema: dict) -> INTEGER | BIGINT:
         """Handle integer type."""
@@ -870,6 +921,13 @@ class DuckLakeConnector(SQLConnector):
         ducklake_schema = []
         converter = JSONSchemaToDuckLake()
         for prop_name, prop_schema in schema.items():
+            if is_unbounded_singer_decimal(prop_schema):
+                logger.warning(
+                    "Property %r is an x-singer.decimal string without a precision; "
+                    "loading it as VARCHAR so every digit is kept. Declare precision "
+                    "and scale to load it as DECIMAL.",
+                    prop_name,
+                )
             ducklake_schema.append(
                 {"name": prop_name, "type": str(converter.to_sql_type(prop_schema))}
             )

@@ -1204,6 +1204,28 @@ class TestExistingNumberColumnStaging:
         with pytest.raises(ValueError, match="Column 'amount' is DECIMAL"):
             self._load(tmp_path, column_ddl, {"type": "number"}, [value])
 
+    def test_singer_decimal_on_existing_decimal_column_is_rounded_with_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        """A table made as DECIMAL(18, 3) by the old mapping keeps its column.
+
+        DuckLake can't change DECIMAL to VARCHAR, so the column must be
+        recreated to keep every digit; meanwhile rounding is reported, and a
+        value too large fails naming the column, instead of DuckDB's silent
+        text cast and bare conversion error.
+        """
+        prop = {"type": ["null", "string"], "format": "x-singer.decimal"}
+        with caplog.at_level("WARNING", logger="target_ducklake.parquet_utils"):
+            rows, _ = self._load(
+                tmp_path, "amount DECIMAL(18, 3)", prop, ["1.123456789"]
+            )
+        assert rows == [Decimal("1.123")]
+        assert "1 value(s) in column 'amount'" in caplog.text
+        with pytest.raises(ValueError, match="Column 'amount' is DECIMAL"):
+            self._load(
+                tmp_path, "amount DECIMAL(18, 3)", prop, ["12345678901234567890"]
+            )
+
     def test_float_hint_on_existing_decimal_column_keeps_the_column(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ):
@@ -1424,6 +1446,115 @@ class TestDecimalPrecision:
         assert ddl == "DECIMAL(38, 33)"
         assert schema.field("amount").type == pa.decimal128(38, 33)
         assert [r[0] for r in con.execute("SELECT amount FROM t").fetchall()] == values
+
+
+class TestSingerDecimal:
+    """Strings with format x-singer.decimal keep every digit (DUCKLKD-84)."""
+
+    D: ClassVar[dict] = {"type": ["null", "string"], "format": "x-singer.decimal"}
+
+    @pytest.mark.parametrize(
+        ("extra", "expected"),
+        [
+            ({}, "VARCHAR"),
+            ({"precision": True}, "VARCHAR"),
+            ({"precision": 0}, "VARCHAR"),
+            ({"precision": "10"}, "VARCHAR"),
+            ({"precision": 20, "scale": 9}, "DECIMAL(20, 9)"),
+            ({"precision": 10}, "DECIMAL(10, 0)"),
+        ],
+        ids=[
+            "unbounded",
+            "precision-bool",
+            "precision-zero",
+            "precision-text",
+            "bounded",
+            "no-scale",
+        ],
+    )
+    def test_column_type(self, extra: dict, expected: str):
+        """Without a usable precision, VARCHAR; with one, an explicit DECIMAL."""
+        assert str(JSONSchemaToDuckLake().to_sql_type({**self.D, **extra})) == expected
+
+    def test_precision_above_38_is_capped_with_a_warning(self):
+        """As for a JSON number, instead of DuckDB refusing DECIMAL(50, 10)."""
+        with pytest.warns(UserWarning, match="exceeds DuckDB's 38-digit DECIMAL"):
+            column = JSONSchemaToDuckLake().to_sql_type(
+                {**self.D, "precision": 50, "scale": 10}
+            )
+        assert str(column) == "DECIMAL(38, 9)"
+
+    def test_an_unbounded_decimal_is_logged_by_name(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """The VARCHAR fallback is reported, naming the property."""
+        connector = DuckLakeConnector(
+            {"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
+        )
+        with caplog.at_level("WARNING", logger="target_ducklake.connector"):
+            connector.json_to_ducklake_schema({"amount": self.D})
+        assert "Property 'amount' is an x-singer.decimal string" in caplog.text
+
+    @staticmethod
+    def _load(tmp_path: Path, prop: dict, values: list) -> list[tuple]:
+        config = {
+            "catalog_type": "sqlite",
+            "catalog_url": str(tmp_path / "catalog.sqlite"),
+            "data_path": str(tmp_path / "data") + "/",
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging") + "/",
+        }
+        schema = {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}, "amount": prop},
+        }
+        schema_message = {"type": "SCHEMA", "stream": "t", "schema": schema}
+        messages = [{**schema_message, "key_properties": ["id"]}]
+        messages += [
+            {"type": "RECORD", "stream": "t", "record": {"id": i, "amount": v}}
+            for i, v in enumerate(values)
+        ]
+        target = Targetducklake(config=config)
+        target.listen(
+            file_input=io.StringIO("".join(json.dumps(m) + "\n" for m in messages))
+        )
+        target.target_connector.close()
+        con = duckdb.connect()
+        con.execute(
+            f"ATTACH 'ducklake:sqlite:{tmp_path / 'catalog.sqlite'}' AS lake "
+            f"(DATA_PATH '{tmp_path / 'data'}/')"
+        )
+        rows = con.execute(
+            "SELECT amount::VARCHAR, typeof(amount) FROM lake.s.t ORDER BY id"
+        ).fetchall()
+        con.close()
+        return rows
+
+    def test_unbounded_values_keep_every_digit(self, tmp_path: Path):
+        """'1.123456789' isn't rounded to 1.123, and 20 digits don't fail."""
+        values = ["1.123456789", "12345678901234567890", None]
+        rows = self._load(tmp_path, self.D, values)
+        assert rows == [
+            ("1.123456789", "VARCHAR"),
+            ("12345678901234567890", "VARCHAR"),
+            (None, "VARCHAR"),
+        ]
+
+    def test_bounded_values_are_unchanged(self, tmp_path: Path):
+        """With precision and scale, the column is DECIMAL(p, s) as before."""
+        prop = {**self.D, "precision": 20, "scale": 9}
+        rows = self._load(tmp_path, prop, ["1.123456789"])
+        assert rows == [("1.123456789", "DECIMAL(20,9)")]
+
+    def test_rounding_to_a_missing_scale_is_reported(
+        self, tmp_path: Path, capfd: pytest.CaptureFixture[str]
+    ):
+        """DECIMAL(10) is scale 0, as before, but rounding it is now logged."""
+        prop = {**self.D, "precision": 10}
+        rows = self._load(tmp_path, prop, ["1.5"])
+        assert rows == [("2", "DECIMAL(10,0)")]
+        assert "1 value(s) in column 'amount'" in capfd.readouterr().err
 
 
 class TestIntegrationScenarios:
