@@ -1075,7 +1075,7 @@ class TestStagingFollowsColumnType:
                 Decimal("Infinity"),
                 ValueError,
             ),
-            ({"type": "string", "x-sql-datatype": "double"}, "abc", pa.ArrowInvalid),
+            ({"type": "string", "x-sql-datatype": "double"}, "abc", ValueError),
             ({"type": "string", "x-sql-datatype": "bigint"}, "1e30", ValueError),
             ({"type": "integer", "x-sql-datatype": "bigint"}, 2**63, ValueError),
             # Rejected at once, without building a million-digit int.
@@ -2625,7 +2625,8 @@ class TestMergeKeyTableTypes:
 class TestValueTypeChecking:
     """value_type_checking: what staging does with a number its column would round.
 
-    permissive (the default) rounds it as DuckDB's cast does and warns; strict
+    permissive (the default) rounds it as DuckDB's cast of a DECIMAL does and
+    warns; strict
     fails the batch naming the column and the value (DUCKLKD-97, DUCKLKD-99).
     Runs the target through ``listen()`` on a real SQLite DuckLake catalog.
     The key is ``K``: the singer-sdk lowercases key_properties, the column
@@ -2649,6 +2650,7 @@ class TestValueTypeChecking:
         ``ddl`` (the columns besides v) creates the table first; None lets the
         target create it. Rows are ordered by v.
         """
+        tmp_path.mkdir(parents=True, exist_ok=True)
         catalog = tmp_path / "catalog.sqlite"
         attach = (
             f"ATTACH 'ducklake:sqlite:{catalog}' AS lake "
@@ -2762,11 +2764,9 @@ class TestValueTypeChecking:
         """Every load method dedups on the key in the batch, so all must fail."""
         del rows
         for load_method in ("merge", "append", "overwrite"):
-            run_path = tmp_path / load_method
-            run_path.mkdir()
             with pytest.raises(ValueError, match=error):
                 self._load_keys(
-                    run_path,
+                    tmp_path / load_method,
                     key_type,
                     prop,
                     keys,
@@ -2877,6 +2877,30 @@ class TestValueTypeChecking:
         """Strict changes nothing for a value that needs no rounding."""
         rows = self._load_values(tmp_path, "DECIMAL(10, 2)", [1.5, 2], **self.STRICT)
         assert [n for _, n, _ in rows] == ["1.50", "2.00"]
+
+    def test_a_double_hinted_value_is_rounded_as_a_decimal(self, tmp_path: Path):
+        """The JSON's exact 2.5 rounds to 3, not to DuckDB's DOUBLE-cast 2.
+
+        A double-hinted number on an existing BIGINT column is staged at the
+        integer too, so 1e19 fails naming the column instead of overflowing
+        in DuckDB's cast.
+        """
+        prop = {"type": "number", "x-sql-datatype": "double"}
+        props = {"K": {"type": "integer"}, "n": prop}
+        records = [{"K": 1, "n": 2.5, "v": "a"}]
+        rows = self._load(tmp_path / "half", '"K" BIGINT, n BIGINT', props, records)
+        assert rows == [("1", "3", "a")]
+        records = [{"K": 1, "n": 1e19, "v": "a"}]
+        with pytest.raises(ValueError, match="Column 'n' holds 64-bit integers"):
+            self._load(tmp_path / "big", '"K" BIGINT, n BIGINT', props, records)
+
+    def test_text_for_a_float_column_fails_naming_the_column(self):
+        """The error names the column, which pyarrow's 'Could not convert' omits."""
+        schema = pa.schema([pa.field("ratio", pa.float64())])
+        with pytest.raises(
+            ValueError, match="Column 'ratio' holds floating-point numbers; 'abc'"
+        ):
+            create_pyarrow_table([{"ratio": "abc"}], schema)
 
     def test_an_unknown_mode_is_refused_at_startup(self, tmp_path: Path):
         """A typo isn't read as permissive: the config fails validation."""

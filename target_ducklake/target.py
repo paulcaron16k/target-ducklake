@@ -503,13 +503,13 @@ class Targetducklake(SQLTarget):
             description=(
                 "What to do with a number its column would round: more fraction "
                 "digits than a DECIMAL column holds, or a fraction for an integer "
-                "column. permissive (default) rounds it as DuckDB's cast does, "
-                "half away from zero, and warns how many values in each column "
-                "were rounded, saying so when the column is a key (records whose "
+                "column. permissive (default) rounds it as DuckDB's cast of a DECIMAL"
+                " does, half away from zero, and warns how many values in each column"
+                " were rounded, saying so when the column is a key (records whose "
                 "keys round alike are merged). strict fails the batch, naming the "
-                "column and the value: use it while onboarding a source. A value "
-                "a column can't hold at all, such as one with too many integer "
-                "digits, fails either way, as DuckDB's cast would."
+                "column and the value: use it while onboarding a source. A value a "
+                "column can't hold at all, such as one with too many integer digits, "
+                "fails either way, as DuckDB's cast would."
             ),
         ),
         th.Property(

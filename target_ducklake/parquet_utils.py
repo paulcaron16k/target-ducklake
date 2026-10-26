@@ -15,8 +15,10 @@ from target_ducklake.type_hints import decimal_hint
 DECIMAL_MAX_PRECISION = 38
 DECIMAL_DEFAULT_SCALE = 9
 # Python's default decimal context keeps only 28 digits; DECIMAL(38, s) needs 38.
-# DuckDB's cast rounds half away from zero (1.225 to 1.23 in DECIMAL(10, 2),
-# 2.5 to 3 in BIGINT), which is Python's ROUND_HALF_UP.
+# DuckDB's cast of a DECIMAL rounds half away from zero (1.225 to 1.23 in
+# DECIMAL(10, 2), 2.5 to 3 in BIGINT), which is Python's ROUND_HALF_UP. (Its
+# cast of a DOUBLE rounds half to even, but values reach staging as the exact
+# Decimals the JSON held, so they are rounded as decimals, whatever the hint.)
 _DECIMAL_CONTEXT = Context(prec=DECIMAL_MAX_PRECISION, rounding=ROUND_HALF_UP)
 
 # value_type_checking: what staging does with a value its column would round.
@@ -183,7 +185,8 @@ class StagingRules:
     A value with more fraction digits than its DECIMAL column holds, or a
     fraction for an integer column, is one DuckDB's cast would round. With
     ``strict`` it fails the batch, naming the column and the value. Otherwise
-    it is rounded as DuckDB's cast rounds it, and a warning counts the rounded
+    it is rounded as DuckDB's cast of a DECIMAL rounds it (half away from
+    zero), and a warning counts the rounded
     values per column; for a key column the warning says records may have
     merged. A value a column can't hold at all (too many integer digits, text
     that isn't a number) fails either way, as DuckDB's cast fails on it.
@@ -274,7 +277,7 @@ def _decimal_column(
 ) -> list[Decimal | None]:
     """Round each value to the column's scale, failing on any that doesn't fit.
 
-    Extra fraction digits are rounded half away from zero, as DuckDB's own
+    Extra fraction digits are rounded half away from zero, as DuckDB's
     cast to the column rounds them, and a warning reports how many values
     were rounded; with strict ``rules`` such a value fails the batch instead.
     A value with more integer digits than DECIMAL(p, s) holds, a non-finite
@@ -484,6 +487,15 @@ def _coerce_column(
         return _integer_column(values, field, rules)
     if pa.types.is_floating(field.type):
         values = [_number_text(v) for v in values]
+        for value in values:
+            # A ValueError, as for every value staging refuses; pyarrow's
+            # own error wouldn't name the column.
+            if isinstance(value, str):
+                msg = (
+                    f"Column {field.name!r} holds floating-point numbers; "
+                    f"{_shown(value)} is not a number."
+                )
+                raise ValueError(msg)  # noqa: TRY004
     if pa.types.is_string(field.type):
         values = [_scalar_text(v) for v in values]
     if any(_has_fixed_offset(v) for v in values) or _mixes_zones(values):
