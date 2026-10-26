@@ -50,6 +50,7 @@ Each side was inventoried from its code against the same checklist, with `file:l
 | | objects / arrays | JSON text, or flattened | ✅ native struct / list when properties/items are declared; JSON text otherwise | DuckLake · **DUCKLKD-85** |
 | | `anyOf` / `oneOf` / `allOf` | ✅ first typed branch, wrapper hint carried | ✗ string with a warning | Iceberg |
 | | multi-type | ✅ VARCHAR, exact text | ◐ string with a warning | — |
+| | a number its column would round (extra fraction digits, a fraction for an integer) | ✅ `value_type_checking`: `permissive` (default) rounds as DuckDB's DECIMAL cast, with a warning (a key warning says records merge); `strict` fails naming column and value (DUCKLKD-97, DUCKLKD-99) | ◐ strict only: Arrow refuses a decimal rescale; no setting | Divergence (no shared setting) |
 | | `type_source` (all-string taps) | ✗ (`auto_cast_timestamps` only) | ✅ per stream, `on_error` policy | DuckLake · DUCKLKD-43 |
 | | binary (`contentEncoding: base64`) | ✗ text | ✅ strict decode | DuckLake · **DUCKLKD-91** |
 | **Schema** | add columns | ✅ | ✅ (refused on upsert tables with rows: a PyIceberg limit) | Iceberg (upstream limit) |
