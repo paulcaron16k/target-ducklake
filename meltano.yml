@@ -134,6 +134,17 @@ plugins:
       description: Whether to validate the schema of the incoming streams.
       default: false
 
+    - name: value_type_checking
+      kind: options
+      label: Value Type Checking
+      description: What to do with a number its column would round (extra fraction digits for a DECIMAL column, a fraction for an integer column). permissive rounds it as DuckDB's cast of a DECIMAL does (half away from zero), with a warning; strict fails the batch naming the column and the value. A value a column can't hold at all fails either way.
+      default: permissive
+      options:
+        - label: Permissive
+          value: permissive
+        - label: Strict
+          value: strict
+
     - name: load_method
       kind: string
       label: Load Method
