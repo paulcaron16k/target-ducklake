@@ -2620,6 +2620,167 @@ class TestMergeKeyTableTypes:
         assert rows == [("a", "second")]
 
 
+class TestKeysStagedExactly:
+    """A key value the key column would change fails the batch (DUCKLKD-97).
+
+    A rounded key identifies another row: keys 1.231 and 1.234 in a
+    DECIMAL(10, 2) column both became 1.23, the merge kept one row, and the
+    other record was lost with only the generic rounding warning. Runs the
+    target through ``listen()`` on a real SQLite DuckLake catalog. The key is
+    ``K``: the singer-sdk lowercases key_properties, the column keeps its case.
+    """
+
+    NUMBER = {"type": "number"}  # noqa: RUF012
+    SINGER_DECIMAL = {"type": "string", "format": "x-singer.decimal"}  # noqa: RUF012
+
+    @staticmethod
+    def _load(
+        tmp_path: Path,
+        key_type: str | None,
+        prop: dict,
+        keys: list,
+        **config: object,
+    ) -> list[tuple]:
+        """Load one record per key (v = 'a', 'b', ...); return (K, v) rows.
+
+        ``key_type`` creates the table first; None lets the target create it.
+        """
+        catalog = tmp_path / "catalog.sqlite"
+        attach = (
+            f"ATTACH 'ducklake:sqlite:{catalog}' AS lake "
+            f"(DATA_PATH '{tmp_path / 'data'}/')"
+        )
+        con = duckdb.connect()
+        con.execute(attach)
+        con.execute("CREATE SCHEMA lake.s")
+        if key_type:
+            con.execute(f'CREATE TABLE lake.s.t ("K" {key_type}, v VARCHAR)')
+        con.close()
+        config = {
+            "catalog_type": "sqlite",
+            "catalog_url": str(catalog),
+            "data_path": str(tmp_path / "data") + "/",
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging") + "/",
+            **config,
+        }
+        schema = {
+            "type": "object",
+            "properties": {"K": prop, "v": {"type": "string"}},
+        }
+        messages = [
+            {"type": "SCHEMA", "stream": "t", "schema": schema, "key_properties": ["K"]}
+        ]
+        messages += [
+            {"type": "RECORD", "stream": "t", "record": {"K": k, "v": v}}
+            for k, v in zip(keys, "abcdef", strict=False)
+        ]
+        target = Targetducklake(config=config)
+        try:
+            target.listen(
+                file_input=io.StringIO(
+                    "".join(json.dumps(m) + "\n" for m in messages)
+                )
+            )
+        finally:
+            target.target_connector.close()
+        con = duckdb.connect()
+        con.execute(attach)
+        rows = con.execute('SELECT "K"::VARCHAR, v FROM lake.s.t ORDER BY v')
+        result = rows.fetchall()
+        con.close()
+        return result
+
+    @pytest.mark.parametrize(
+        ("key_type", "prop", "keys", "error"),
+        [
+            (
+                "DECIMAL(10, 2)",
+                NUMBER,
+                [1.231, 1.234],
+                r"Column 'K' is DECIMAL\(10, 2\); Decimal\('1.231'\) would be "
+                r"rounded to 1.23, but the column is a key",
+            ),
+            (
+                "DECIMAL(18, 3)",
+                SINGER_DECIMAL,
+                ["1.2341", "1.2344"],
+                r"Column 'K' is DECIMAL\(18, 3\); '1.2341' would be rounded",
+            ),
+            # Staged as DECIMAL(38, 9), the merge's cast to BIGINT rounded 1.5
+            # to 2 with no warning, and left two rows with key 2.
+            (
+                "BIGINT",
+                NUMBER,
+                [1.5, 2],
+                r"Column 'K' holds whole numbers; Decimal\('1.5'\) is not one",
+            ),
+            (
+                None,
+                NUMBER,
+                [1.0000000001, 1.0000000002],
+                r"Column 'K' is DECIMAL\(38, 9\); Decimal\('1.0000000001'\) would "
+                r"be rounded",
+            ),
+        ],
+        ids=["decimal-number", "decimal-singer-decimal", "bigint", "new-table"],
+    )
+    def test_keys_that_would_be_rounded_fail(
+        self, tmp_path: Path, key_type: str | None, prop: dict, keys: list, error: str
+    ):
+        """Every load method dedups on the key in the batch, so all must fail."""
+        for load_method in ("merge", "append", "overwrite"):
+            run_path = tmp_path / load_method
+            run_path.mkdir()
+            with pytest.raises(ValueError, match=error):
+                self._load(run_path, key_type, prop, keys, load_method=load_method)
+
+    @pytest.mark.parametrize(
+        ("key_type", "prop", "keys", "rows"),
+        [
+            (
+                "DECIMAL(10, 2)",
+                NUMBER,
+                [1.23, 1.5, 1.230],
+                [("1.50", "b"), ("1.23", "c")],
+            ),
+            ("BIGINT", NUMBER, [1, 2.0, 2], [("1", "a"), ("2", "c")]),
+            ("DECIMAL(18, 3)", SINGER_DECIMAL, ["7.125"], [("7.125", "a")]),
+        ],
+        ids=["decimal", "bigint", "singer-decimal"],
+    )
+    def test_keys_the_column_holds_exactly_merge(
+        self, tmp_path: Path, key_type: str, prop: dict, keys: list, rows: list
+    ):
+        """1.230 is the key 1.23 and 2.0 the key 2: the later record wins."""
+        assert self._load(tmp_path, key_type, prop, keys) == rows
+
+    def test_a_non_key_column_is_still_rounded_with_the_warning(self):
+        """Only key columns are staged exactly; other values keep the warning."""
+        schema = pa.schema([("k", pa.int64()), ("amount", pa.decimal128(10, 2))])
+        table = create_pyarrow_table(
+            [{"k": 1, "amount": Decimal("1.231")}],
+            schema,
+            key_columns=frozenset({"k"}),
+        )
+        assert table.column("amount").to_pylist() == [Decimal("1.23")]
+
+    def test_number_key_on_an_integer_column_is_staged_as_the_integer(self):
+        """A key column the table has as BIGINT stages as int64; a value doesn't."""
+        number = "DECIMAL(38, 9)"
+        staged = ducklakeSink._staged_columns(
+            [{"name": "k", "type": number}, {"name": "n", "type": number}],
+            {"k": "BIGINT", "n": "BIGINT"},
+            {"k": self.NUMBER, "n": self.NUMBER},
+            frozenset({"k"}),
+        )
+        assert staged == [
+            {"name": "k", "type": "BIGINT"},
+            {"name": "n", "type": number},
+        ]
+
+
 class TestTimezoneOffsets:
     """Timestamps with any fixed UTC offset load, with or without convert_tz_to_utc.
 
