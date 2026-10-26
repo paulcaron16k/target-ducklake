@@ -178,24 +178,31 @@ class _DecimalMismatchError(ValueError):
     text rather than a number.
     """
 
-    def __init__(self, field: pa.Field, value: object) -> None:
+    def __init__(
+        self, field: pa.Field, value: object, problem: str = "doesn't fit."
+    ) -> None:
         shown = repr(value)
         if len(shown) > _MAX_SHOWN_VALUE:
             shown = shown[: _MAX_SHOWN_VALUE - 3] + "..."
         precision, scale = field.type.precision, field.type.scale
         super().__init__(
-            f"Column {field.name!r} is DECIMAL({precision}, {scale}); "
-            f"{shown} doesn't fit."
+            f"Column {field.name!r} is DECIMAL({precision}, {scale}); {shown} {problem}"
         )
 
 
-def _decimal_column(values: list, field: pa.Field) -> list[Decimal | None]:
+def _decimal_column(
+    values: list, field: pa.Field, *, exact: bool = False
+) -> list[Decimal | None]:
     """Round each value to the column's scale, failing on any that doesn't fit.
 
     Extra fraction digits are rounded half-even, as DuckDB's own cast to the
     column rounds them, and a warning reports how many values were rounded.
     A value with more integer digits than DECIMAL(p, s) holds, a non-finite
     number or text that isn't a number raises ValueError naming the column.
+
+    With ``exact`` (a key column), a value that would be rounded raises
+    instead: a rounded key identifies another row, so distinct keys (1.231
+    and 1.234 in DECIMAL(10, 2)) would merge into one and a record be lost.
     """
     precision, scale = field.type.precision, field.type.scale
     quantum = Decimal(1).scaleb(-scale)
@@ -203,18 +210,25 @@ def _decimal_column(values: list, field: pa.Field) -> list[Decimal | None]:
     changed = 0
     for value in values:
         try:
-            exact = _as_decimal(value)
-            if exact is None:
+            exact_value = _as_decimal(value)
+            if exact_value is None:
                 rounded.append(None)
                 continue
-            result = exact.quantize(quantum, context=_DECIMAL_CONTEXT)
+            result = exact_value.quantize(quantum, context=_DECIMAL_CONTEXT)
         except InvalidOperation:  # not a number, or more than 38 digits
             raise _DecimalMismatchError(field, value) from None
         if not result.is_finite() or (
             result and result.adjusted() >= precision - scale
         ):
             raise _DecimalMismatchError(field, value)
-        changed += result != exact
+        if exact and result != exact_value:
+            raise _DecimalMismatchError(
+                field,
+                value,
+                f"would be rounded to {result}, but the column is a key: records "
+                "with different keys would merge into one row.",
+            )
+        changed += result != exact_value
         rounded.append(result)
     if changed:
         logger.warning(
@@ -362,10 +376,13 @@ def _integer_value(value: object, column: str) -> int | None:
     return integer
 
 
-def _coerce_column(values: list, field: pa.Field) -> list:
-    """Coerce Python values so pyarrow can build the column with the field's type."""
+def _coerce_column(values: list, field: pa.Field, *, exact: bool = False) -> list:
+    """Coerce Python values so pyarrow can build the column with the field's type.
+
+    ``exact`` (a key column) fails on a value a DECIMAL column would round.
+    """
     if pa.types.is_decimal(field.type):
-        return _decimal_column(values, field)
+        return _decimal_column(values, field, exact=exact)
     if pa.types.is_integer(field.type):
         return [_integer_value(v, field.name) for v in values]
     if pa.types.is_floating(field.type):
@@ -383,9 +400,16 @@ def _coerce_column(values: list, field: pa.Field) -> list:
 
 
 def create_pyarrow_table(
-    list_dict: list[dict], pyarrow_schema: pa.Schema, datetime_fields: list = []
+    list_dict: list[dict],
+    pyarrow_schema: pa.Schema,
+    datetime_fields: list = [],
+    key_columns: frozenset[str] = frozenset(),
 ) -> pa.Table:
-    """Create a pyarrow Table from a python list of dict."""
+    """Create a pyarrow Table from a python list of dict.
+
+    ``key_columns`` are the lowercased names of the key columns, whose values
+    must be staged exactly (see ``_decimal_column``).
+    """
     data = {
         field.name: [row.get(field.name) for row in list_dict]
         for field in pyarrow_schema
@@ -394,20 +418,28 @@ def create_pyarrow_table(
     # formatted as text below.
     normalized_data = _normalize_data_for_pyarrow(data, datetime_fields)
     coerced = {
-        field.name: _coerce_column(normalized_data[field.name], field)
+        field.name: _coerce_column(
+            normalized_data[field.name],
+            field,
+            exact=field.name.lower() in key_columns,
+        )
         for field in pyarrow_schema
     }
     return pa.table(coerced).cast(pyarrow_schema)
 
 
-def concat_tables(
+def concat_tables(  # noqa: PLR0913 (the last two are optional staging rules)
     records: list[dict],
     pyarrow_table: pa.Table,
     pyarrow_schema: pa.Schema,
     flattened_schema: dict,
     convert_tz_to_utc: bool = False,
+    key_columns: frozenset[str] = frozenset(),
 ) -> pa.Table:
-    """Create a dataframe from records and concatenate with the existing one."""
+    """Create a dataframe from records and concatenate with the existing one.
+
+    ``key_columns`` are the lowercased names of the key columns.
+    """
     if not records:
         return pyarrow_table
     if convert_tz_to_utc:
@@ -419,5 +451,7 @@ def concat_tables(
         ]
     else:
         datetime_fields = []
-    new_table = create_pyarrow_table(records, pyarrow_schema, datetime_fields)
+    new_table = create_pyarrow_table(
+        records, pyarrow_schema, datetime_fields, key_columns
+    )
     return pa.concat_tables([pyarrow_table, new_table]) if pyarrow_table else new_table

@@ -40,6 +40,11 @@ def _is_fractional(staged: pa.DataType) -> bool:
     return pa.types.is_decimal(staged) or pa.types.is_floating(staged)
 
 
+def _is_exact_number(staged: pa.DataType) -> bool:
+    """Whether a staging type holds numbers exactly: a decimal or an integer."""
+    return pa.types.is_decimal(staged) or pa.types.is_integer(staged)
+
+
 class ducklakeSink(SQLSink):
     """ducklake target sink class."""
 
@@ -250,7 +255,10 @@ class ducklakeSink(SQLSink):
         self._table_types = {name.lower(): typ for name, typ in table_types.items()}
         self.pyarrow_schema = staging_schema(
             self._staged_columns(
-                self.ducklake_schema, self._table_types, self.flatten_schema
+                self.ducklake_schema,
+                self._table_types,
+                self.flatten_schema,
+                self._key_columns,
             )
         )
 
@@ -259,6 +267,7 @@ class ducklakeSink(SQLSink):
         columns: list[dict[str, str]],
         table_types: dict[str, str],
         flattened: dict[str, dict],
+        key_columns: frozenset[str] = frozenset(),
     ) -> list[dict[str, str]]:
         """The columns to stage: each at its DDL type, or an existing column's.
 
@@ -276,10 +285,15 @@ class ducklakeSink(SQLSink):
         - an ``x-singer.decimal`` string the table has as DECIMAL, such as an
           unsized one in a table created as DECIMAL(18, 3) before it became
           VARCHAR: staged as text, DuckDB's cast rounded it silently, and a
-          value too large failed with a bare conversion error.
+          value too large failed with a bare conversion error;
+        - a numeric key column the table has as DECIMAL or an integer, so
+          staging checks the key fits it exactly (see ``_decimal_column``):
+          a number key staged as DECIMAL(38, 9) for a BIGINT column was
+          rounded by the merge's cast, so keys 1.5 and 2 both became 2.
 
-        ``table_types`` is keyed by lowercased name; ``flattened`` is the
-        flattened stream schema the columns were built from.
+        ``table_types`` and ``key_columns`` are keyed by lowercased name;
+        ``flattened`` is the flattened stream schema the columns were built
+        from.
         """
         staged = []
         for column in columns:
@@ -306,9 +320,19 @@ class ducklakeSink(SQLSink):
                     pa.types.is_decimal(theirs)
                     and prop.get("format") == SINGER_DECIMAL_FORMAT
                 )
+                or (
+                    column["name"].lower() in key_columns
+                    and (_is_exact_number(ours) or pa.types.is_floating(ours))
+                    and _is_exact_number(theirs)
+                )
             )
             staged.append({**column, "type": table_type} if use_table_type else column)
         return staged
+
+    @property
+    def _key_columns(self) -> frozenset[str]:
+        """The key columns' lowercased names, whose values are staged exactly."""
+        return frozenset(key.lower() for key in self.key_properties or ())
 
     def _key_column_types(self) -> dict[str, str]:
         """Map each key property to its table column's actual type.
@@ -404,6 +428,7 @@ class ducklakeSink(SQLSink):
             pyarrow_schema=self.pyarrow_schema,  # type: ignore
             flattened_schema=self.flatten_schema,
             convert_tz_to_utc=self.convert_tz_to_utc,
+            key_columns=self._key_columns,
         )
         memory_after_concat = self._get_memory_usage_mb()
         memory_diff_concat = memory_after_concat - memory_before_concat
