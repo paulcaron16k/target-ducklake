@@ -14,7 +14,7 @@ Each side was inventoried from its code against the same checklist, with `file:l
 
 ## Summary
 
-- **target-ducklake gaps relative to target-iceberg.** 17 already had board issues. This evaluation filed 9 more, DUCKLKD-84 to 92. One is a bug: an `x-singer.decimal` string without precision is silently rounded to 3 places (DUCKLKD-84).
+- **target-ducklake gaps relative to target-iceberg.** 17 already had board issues. This evaluation filed 9 more, DUCKLKD-84 to 92. One is a bug: an `x-singer.decimal` string without precision is silently rounded to 3 places (DUCKLKD-84, fixed 2026-10-26: such a string is now VARCHAR, as in target-iceberg).
 - **target-iceberg gaps relative to target-ducklake.** These are recorded here and not filed: issues go on our board only.
   - three per-stream settings that are accepted but never applied (`sort_order`, `write_mode`, `key_properties`);
   - no `anyOf`/`oneOf`/`allOf`;
@@ -43,7 +43,7 @@ Each side was inventoried from its code against the same checklist, with `file:l
 | | composite keys | ✅ per-column match | ✅ | — |
 | | NULL key values | ✅ NULL matches NULL | ◐ a nullable key is dropped from identifiers, then upsert refuses | Iceberg |
 | | key type handling | ✅ staged keys cast to the table type | ◐ dedup compares raw values | Iceberg |
-| **Types** | decimals | ✅ exact decimal128, rounding reported; ◐ `x-singer.decimal` without precision becomes DECIMAL(18,3) | ✅ exact; an unbounded decimal becomes exact string | DuckLake · **DUCKLKD-84** |
+| **Types** | decimals | ✅ exact decimal128, rounding reported; `x-singer.decimal` without integer precision and scale becomes exact VARCHAR, as in target-iceberg (DUCKLKD-84) | ✅ exact; an unbounded decimal becomes exact string | — |
 | | decimals inside JSON | ◐ converted to float | ✅ exact string | DuckLake · DUCKLKD-22 |
 | | `x-sql-datatype` hints | ✅ wider vocabulary (MySQL unsigned, `datetime2`, unsized numeric); hints that conflict with the JSON type are ignored with a warning | ✅ core vocabulary; `timetz` maps to time with a warning; binary | — (see binary) |
 | | `date-time` default | TIMESTAMP (wall clock unless `convert_tz_to_utc`) | timestamptz (UTC) | Divergence · **DUCKLKD-89** |
