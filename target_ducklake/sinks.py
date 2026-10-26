@@ -16,7 +16,11 @@ from singer_sdk import Target
 from singer_sdk.sinks import SQLSink
 from singer_sdk.sinks.core import JSONSchemaValidator
 
-from target_ducklake.connector import VERSION_COLUMN, DuckLakeConnector
+from target_ducklake.connector import (
+    SINGER_DECIMAL_FORMAT,
+    VERSION_COLUMN,
+    DuckLakeConnector,
+)
 from target_ducklake.flatten import (
     flatten_record,
     flatten_schema,
@@ -268,7 +272,11 @@ class ducklakeSink(SQLSink):
           as an integer, so a value out of its range fails with a clear error;
         - a string property the table has as a text column, whose text is then
           kept as sent, whatever its hint (a ``numeric`` hint would otherwise
-          store '1.5' as '1.500000000').
+          store '1.5' as '1.500000000');
+        - an ``x-singer.decimal`` string the table has as DECIMAL, such as an
+          unsized one in a table created as DECIMAL(18, 3) before it became
+          VARCHAR: staged as text, DuckDB's cast rounded it silently, and a
+          value too large failed with a bare conversion error.
 
         ``table_types`` is keyed by lowercased name; ``flattened`` is the
         flattened stream schema the columns were built from.
@@ -280,7 +288,8 @@ class ducklakeSink(SQLSink):
                 staged.append(column)
                 continue
             ours, theirs = staging_type(column["type"]), staging_type(table_type)
-            types = flattened.get(column["name"], {}).get("type") or []
+            prop = flattened.get(column["name"], {})
+            types = prop.get("type") or []
             types = [types] if isinstance(types, str) else types
             use_table_type = (
                 (_is_fractional(ours) and _is_fractional(theirs))
@@ -292,6 +301,10 @@ class ducklakeSink(SQLSink):
                 or (
                     pa.types.is_string(theirs)
                     and [t for t in types if t != "null"] == ["string"]
+                )
+                or (
+                    pa.types.is_decimal(theirs)
+                    and prop.get("format") == SINGER_DECIMAL_FORMAT
                 )
             )
             staged.append({**column, "type": table_type} if use_table_type else column)
