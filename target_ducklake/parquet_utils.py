@@ -3,8 +3,9 @@ import logging
 import math
 import re
 import warnings
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_HALF_EVEN, Context, Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Context, Decimal, InvalidOperation
 
 import pyarrow as pa
 
@@ -14,7 +15,14 @@ from target_ducklake.type_hints import decimal_hint
 DECIMAL_MAX_PRECISION = 38
 DECIMAL_DEFAULT_SCALE = 9
 # Python's default decimal context keeps only 28 digits; DECIMAL(38, s) needs 38.
-_DECIMAL_CONTEXT = Context(prec=DECIMAL_MAX_PRECISION, rounding=ROUND_HALF_EVEN)
+# DuckDB's cast rounds half away from zero (1.225 to 1.23 in DECIMAL(10, 2),
+# 2.5 to 3 in BIGINT), which is Python's ROUND_HALF_UP.
+_DECIMAL_CONTEXT = Context(prec=DECIMAL_MAX_PRECISION, rounding=ROUND_HALF_UP)
+
+# value_type_checking: what staging does with a value its column would round.
+STRICT = "strict"
+PERMISSIVE = "permissive"
+VALUE_TYPE_CHECKING_MODES = (PERMISSIVE, STRICT)
 
 logger = logging.getLogger(__name__)
 
@@ -168,41 +176,109 @@ def _as_decimal(value: object) -> Decimal | None:
     return Decimal(str(value))
 
 
+@dataclass(frozen=True)
+class StagingRules:
+    """What staging does with a value its column would round.
+
+    A value with more fraction digits than its DECIMAL column holds, or a
+    fraction for an integer column, is one DuckDB's cast would round. With
+    ``strict`` it fails the batch, naming the column and the value. Otherwise
+    it is rounded as DuckDB's cast rounds it, and a warning counts the rounded
+    values per column; for a key column the warning says records may have
+    merged. A value a column can't hold at all (too many integer digits, text
+    that isn't a number) fails either way, as DuckDB's cast fails on it.
+
+    ``key_columns`` holds the key columns' lowercased names.
+    """
+
+    strict: bool = False
+    key_columns: frozenset[str] = frozenset()
+
+    def is_key(self, column: str) -> bool:
+        """Whether the column is a key column, matched case-insensitively."""
+        return column.lower() in self.key_columns
+
+
+DEFAULT_STAGING_RULES = StagingRules()
+
 _MAX_SHOWN_VALUE = 50
 
 
+def _shown(value: object) -> str:
+    """The value as given, cut to 50 characters, since it may be source text."""
+    shown = repr(value)
+    if len(shown) > _MAX_SHOWN_VALUE:
+        shown = shown[: _MAX_SHOWN_VALUE - 3] + "..."
+    return shown
+
+
+def _column_kind(field: pa.Field) -> str:
+    """How an error describes the column's type: 'is DECIMAL(10, 2)'."""
+    if pa.types.is_decimal(field.type):
+        return f"is DECIMAL({field.type.precision}, {field.type.scale})"
+    return "holds whole numbers"
+
+
 class _DecimalMismatchError(ValueError):
-    """A value a DECIMAL(p, s) column can't hold; names the column and the value.
+    """A value a DECIMAL(p, s) column can't hold; names the column and the value."""
 
-    The value is shown as given, cut to 50 characters, since it may be source
-    text rather than a number.
-    """
-
-    def __init__(
-        self, field: pa.Field, value: object, problem: str = "doesn't fit."
-    ) -> None:
-        shown = repr(value)
-        if len(shown) > _MAX_SHOWN_VALUE:
-            shown = shown[: _MAX_SHOWN_VALUE - 3] + "..."
-        precision, scale = field.type.precision, field.type.scale
+    def __init__(self, field: pa.Field, value: object) -> None:
         super().__init__(
-            f"Column {field.name!r} is DECIMAL({precision}, {scale}); {shown} {problem}"
+            f"Column {field.name!r} {_column_kind(field)}; {_shown(value)} doesn't fit."
         )
 
 
+def _check_rounding(
+    field: pa.Field, value: object, result: object, rules: StagingRules
+) -> None:
+    """Fail on a value staging would round, if ``value_type_checking`` is strict."""
+    if not rules.strict:
+        return
+    message = (
+        f"Column {field.name!r} {_column_kind(field)}; {_shown(value)} would be "
+        f"rounded to {result}"
+    )
+    if rules.is_key(field.name):
+        message += (
+            ", and the column is a key: records with different keys would merge "
+            "into one row"
+        )
+    message += (
+        ". value_type_checking is strict; set it to permissive to round such "
+        "values with a warning."
+    )
+    raise ValueError(message)
+
+
+def _report_rounding(
+    field: pa.Field, changed: int, rounding: str, rules: StagingRules
+) -> None:
+    """Warn how many of a batch's values in a column were rounded."""
+    if not changed:
+        return
+    if rules.is_key(field.name):
+        logger.warning(
+            "%d key value(s) in column %r %s. Records whose keys round to the "
+            "same value are merged into one row; set value_type_checking to "
+            "strict to fail instead.",
+            changed,
+            field.name,
+            rounding,
+        )
+    else:
+        logger.warning("%d value(s) in column %r %s.", changed, field.name, rounding)
+
+
 def _decimal_column(
-    values: list, field: pa.Field, *, exact: bool = False
+    values: list, field: pa.Field, rules: StagingRules = DEFAULT_STAGING_RULES
 ) -> list[Decimal | None]:
     """Round each value to the column's scale, failing on any that doesn't fit.
 
-    Extra fraction digits are rounded half-even, as DuckDB's own cast to the
-    column rounds them, and a warning reports how many values were rounded.
+    Extra fraction digits are rounded half away from zero, as DuckDB's own
+    cast to the column rounds them, and a warning reports how many values
+    were rounded; with strict ``rules`` such a value fails the batch instead.
     A value with more integer digits than DECIMAL(p, s) holds, a non-finite
     number or text that isn't a number raises ValueError naming the column.
-
-    With ``exact`` (a key column), a value that would be rounded raises
-    instead: a rounded key identifies another row, so distinct keys (1.231
-    and 1.234 in DECIMAL(10, 2)) would merge into one and a record be lost.
     """
     precision, scale = field.type.precision, field.type.scale
     quantum = Decimal(1).scaleb(-scale)
@@ -210,36 +286,28 @@ def _decimal_column(
     changed = 0
     for value in values:
         try:
-            exact_value = _as_decimal(value)
-            if exact_value is None:
+            exact = _as_decimal(value)
+            if exact is None:
                 rounded.append(None)
                 continue
-            result = exact_value.quantize(quantum, context=_DECIMAL_CONTEXT)
+            result = exact.quantize(quantum, context=_DECIMAL_CONTEXT)
         except InvalidOperation:  # not a number, or more than 38 digits
             raise _DecimalMismatchError(field, value) from None
         if not result.is_finite() or (
             result and result.adjusted() >= precision - scale
         ):
             raise _DecimalMismatchError(field, value)
-        if exact and result != exact_value:
-            raise _DecimalMismatchError(
-                field,
-                value,
-                f"would be rounded to {result}, but the column is a key: records "
-                "with different keys would merge into one row.",
-            )
-        changed += result != exact_value
+        if result != exact:
+            _check_rounding(field, value, result, rules)
+            changed += 1
         rounded.append(result)
-    if changed:
-        logger.warning(
-            "%d value(s) in column %r had more than %d fraction digits and were "
-            "rounded to fit DECIMAL(%d, %d).",
-            changed,
-            field.name,
-            scale,
-            precision,
-            scale,
-        )
+    _report_rounding(
+        field,
+        changed,
+        f"had more than {scale} fraction digits and were rounded to fit "
+        f"DECIMAL({precision}, {scale})",
+        rules,
+    )
     return rounded
 
 
@@ -344,47 +412,76 @@ _INT64_RANGE = range(-(2**63), 2**63)
 _INT64_DIGITS = len(str(2**63))  # 19: a Decimal with more digits can't fit
 
 
-def _integer_value(value: object, column: str) -> int | None:
-    """A whole number (int, bool, Decimal, float or number text) as an exact int.
+def _out_of_range(column: str, value: object) -> ValueError:
+    return ValueError(
+        f"Column {column!r} holds 64-bit integers; {_shown(value)} is out of range."
+    )
 
-    Raises ValueError naming the column for anything else (a fraction, a
-    non-finite number, text that isn't a number, a number outside int64), so
-    the batch fails instead of the value being changed.
+
+def _number_value(value: object, column: str) -> int | Decimal | None:
+    """A number (int, bool, Decimal, float or number text) as an int or a Decimal.
+
+    A whole number is an int; a number with a fraction is the exact Decimal.
+    Raises ValueError naming the column for anything else (a non-finite
+    number, text that isn't a number, a number far outside int64), which
+    DuckDB's cast to an integer fails on too.
     """
     number = _number_text(value)
     if number is None:
         return None
+    if isinstance(number, float) and math.isfinite(number):
+        number = _as_decimal(number)
     if isinstance(number, int):  # bool is an int
-        integer: int | None = int(number)
-    elif isinstance(number, Decimal) and number.is_finite():
+        return int(number)
+    if isinstance(number, Decimal) and number.is_finite():
         if number and number.adjusted() >= _INT64_DIGITS:
             # Rejected on magnitude: int() of '1e1000000' would take minutes.
             # (A zero's adjusted() is no magnitude: '0e100' is 0.)
-            msg = f"Column {column!r} holds 64-bit integers; {value!r} is out of range."
-            raise ValueError(msg)
-        integer = int(number) if number == number.to_integral_value() else None
-    elif isinstance(number, float) and math.isfinite(number):
-        integer = int(number) if number.is_integer() else None
-    else:
-        integer = None
-    if integer is None:
-        msg = f"Column {column!r} holds whole numbers; {value!r} is not one."
-        raise ValueError(msg)
-    if integer not in _INT64_RANGE:
-        msg = f"Column {column!r} holds 64-bit integers; {value!r} is out of range."
-        raise ValueError(msg)
-    return integer
+            raise _out_of_range(column, value)
+        return int(number) if number == number.to_integral_value() else number
+    msg = f"Column {column!r} holds whole numbers; {_shown(value)} is not a number."
+    raise ValueError(msg)
 
 
-def _coerce_column(values: list, field: pa.Field, *, exact: bool = False) -> list:
+def _integer_column(
+    values: list, field: pa.Field, rules: StagingRules = DEFAULT_STAGING_RULES
+) -> list[int | None]:
+    """Each value as an exact int, failing on any the column can't hold.
+
+    A fraction is rounded half away from zero, as DuckDB's cast to an integer
+    rounds it (pyarrow would truncate), and a warning reports how many values
+    were rounded; with strict ``rules`` such a value fails the batch instead.
+    """
+    integers: list[int | None] = []
+    changed = 0
+    for value in values:
+        number = _number_value(value, field.name)
+        if isinstance(number, Decimal):
+            integer = int(number.to_integral_value(rounding=ROUND_HALF_UP))
+            _check_rounding(field, value, integer, rules)
+            changed += 1
+            number = integer
+        if number is not None and number not in _INT64_RANGE:
+            raise _out_of_range(field.name, value)
+        integers.append(number)
+    _report_rounding(
+        field, changed, "had a fraction and were rounded to whole numbers", rules
+    )
+    return integers
+
+
+def _coerce_column(
+    values: list, field: pa.Field, rules: StagingRules = DEFAULT_STAGING_RULES
+) -> list:
     """Coerce Python values so pyarrow can build the column with the field's type.
 
-    ``exact`` (a key column) fails on a value a DECIMAL column would round.
+    ``rules`` say what to do with a number its DECIMAL or integer column would
+    round.
     """
     if pa.types.is_decimal(field.type):
-        return _decimal_column(values, field, exact=exact)
+        return _decimal_column(values, field, rules)
     if pa.types.is_integer(field.type):
-        return [_integer_value(v, field.name) for v in values]
+        return _integer_column(values, field, rules)
     if pa.types.is_floating(field.type):
         values = [_number_text(v) for v in values]
     if pa.types.is_string(field.type):
@@ -403,12 +500,11 @@ def create_pyarrow_table(
     list_dict: list[dict],
     pyarrow_schema: pa.Schema,
     datetime_fields: list = [],
-    key_columns: frozenset[str] = frozenset(),
+    rules: StagingRules = DEFAULT_STAGING_RULES,
 ) -> pa.Table:
     """Create a pyarrow Table from a python list of dict.
 
-    ``key_columns`` are the lowercased names of the key columns, whose values
-    must be staged exactly (see ``_decimal_column``).
+    ``rules`` say what to do with a number its column would round.
     """
     data = {
         field.name: [row.get(field.name) for row in list_dict]
@@ -418,27 +514,23 @@ def create_pyarrow_table(
     # formatted as text below.
     normalized_data = _normalize_data_for_pyarrow(data, datetime_fields)
     coerced = {
-        field.name: _coerce_column(
-            normalized_data[field.name],
-            field,
-            exact=field.name.lower() in key_columns,
-        )
+        field.name: _coerce_column(normalized_data[field.name], field, rules)
         for field in pyarrow_schema
     }
     return pa.table(coerced).cast(pyarrow_schema)
 
 
-def concat_tables(  # noqa: PLR0913 (the last two are optional staging rules)
+def concat_tables(  # noqa: PLR0913 (the last two are optional staging options)
     records: list[dict],
     pyarrow_table: pa.Table,
     pyarrow_schema: pa.Schema,
     flattened_schema: dict,
     convert_tz_to_utc: bool = False,
-    key_columns: frozenset[str] = frozenset(),
+    rules: StagingRules = DEFAULT_STAGING_RULES,
 ) -> pa.Table:
     """Create a dataframe from records and concatenate with the existing one.
 
-    ``key_columns`` are the lowercased names of the key columns.
+    ``rules`` say what to do with a number its column would round.
     """
     if not records:
         return pyarrow_table
@@ -451,7 +543,5 @@ def concat_tables(  # noqa: PLR0913 (the last two are optional staging rules)
         ]
     else:
         datetime_fields = []
-    new_table = create_pyarrow_table(
-        records, pyarrow_schema, datetime_fields, key_columns
-    )
+    new_table = create_pyarrow_table(records, pyarrow_schema, datetime_fields, rules)
     return pa.concat_tables([pyarrow_table, new_table]) if pyarrow_table else new_table

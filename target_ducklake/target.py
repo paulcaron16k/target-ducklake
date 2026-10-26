@@ -12,6 +12,7 @@ from singer_sdk import typing as th
 from singer_sdk.target_base import SQLTarget
 
 from target_ducklake.layout import LayoutError, check_layout_config
+from target_ducklake.parquet_utils import PERMISSIVE, VALUE_TYPE_CHECKING_MODES
 from target_ducklake.sinks import (
     ducklakeSink,
 )
@@ -493,6 +494,23 @@ class Targetducklake(SQLTarget):
             default=False,
             title="Validate Records",
             description="Whether to validate the schema of the incoming streams.",
+        ),
+        th.Property(
+            "value_type_checking",
+            th.StringType(allowed_values=list(VALUE_TYPE_CHECKING_MODES)),
+            default=PERMISSIVE,
+            title="Value Type Checking",
+            description=(
+                "What to do with a number its column would round: more fraction "
+                "digits than a DECIMAL column holds, or a fraction for an integer "
+                "column. permissive (default) rounds it as DuckDB's cast does, "
+                "half away from zero, and warns how many values in each column "
+                "were rounded, saying so when the column is a key (records whose "
+                "keys round alike are merged). strict fails the batch, naming the "
+                "column and the value: use it while onboarding a source. A value "
+                "a column can't hold at all, such as one with too many integer "
+                "digits, fails either way, as DuckDB's cast would."
+            ),
         ),
         th.Property(
             "overwrite_if_no_pk",

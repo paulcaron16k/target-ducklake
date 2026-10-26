@@ -1064,13 +1064,7 @@ class TestStagingFollowsColumnType:
                 "n/a",
                 ValueError,
             ),
-            (
-                {"type": "number", "x-sql-datatype": "bigint"},
-                Decimal("5.5"),
-                ValueError,
-            ),
             ({"type": "string", "x-sql-datatype": "bigint"}, "abc", ValueError),
-            ({"type": "string", "x-sql-datatype": "bigint"}, "12.5", ValueError),
             (
                 {"type": "number", "x-sql-datatype": "bigint"},
                 Decimal("NaN"),
@@ -1089,9 +1083,7 @@ class TestStagingFollowsColumnType:
         ],
         ids=[
             "string-decimal",
-            "number-bigint-fraction",
             "string-bigint",
-            "string-bigint-fraction",
             "number-bigint-nan",
             "number-bigint-infinity",
             "string-double",
@@ -1103,7 +1095,12 @@ class TestStagingFollowsColumnType:
     def test_value_the_column_cannot_hold_fails_the_batch(
         self, prop: dict, value: object, error: type[Exception]
     ):
-        """A value the hinted column can't hold fails staging; it is never changed."""
+        """A value the hinted column can't hold fails staging; it is never changed.
+
+        Under the default permissive value_type_checking too: these aren't
+        values DuckDB's cast would round, but ones it fails on. A fraction
+        for an integer column is rounded (see TestValueTypeChecking).
+        """
         flat = flatten_schema({"type": "object", "properties": {"c": prop}})
         with pytest.raises(error):
             create_pyarrow_table([{"c": value}], _staging_schema(flat))
@@ -1292,7 +1289,9 @@ class TestExistingNumberColumnStaging:
         ("column_ddl", "staged"),
         [
             ("amount VARCHAR", pa.decimal128(38, 9)),
-            ("amount BIGINT", pa.decimal128(38, 9)),
+            # DUCKLKD-99: staged at the integer, so a fraction is rounded with
+            # a warning (or fails under strict), not cast silently.
+            ("amount BIGINT", pa.int64()),
             ("other INTEGER", pa.decimal128(38, 9)),
         ],
         ids=["varchar-column", "bigint-column", "new-column"],
@@ -1300,7 +1299,7 @@ class TestExistingNumberColumnStaging:
     def test_other_columns_keep_the_stream_staging(
         self, tmp_path: Path, column_ddl: str, staged: pa.DataType
     ):
-        """Only an existing DECIMAL/REAL/DOUBLE column changes a number's staging."""
+        """Only an existing numeric column changes a number's staging."""
         _, sink = self._load(tmp_path, column_ddl, {"type": "number"}, [Decimal(1)])
         assert sink.pyarrow_schema.field("amount").type == staged
 
@@ -1352,7 +1351,10 @@ class TestDecimalPrecision:
         assert table.column("amount").to_pylist() == [self.BIG]
 
     def test_create_pyarrow_table_coerces_numeric_inputs(self):
-        """Ints, floats and None are accepted; extra digits round half-even."""
+        """Ints, floats and None are accepted; extra digits round as DuckDB's cast.
+
+        That is half away from zero: 1.005 is 1.01.
+        """
         schema = pa.schema([pa.field("amount", pa.decimal128(38, 2))])
         records = [
             {"amount": 7},
@@ -1365,7 +1367,7 @@ class TestDecimalPrecision:
         assert table.column("amount").to_pylist() == [
             Decimal("7.00"),
             Decimal("0.10"),
-            Decimal("1.00"),
+            Decimal("1.01"),
             Decimal("1.02"),
             None,
         ]
@@ -2620,30 +2622,32 @@ class TestMergeKeyTableTypes:
         assert rows == [("a", "second")]
 
 
-class TestKeysStagedExactly:
-    """A key value the key column would change fails the batch (DUCKLKD-97).
+class TestValueTypeChecking:
+    """value_type_checking: what staging does with a number its column would round.
 
-    A rounded key identifies another row: keys 1.231 and 1.234 in a
-    DECIMAL(10, 2) column both became 1.23, the merge kept one row, and the
-    other record was lost with only the generic rounding warning. Runs the
-    target through ``listen()`` on a real SQLite DuckLake catalog. The key is
-    ``K``: the singer-sdk lowercases key_properties, the column keeps its case.
+    permissive (the default) rounds it as DuckDB's cast does and warns; strict
+    fails the batch naming the column and the value (DUCKLKD-97, DUCKLKD-99).
+    Runs the target through ``listen()`` on a real SQLite DuckLake catalog.
+    The key is ``K``: the singer-sdk lowercases key_properties, the column
+    keeps its case.
     """
 
     NUMBER = {"type": "number"}  # noqa: RUF012
     SINGER_DECIMAL = {"type": "string", "format": "x-singer.decimal"}  # noqa: RUF012
+    STRICT = {"value_type_checking": "strict"}  # noqa: RUF012
 
     @staticmethod
     def _load(
         tmp_path: Path,
-        key_type: str | None,
-        prop: dict,
-        keys: list,
+        ddl: str | None,
+        props: dict,
+        records: list[dict],
         **config: object,
     ) -> list[tuple]:
-        """Load one record per key (v = 'a', 'b', ...); return (K, v) rows.
+        """Load records keyed by K, each with a v; return the rows as text.
 
-        ``key_type`` creates the table first; None lets the target create it.
+        ``ddl`` (the columns besides v) creates the table first; None lets the
+        target create it. Rows are ordered by v.
         """
         catalog = tmp_path / "catalog.sqlite"
         attach = (
@@ -2653,8 +2657,8 @@ class TestKeysStagedExactly:
         con = duckdb.connect()
         con.execute(attach)
         con.execute("CREATE SCHEMA lake.s")
-        if key_type:
-            con.execute(f'CREATE TABLE lake.s.t ("K" {key_type}, v VARCHAR)')
+        if ddl:
+            con.execute(f"CREATE TABLE lake.s.t ({ddl}, v VARCHAR)")
         con.close()
         config = {
             "catalog_type": "sqlite",
@@ -2667,46 +2671,56 @@ class TestKeysStagedExactly:
         }
         schema = {
             "type": "object",
-            "properties": {"K": prop, "v": {"type": "string"}},
+            "properties": {**props, "v": {"type": "string"}},
         }
         messages = [
             {"type": "SCHEMA", "stream": "t", "schema": schema, "key_properties": ["K"]}
         ]
-        messages += [
-            {"type": "RECORD", "stream": "t", "record": {"K": k, "v": v}}
-            for k, v in zip(keys, "abcdef", strict=False)
-        ]
+        messages += [{"type": "RECORD", "stream": "t", "record": r} for r in records]
         target = Targetducklake(config=config)
         try:
             target.listen(
-                file_input=io.StringIO(
-                    "".join(json.dumps(m) + "\n" for m in messages)
-                )
+                file_input=io.StringIO("".join(json.dumps(m) + "\n" for m in messages))
             )
         finally:
             target.target_connector.close()
         con = duckdb.connect()
         con.execute(attach)
-        rows = con.execute('SELECT "K"::VARCHAR, v FROM lake.s.t ORDER BY v')
+        rows = con.execute("SELECT COLUMNS(*)::VARCHAR FROM lake.s.t ORDER BY v")
         result = rows.fetchall()
         con.close()
         return result
 
-    @pytest.mark.parametrize(
-        ("key_type", "prop", "keys", "error"),
+    def _load_keys(
+        self,
+        tmp_path: Path,
+        key_type: str | None,
+        prop: dict,
+        keys: list,
+        **config: object,
+    ) -> list[tuple]:
+        """One record per key, v = 'a', 'b', ...; return (K, v) rows."""
+        ddl = f'"K" {key_type}' if key_type else None
+        records = [{"K": k, "v": v} for k, v in zip(keys, "abcdef", strict=False)]
+        return self._load(tmp_path, ddl, {"K": prop}, records, **config)
+
+    ROUNDED_KEYS = (
+        ("key_type", "prop", "keys", "error", "rows"),
         [
             (
                 "DECIMAL(10, 2)",
                 NUMBER,
                 [1.231, 1.234],
                 r"Column 'K' is DECIMAL\(10, 2\); Decimal\('1.231'\) would be "
-                r"rounded to 1.23, but the column is a key",
+                r"rounded to 1.23, and the column is a key",
+                [("1.23", "b")],
             ),
             (
                 "DECIMAL(18, 3)",
                 SINGER_DECIMAL,
                 ["1.2341", "1.2344"],
                 r"Column 'K' is DECIMAL\(18, 3\); '1.2341' would be rounded",
+                [("1.234", "b")],
             ),
             # Staged as DECIMAL(38, 9), the merge's cast to BIGINT rounded 1.5
             # to 2 with no warning, and left two rows with key 2.
@@ -2714,7 +2728,9 @@ class TestKeysStagedExactly:
                 "BIGINT",
                 NUMBER,
                 [1.5, 2],
-                r"Column 'K' holds whole numbers; Decimal\('1.5'\) is not one",
+                r"Column 'K' holds whole numbers; Decimal\('1.5'\) would be "
+                r"rounded to 2, and the column is a key",
+                [("2", "b")],
             ),
             (
                 None,
@@ -2722,20 +2738,62 @@ class TestKeysStagedExactly:
                 [1.0000000001, 1.0000000002],
                 r"Column 'K' is DECIMAL\(38, 9\); Decimal\('1.0000000001'\) would "
                 r"be rounded",
+                [("1.000000000", "b")],
             ),
         ],
-        ids=["decimal-number", "decimal-singer-decimal", "bigint", "new-table"],
     )
-    def test_keys_that_would_be_rounded_fail(
-        self, tmp_path: Path, key_type: str | None, prop: dict, keys: list, error: str
+    ROUNDED_KEY_IDS = (
+        "decimal-number",
+        "decimal-singer-decimal",
+        "bigint",
+        "new-table",
+    )
+
+    @pytest.mark.parametrize(*ROUNDED_KEYS, ids=ROUNDED_KEY_IDS)
+    def test_strict_fails_on_a_key_the_column_would_round(  # noqa: PLR0913
+        self,
+        tmp_path: Path,
+        key_type: str | None,
+        prop: dict,
+        keys: list,
+        error: str,
+        rows: list,
     ):
         """Every load method dedups on the key in the batch, so all must fail."""
+        del rows
         for load_method in ("merge", "append", "overwrite"):
             run_path = tmp_path / load_method
             run_path.mkdir()
             with pytest.raises(ValueError, match=error):
-                self._load(run_path, key_type, prop, keys, load_method=load_method)
+                self._load_keys(
+                    run_path,
+                    key_type,
+                    prop,
+                    keys,
+                    load_method=load_method,
+                    **self.STRICT,
+                )
 
+    @pytest.mark.parametrize(*ROUNDED_KEYS, ids=ROUNDED_KEY_IDS)
+    def test_permissive_rounds_a_key_and_says_records_merged(  # noqa: PLR0913
+        self,
+        tmp_path: Path,
+        capfd: pytest.CaptureFixture[str],
+        key_type: str | None,
+        prop: dict,
+        keys: list,
+        error: str,
+        rows: list,
+    ):
+        """The default rounds as DuckDB's cast does; the warning names the key."""
+        del error
+        assert self._load_keys(tmp_path, key_type, prop, keys) == rows
+        warning = capfd.readouterr().err
+        assert "key value(s) in column 'K'" in warning
+        assert "merged into one row" in warning
+        assert "set value_type_checking to strict" in warning
+
+    @pytest.mark.parametrize("config", [{}, STRICT], ids=["permissive", "strict"])
     @pytest.mark.parametrize(
         ("key_type", "prop", "keys", "rows"),
         [
@@ -2750,35 +2808,104 @@ class TestKeysStagedExactly:
         ],
         ids=["decimal", "bigint", "singer-decimal"],
     )
-    def test_keys_the_column_holds_exactly_merge(
-        self, tmp_path: Path, key_type: str, prop: dict, keys: list, rows: list
+    def test_keys_the_column_holds_exactly_merge(  # noqa: PLR0913
+        self,
+        tmp_path: Path,
+        key_type: str,
+        prop: dict,
+        keys: list,
+        rows: list,
+        config: dict,
     ):
         """1.230 is the key 1.23 and 2.0 the key 2: the later record wins."""
-        assert self._load(tmp_path, key_type, prop, keys) == rows
+        assert self._load_keys(tmp_path, key_type, prop, keys, **config) == rows
 
-    def test_a_non_key_column_is_still_rounded_with_the_warning(self):
-        """Only key columns are staged exactly; other values keep the warning."""
-        schema = pa.schema([("k", pa.int64()), ("amount", pa.decimal128(10, 2))])
-        table = create_pyarrow_table(
-            [{"k": 1, "amount": Decimal("1.231")}],
-            schema,
-            key_columns=frozenset({"k"}),
-        )
-        assert table.column("amount").to_pylist() == [Decimal("1.23")]
-
-    def test_number_key_on_an_integer_column_is_staged_as_the_integer(self):
-        """A key column the table has as BIGINT stages as int64; a value doesn't."""
-        number = "DECIMAL(38, 9)"
-        staged = ducklakeSink._staged_columns(
-            [{"name": "k", "type": number}, {"name": "n", "type": number}],
-            {"k": "BIGINT", "n": "BIGINT"},
-            {"k": self.NUMBER, "n": self.NUMBER},
-            frozenset({"k"}),
-        )
-        assert staged == [
-            {"name": "k", "type": "BIGINT"},
-            {"name": "n", "type": number},
+    def _load_values(
+        self, tmp_path: Path, column_type: str, values: list, **config: object
+    ) -> list[tuple]:
+        """Number values into an existing non-key column n; return (K, n, v) rows."""
+        records = [
+            {"K": i, "n": n, "v": v}
+            for i, (n, v) in enumerate(zip(values, "abcdef", strict=False))
         ]
+        props = {"K": {"type": "integer"}, "n": self.NUMBER}
+        ddl = f'"K" BIGINT, n {column_type}'
+        return self._load(tmp_path, ddl, props, records, **config)
+
+    def test_permissive_rounds_a_fraction_for_an_integer_column_with_a_warning(
+        self, tmp_path: Path, capfd: pytest.CaptureFixture[str]
+    ):
+        """DUCKLKD-99: 1.5 and 2.4 were cast to 2 silently; now with a warning.
+
+        Half away from zero, as DuckDB's cast: -2.5 is -3.
+        """
+        rows = self._load_values(tmp_path, "BIGINT", [1.5, 2.4, -2.5, 7])
+        assert [n for _, n, _ in rows] == ["2", "2", "-3", "7"]
+        warning = capfd.readouterr().err
+        assert (
+            "3 value(s) in column 'n' had a fraction and were rounded to whole "
+            "numbers." in warning
+        )
+        assert "key value" not in warning
+
+    @pytest.mark.parametrize(
+        ("column_type", "value", "error"),
+        [
+            (
+                "BIGINT",
+                1.5,
+                r"Column 'n' holds whole numbers; Decimal\('1.5'\) would be "
+                r"rounded to 2\. value_type_checking is strict",
+            ),
+            (
+                "DECIMAL(10, 2)",
+                1.231,
+                r"Column 'n' is DECIMAL\(10, 2\); Decimal\('1.231'\) would be "
+                r"rounded to 1.23\. value_type_checking is strict",
+            ),
+        ],
+        ids=["bigint", "decimal"],
+    )
+    def test_strict_fails_on_a_value_the_column_would_round(
+        self, tmp_path: Path, column_type: str, value: float, error: str
+    ):
+        """Under strict a non-key value fails too, naming the column and value."""
+        with pytest.raises(ValueError, match=error):
+            self._load_values(tmp_path, column_type, [value], **self.STRICT)
+
+    def test_strict_loads_values_the_column_holds(self, tmp_path: Path):
+        """Strict changes nothing for a value that needs no rounding."""
+        rows = self._load_values(tmp_path, "DECIMAL(10, 2)", [1.5, 2], **self.STRICT)
+        assert [n for _, n, _ in rows] == ["1.50", "2.00"]
+
+    def test_an_unknown_mode_is_refused_at_startup(self, tmp_path: Path):
+        """A typo isn't read as permissive: the config fails validation."""
+        with pytest.raises(ConfigValidationError):
+            self._load_values(tmp_path, "BIGINT", [1], value_type_checking="lenient")
+
+    @pytest.mark.parametrize(
+        ("column", "values"),
+        [
+            (
+                pa.decimal128(10, 2),
+                ["1.225", "-1.225", "1.235", "0.005", "-0.005", "1.2349"],
+            ),
+            (pa.int64(), ["2.5", "-2.5", "0.5", "-0.5", "1.4999", "3.5"]),
+        ],
+        ids=["decimal", "bigint"],
+    )
+    def test_staging_rounds_as_duckdbs_cast(self, column: pa.DataType, values: list):
+        """A rounded value is the one DuckDB's cast would have stored."""
+        field = pa.field("n", column)
+        staged = create_pyarrow_table(
+            [{"n": Decimal(v)} for v in values], pa.schema([field])
+        )
+        sql_type = "BIGINT" if pa.types.is_integer(column) else "DECIMAL(10, 2)"
+        cast = [
+            duckdb.sql(f"SELECT CAST({v}::DECIMAL(38, 9) AS {sql_type})").fetchone()[0]
+            for v in values
+        ]
+        assert staged.column("n").to_pylist() == cast
 
 
 class TestTimezoneOffsets:

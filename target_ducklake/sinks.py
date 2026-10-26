@@ -29,6 +29,8 @@ from target_ducklake.flatten import (
 )
 from target_ducklake.layout import resolve_layout
 from target_ducklake.parquet_utils import (
+    STRICT,
+    StagingRules,
     concat_tables,
     staging_schema,
     staging_type,
@@ -38,11 +40,6 @@ from target_ducklake.parquet_utils import (
 def _is_fractional(staged: pa.DataType) -> bool:
     """Whether a staging type holds fractions: a decimal or a float."""
     return pa.types.is_decimal(staged) or pa.types.is_floating(staged)
-
-
-def _is_exact_number(staged: pa.DataType) -> bool:
-    """Whether a staging type holds numbers exactly: a decimal or an integer."""
-    return pa.types.is_decimal(staged) or pa.types.is_integer(staged)
 
 
 class ducklakeSink(SQLSink):
@@ -255,10 +252,7 @@ class ducklakeSink(SQLSink):
         self._table_types = {name.lower(): typ for name, typ in table_types.items()}
         self.pyarrow_schema = staging_schema(
             self._staged_columns(
-                self.ducklake_schema,
-                self._table_types,
-                self.flatten_schema,
-                self._key_columns,
+                self.ducklake_schema, self._table_types, self.flatten_schema
             )
         )
 
@@ -267,7 +261,6 @@ class ducklakeSink(SQLSink):
         columns: list[dict[str, str]],
         table_types: dict[str, str],
         flattened: dict[str, dict],
-        key_columns: frozenset[str] = frozenset(),
     ) -> list[dict[str, str]]:
         """The columns to stage: each at its DDL type, or an existing column's.
 
@@ -277,23 +270,21 @@ class ducklakeSink(SQLSink):
           another scale rounded silently: a DECIMAL(38, 30) column staged at
           the default (38, 9) lost 21 fraction digits, and a DOUBLE column
           staged as a decimal stored 1.5e-12 as 0);
-        - a whole-number decimal (scale 0, e.g. bigint unsigned) the table has
-          as an integer, so a value out of its range fails with a clear error;
+        - a number column the table has as an integer, so a value out of its
+          range fails with a clear error and a fraction is rounded with a
+          warning, or fails under strict ``value_type_checking``: staged as
+          DECIMAL(38, 9), DuckDB's cast rounded 1.5 and 2.4 to 2 silently, and
+          a key column ended up with two rows for key 2;
         - a string property the table has as a text column, whose text is then
           kept as sent, whatever its hint (a ``numeric`` hint would otherwise
           store '1.5' as '1.500000000');
         - an ``x-singer.decimal`` string the table has as DECIMAL, such as an
           unsized one in a table created as DECIMAL(18, 3) before it became
           VARCHAR: staged as text, DuckDB's cast rounded it silently, and a
-          value too large failed with a bare conversion error;
-        - a numeric key column the table has as DECIMAL or an integer, so
-          staging checks the key fits it exactly (see ``_decimal_column``):
-          a number key staged as DECIMAL(38, 9) for a BIGINT column was
-          rounded by the merge's cast, so keys 1.5 and 2 both became 2.
+          value too large failed with a bare conversion error.
 
-        ``table_types`` and ``key_columns`` are keyed by lowercased name;
-        ``flattened`` is the flattened stream schema the columns were built
-        from.
+        ``table_types`` is keyed by lowercased name; ``flattened`` is the
+        flattened stream schema the columns were built from.
         """
         staged = []
         for column in columns:
@@ -307,11 +298,7 @@ class ducklakeSink(SQLSink):
             types = [types] if isinstance(types, str) else types
             use_table_type = (
                 (_is_fractional(ours) and _is_fractional(theirs))
-                or (
-                    pa.types.is_decimal(ours)
-                    and ours.scale == 0
-                    and pa.types.is_integer(theirs)
-                )
+                or (_is_fractional(ours) and pa.types.is_integer(theirs))
                 or (
                     pa.types.is_string(theirs)
                     and [t for t in types if t != "null"] == ["string"]
@@ -320,20 +307,21 @@ class ducklakeSink(SQLSink):
                     pa.types.is_decimal(theirs)
                     and prop.get("format") == SINGER_DECIMAL_FORMAT
                 )
-                or (
-                    # Any numeric key, a double-hinted one included.
-                    column["name"].lower() in key_columns
-                    and (_is_exact_number(ours) or pa.types.is_floating(ours))
-                    and _is_exact_number(theirs)
-                )
             )
             staged.append({**column, "type": table_type} if use_table_type else column)
         return staged
 
     @property
-    def _key_columns(self) -> frozenset[str]:
-        """The key columns' lowercased names, whose values are staged exactly."""
-        return frozenset(key.lower() for key in self.key_properties or ())
+    def _staging_rules(self) -> StagingRules:
+        """What staging does with a value its column would round.
+
+        From ``value_type_checking``; key columns are named so a rounded key
+        is reported as one (it can merge records), or fails under strict.
+        """
+        return StagingRules(
+            strict=self.config.get("value_type_checking") == STRICT,
+            key_columns=frozenset(key.lower() for key in self.key_properties or ()),
+        )
 
     def _key_column_types(self) -> dict[str, str]:
         """Map each key property to its table column's actual type.
@@ -429,7 +417,7 @@ class ducklakeSink(SQLSink):
             pyarrow_schema=self.pyarrow_schema,  # type: ignore
             flattened_schema=self.flatten_schema,
             convert_tz_to_utc=self.convert_tz_to_utc,
-            key_columns=self._key_columns,
+            rules=self._staging_rules,
         )
         memory_after_concat = self._get_memory_usage_mb()
         memory_diff_concat = memory_after_concat - memory_before_concat
