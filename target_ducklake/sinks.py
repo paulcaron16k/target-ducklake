@@ -321,6 +321,7 @@ class ducklakeSink(SQLSink):
                     and prop.get("format") == SINGER_DECIMAL_FORMAT
                 )
                 or (
+                    # Any numeric key, a double-hinted one included.
                     column["name"].lower() in key_columns
                     and (_is_exact_number(ours) or pa.types.is_floating(ours))
                     and _is_exact_number(theirs)
