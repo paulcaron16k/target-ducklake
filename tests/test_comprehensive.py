@@ -3263,13 +3263,118 @@ class TestTimezoneOffsets:
 
     @pytest.mark.parametrize(
         "text",
-        ["not a date", "", "9999-12-31T23:59:59-05:00", "2024-13-01T00:00:00+02:00"],
-        ids=["garbage", "empty", "utc-beyond-year-9999", "invalid-month"],
+        ["not a date", "", "2024-13-01T00:00:00+02:00"],
+        ids=["garbage", "empty", "invalid-month"],
     )
     def test_text_that_does_not_convert_is_left_as_it_is(self, text: str):
-        """Text that doesn't parse, or overflows in UTC, reaches DuckDB unchanged."""
+        """Text that doesn't parse reaches DuckDB unchanged."""
         data = {"at": [text, None]}
         assert _normalize_data_for_pyarrow(data, ["at"]) == {"at": [text, None]}
+
+    # DUCKLKD-104: UTC times Python can't hold (years 1 to 9999) but DuckDB can.
+    BEYOND: ClassVar[list[tuple[datetime, str]]] = [
+        (
+            datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone(timedelta(hours=-5))),
+            "10000-01-01 04:59:59.000000Z",
+        ),
+        (
+            datetime(1, 1, 1, 0, 0, tzinfo=timezone(timedelta(hours=9))),
+            "0000-12-31 15:00:00.000000Z",
+        ),
+        (
+            datetime(9999, 12, 31, 23, 0, tzinfo=ZoneInfo("America/New_York")),
+            "10000-01-01 04:00:00.000000Z",
+        ),
+        (
+            # Local mean time: Paris was +00:09:21 then.
+            datetime(1, 1, 1, 0, 5, tzinfo=ZoneInfo("Europe/Paris")),
+            "0000-12-31 23:55:39.000000Z",
+        ),
+        (
+            datetime(
+                9999, 12, 31, 23, 59, 59, 999999, tzinfo=timezone(-timedelta(hours=5))
+            ),
+            "10000-01-01 04:59:59.999999Z",
+        ),
+        (
+            datetime(1, 1, 1, 0, 0, tzinfo=timezone(timedelta(hours=9, seconds=30))),
+            "0000-12-31 14:59:30.000000Z",
+        ),
+    ]
+    BEYOND_IDS: ClassVar[list[str]] = [
+        "past-9999",
+        "before-1",
+        "named-zone-past-9999",
+        "lmt-before-1",
+        "microseconds",
+        "offset-with-seconds",
+    ]
+
+    @pytest.mark.parametrize(("value", "utc"), BEYOND, ids=BEYOND_IDS)
+    def test_utc_beyond_python_years_is_converted(self, value: datetime, utc: str):
+        """As a datetime or as text, with convert_tz_to_utc: UTC text, no crash.
+
+        The datetime raised OverflowError and failed the batch; the text was
+        left with its offset, which a TIMESTAMP column drops.
+        """
+        data = {"at": [value, value.isoformat(), None]}
+        assert _normalize_data_for_pyarrow(data, ["at"]) == {"at": [utc, utc, None]}
+        assert _as_utc_instant(value) == utc
+
+    def test_utc_beyond_python_years_loads_as_utc(self, tmp_path: Path):
+        """Through the sink: the batch loads and the column holds the UTC time.
+
+        A plain TIMESTAMP column holds 10000-01-01 04:59:59 (not the value's
+        own 9999-12-31 23:59:59), and TIMESTAMPTZ the same instant.
+        """
+        value, _ = self.BEYOND[0]
+        con = self._load(
+            tmp_path, [{"id": "a", "at": value, "at_tz": value}], convert_tz_to_utc=True
+        )
+        row = con.execute(
+            'SELECT "at"::VARCHAR, epoch(at_tz) FROM ducklake_catalog.s.t'
+        ).fetchone()
+        assert row == ("10000-01-01 04:59:59", value.timestamp())
+
+    @pytest.mark.parametrize("order", ["beyond-first", "beyond-last"])
+    def test_a_batch_mixing_in_range_and_beyond_loads(self, tmp_path: Path, order: str):
+        """One row beyond Python's years beside ordinary rows doesn't fail the batch.
+
+        The out-of-range value becomes text while the others stay datetimes,
+        and pyarrow can't build a string column from both.
+        """
+        beyond, _ = self.BEYOND[0]
+        ordinary = datetime(2024, 1, 1, 10, tzinfo=timezone(timedelta(hours=2)))
+        values = [beyond, ordinary] if order == "beyond-first" else [ordinary, beyond]
+        records = [
+            {"id": str(i), "at": v, "at_tz": v} for i, v in enumerate(values)
+        ] + [{"id": "none", "at": None, "at_tz": None}]
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        # One batch, so the values share a staged column.
+        self._load_into(con, tmp_path, [records], convert_tz_to_utc=True)
+        rows = dict(
+            con.execute(
+                'SELECT "at"::VARCHAR, epoch(at_tz) FROM ducklake_catalog.s.t'
+                " WHERE id <> 'none'"
+            ).fetchall()
+        )
+        assert rows == {
+            "10000-01-01 04:59:59": beyond.timestamp(),
+            "2024-01-01 08:00:00": ordinary.timestamp(),
+        }
+
+    @pytest.mark.parametrize("shape", TEXT_SHAPES)
+    def test_unparsed_text_beyond_python_years_loads_as_utc(
+        self, tmp_path: Path, shape: str
+    ):
+        """Nested, oneOf and auto-cast text: UTC, not the value's wall-clock time."""
+        value, _ = self.BEYOND[0]
+        loaded = self._load_text(
+            tmp_path, value.isoformat(), convert_tz_to_utc=True, shape=shape
+        )
+        assert loaded == ("10000-01-01 04:59:59", value.timestamp())
 
     @pytest.mark.parametrize("offset", ["+02:00", "-07:00", "+05:30"])
     @pytest.mark.parametrize("convert", ["keep-offset", "convert-to-utc"])
@@ -3684,7 +3789,7 @@ class TestDateTimeType:
             ("2024-01-01T14:00:00+02:00", "2024-01-01 12:00:00.000000Z"),
             ("2024-01-01T12:00:00Z", "2024-01-01 12:00:00.000000Z"),
             ("2024-01-01T12:00:00.5", "2024-01-01 12:00:00.500000Z"),
-            (LATE, LATE),
+            (LATE, "10000-01-01 04:00:00.000000Z"),
             ("not a date", "not a date"),
             (None, None),
         ],
