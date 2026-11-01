@@ -39,9 +39,17 @@ def dump_json_value(value: object) -> str:
 
     The SDK parses every JSON number with a fraction as a Decimal. It is
     written as a JSON number with all its digits (``use_decimal``), not
-    through float, which keeps only about 15 significant digits.
+    through float, which keeps only about 15 significant digits. Every other
+    value is written as the stdlib ``json.dumps`` writes it: NaN and Infinity
+    as such, and namedtuples as arrays.
     """
-    return simplejson.dumps(value, use_decimal=True, default=_json_default)
+    return simplejson.dumps(
+        value,
+        use_decimal=True,
+        default=_json_default,
+        allow_nan=True,
+        namedtuple_as_object=False,
+    )
 
 
 def flatten_key(k, parent_key, sep):

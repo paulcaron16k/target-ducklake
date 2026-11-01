@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import copy
 import io
 import itertools
@@ -1623,6 +1624,31 @@ class TestJsonColumnDecimals:
             {"payload": Decimal("0.12345678901234567890")}, flatten_schema=schema
         )
         assert result["payload"] == "0.12345678901234567890"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            {"a": {"b": [1, "x", None, True, False]}},
+            {"é": "ü\n\"q\""},
+            [1e22, 1e-7, 2.5, -0.0, 10**30],
+            {1: "int key", 2.5: "float key", None: "null key"},
+            {"x": float("nan"), "y": [float("inf"), float("-inf")]},
+            {"x": collections.namedtuple("Pair", "a b")(1, 2)},
+            {"x": (1, 2)},
+        ],
+        ids=[
+            "nested",
+            "unicode",
+            "numbers",
+            "non-str-keys",
+            "nan-and-infinity",
+            "namedtuple",
+            "tuple",
+        ],
+    )
+    def test_values_without_decimals_are_dumped_as_before(self, value: object):
+        """Byte for byte what json.dumps wrote, NaN and namedtuples included."""
+        assert dump_json_value(value) == json.dumps(value)
 
     def test_loaded_json_keeps_every_digit_and_stays_numeric(self, tmp_path: Path):
         """Through listen() on a real catalog: valid JSON, numbers stay numbers."""
