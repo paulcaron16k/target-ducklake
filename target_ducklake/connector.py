@@ -25,8 +25,10 @@ from target_ducklake.layout import PartitionKey, SortKey, TableLayout
 from target_ducklake.parquet_utils import number_precision_and_scale
 from target_ducklake.type_hints import (
     decimal_hint,
+    declares_base64_binary,
     hint_fits_json_type,
     hinted_type,
+    is_binary_hint,
     is_decimal_hint,
     is_default_type_hint,
 )
@@ -180,11 +182,15 @@ class JSONSchemaToDuckLake(JSONSchemaToSQL):
         the SDK's warning. A supported hint that the property's JSON type can't
         be loaded into (``uuid`` on an integer, see ``hint_fits_json_type``) is
         ignored with a warning, and the JSON type decides the column.
+
+        A string sent as base64 (``contentEncoding: base64``) is BLOB, with or
+        without a binary hint; a binary hint without that encoding is ignored
+        (``json_to_ducklake_schema`` warns, naming the property).
         """
         unhinted = {k: v for k, v in schema.items() if k != "x-sql-datatype"}
-        if is_unsized_singer_decimal(schema):
-            return VARCHAR()
-        if is_default_type_hint(schema):
+        if (declared := self._declared_text_type(schema)) is not None:
+            return declared
+        if is_default_type_hint(schema) or is_binary_hint(schema):
             return super().to_sql_type(unhinted)
         hinted = "DECIMAL" if is_decimal_hint(schema) else hinted_type(schema)
         if hinted is None:
@@ -200,6 +206,19 @@ class JSONSchemaToDuckLake(JSONSchemaToSQL):
             stacklevel=2,
         )
         return super().to_sql_type(unhinted)
+
+    @staticmethod
+    def _declared_text_type(schema: dict) -> TypeEngine | None:
+        """The column of a string whose text the schema says how to read, if any.
+
+        An unsized ``x-singer.decimal`` is VARCHAR, keeping every digit; a
+        string sent as base64 is BLOB.
+        """
+        if is_unsized_singer_decimal(schema):
+            return VARCHAR()
+        if declares_base64_binary(schema):
+            return DuckDBType("BLOB")
+        return None
 
     def __init__(self, *args, date_time_type: str = "timestamptz", **kwargs):
         super().__init__(*args, **kwargs)
@@ -950,7 +969,7 @@ class DuckLakeConnector(SQLConnector):
         DELETE FROM {table_ref} AS "target"
         USING (SELECT {staged_keys_sql} FROM '{file_location}') AS "staged"
         WHERE {key_match_sql};
-        INSERT INTO {table_ref} 
+        INSERT INTO {table_ref}
         SELECT {columns_sql} FROM '{file_location}';
         COMMIT;
         """
@@ -981,6 +1000,14 @@ class DuckLakeConnector(SQLConnector):
                     prop_name,
                     prop_schema.get("precision"),
                     prop_schema.get("scale"),
+                )
+            if is_binary_hint(prop_schema) and not declares_base64_binary(prop_schema):
+                logger.warning(
+                    "Property %r declares x-sql-datatype %r but no contentEncoding, "
+                    "so how its text stands for bytes is unknown; keeping its text "
+                    "as sent. Add contentEncoding: base64 to load it as BLOB.",
+                    prop_name,
+                    prop_schema.get("x-sql-datatype"),
                 )
             ducklake_schema.append(
                 {"name": prop_name, "type": str(converter.to_sql_type(prop_schema))}

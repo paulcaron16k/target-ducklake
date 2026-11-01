@@ -67,6 +67,10 @@ plugins:
         partition_fields: {"my_stream": [{"column_name": "created_at", "type": "timestamp", "granularity": ["year", "month"]}]} # Optional
 ```
 
+### Binary columns
+
+A `string` property with `contentEncoding: base64` is a BLOB column, as in target-iceberg, with or without a binary `x-sql-datatype` hint. Each value is decoded strictly (`base64.b64decode(..., validate=True)`): text outside the base64 alphabet, bad padding or a line break fails the batch, naming the column, rather than storing the wrong bytes. A `format`, or a supported hint other than a binary or text type (`uuid`, a timestamp), decides the column first. A column already created as VARCHAR keeps the text as sent.
+
 ### Date-time columns
 
 A Singer `date-time` is an instant: sources send UTC, and a value with another offset stands for its UTC instant. So by default (`date_time_type: timestamptz`) a `format: date-time` property without an `x-sql-datatype` hint is a TIMESTAMPTZ column, as in target-iceberg:
@@ -166,7 +170,7 @@ Supported hints (case and spacing ignored):
 | any of the timestamp and time hints with a precision, e.g. `timestamp(3) with time zone` | as without it: microseconds are kept, so `datetime2(7)`'s 100 ns digit is dropped |
 | `uuid`, `uniqueidentifier` / `json`, `jsonb` | UUID / JSON |
 
-Hints naming the type a property gets anyway are accepted without a warning: a text type (`text`, `varchar(n)`, `varchar(max)`, `char(n)`, `nvarchar(n)`, `citext`) on a `string` property, and `boolean`/`bool` on a `boolean` property. On another JSON type they warn as unsupported. Deliberately unsupported, so they keep the JSON type's column: `tinyint` (MySQL uses `tinyint(1)` for booleans), `datetime` (MySQL's meaning is the opposite of ISO's), `timetz` and `time with time zone` (DuckLake's Parquet files drop the offset without converting it), `bit` and binary types.
+Hints naming the type a property gets anyway are accepted without a warning: a text type (`text`, `varchar(n)`, `varchar(max)`, `char(n)`, `nvarchar(n)`, `citext`) on a `string` property, and `boolean`/`bool` on a `boolean` property. On another JSON type they warn as unsupported. Deliberately unsupported, so they keep the JSON type's column: `tinyint` (MySQL uses `tinyint(1)` for booleans), `datetime` (MySQL's meaning is the opposite of ISO's), `timetz` and `time with time zone` (DuckLake's Parquet files drop the offset without converting it), and `bit`. A binary hint (`binary`, `varbinary(n)`, `blob`, `bytea`, `bytes`) alone keeps the text, with a warning naming the property: JSON carries no bytes, so only `contentEncoding: base64` says how to read them (see [Binary columns](#binary-columns)).
 
 Existing tables keep their column types, apart from safe integer and float widenings. Values are staged at an existing column's own type where the stream's type would change them: a number column into an existing DECIMAL, REAL or DOUBLE column, a number into an existing integer column, a string property into an existing text column, whose text is kept as sent whatever its hint, and an `x-singer.decimal` string into an existing DECIMAL column. A table created before unbounded `x-singer.decimal` strings became VARCHAR has them as DECIMAL(18, 3), which DuckLake can't change to VARCHAR: extra fraction digits are rounded with a warning, and a value with more than 15 integer digits fails naming the column. Recreate the column to keep every digit. So a `double` hint on a column that already exists as DECIMAL(38, 9) still stores DECIMAL(38, 9) values: `1.5e-12` is stored as 0, and a warning reports how many values were rounded. Recreate the column to store doubles.
 
