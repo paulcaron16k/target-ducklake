@@ -3621,9 +3621,7 @@ class TestExecuteRetry:
         """Test that execute raises DuckLakeConnectorError after exhausting retries."""
         connector = self._make_connector()
         mock_cursor = Mock()
-        mock_cursor.execute.side_effect = duckdb.IOException(
-            "Unable to connect to Postgres"
-        )
+        mock_cursor.execute.side_effect = duckdb.IOException("Unable to connect to Postgres")
         connector._connection = Mock()
         connector._connection.cursor.return_value = mock_cursor
 
@@ -3655,11 +3653,9 @@ class TestExecuteRetry:
         mock_cursor = Mock()
         mock_result = Mock()
         mock_cursor.execute.side_effect = [
-            duckdb.Error(
-                "Failed to query most recent snapshot for DuckLake: "
-                'Failed to execute query "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ": '
-                "SSL connection has been closed unexpectedly"
-            ),
+            duckdb.Error("Failed to query most recent snapshot for DuckLake: "
+                         'Failed to execute query "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ": '
+                         "SSL connection has been closed unexpectedly"),
             mock_result,
         ]
         connector._connection = Mock()
@@ -3792,7 +3788,6 @@ class TestTruncateColumnNames:
             assert sink.key_properties == ["a" * 63]
             assert long_key not in sink.flatten_schema
             assert "a" * 63 in sink.flatten_schema
-
 
 class TestStartupScriptGCS:
     """Verify GCS HMAC startup script wiring."""
@@ -4247,7 +4242,9 @@ class TestAtomicOverwrite:
         assert self._rows(con) == [(3, "new"), (4, "new")]
         assert not Path(sink.temp_file_dir).exists()
 
-    def test_a_run_that_fails_before_the_end_leaves_the_old_table(self, tmp_path: Path):
+    def test_a_run_that_fails_before_the_end_leaves_the_old_table(
+        self, tmp_path: Path
+    ):
         """Without clean_up (the run failed or was interrupted), nothing changed."""
         con = duckdb.connect()
         sink = self._sink(tmp_path, con)
@@ -4337,7 +4334,9 @@ class TestActivateVersion:
             "key_properties": ["id"],
         }
 
-    def test_rows_absent_from_the_new_version_are_marked_deleted(self, tmp_path: Path):
+    def test_rows_absent_from_the_new_version_are_marked_deleted(
+        self, tmp_path: Path
+    ):
         """By default row 2, gone at the source, is kept with _sdc_deleted_at set.
 
         When the source sends it again, its next load revives it.

@@ -306,7 +306,8 @@ def truncate_column_names(
 
 # pylint: disable=redefined-outer-name
 def _should_json_dump_value(key, value, flatten_schema=None):
-    """Adapted from here: https://github.com/jwills/target-duckdb/blob/36c8ce68a0b2584c4bbb07325482968b1edc0c40/target_duckdb/db_sync.py#L125"""
+    """Adapted from here: https://github.com/jwills/target-duckdb/blob/36c8ce68a0b2584c4bbb07325482968b1edc0c40/target_duckdb/db_sync.py#L125
+    """
     if isinstance(value, (dict, list)):
         return True
 
