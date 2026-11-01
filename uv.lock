@@ -1369,11 +1369,13 @@ s3 = [
 dev = [
     { name = "jsonschema" },
     { name = "pytest" },
+    { name = "pyyaml" },
     { name = "singer-sdk", extra = ["testing"] },
 ]
 test = [
     { name = "jsonschema" },
     { name = "pytest" },
+    { name = "pyyaml" },
     { name = "singer-sdk", extra = ["testing"] },
 ]
 
@@ -1395,11 +1397,13 @@ provides-extras = ["s3"]
 dev = [
     { name = "jsonschema", specifier = ">=4.24" },
     { name = "pytest", specifier = ">=8" },
+    { name = "pyyaml", specifier = ">=6" },
     { name = "singer-sdk", extras = ["testing"] },
 ]
 test = [
     { name = "jsonschema", specifier = ">=4.24" },
     { name = "pytest", specifier = ">=8" },
+    { name = "pyyaml", specifier = ">=6" },
     { name = "singer-sdk", extras = ["testing"] },
 ]
 
