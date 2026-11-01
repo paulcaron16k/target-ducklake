@@ -126,6 +126,14 @@ _TEXT_TYPE_HINT = re.compile(
 )
 _BOOLEAN_TYPE_HINTS = {"boolean", "bool"}
 
+# Binary column types. A hint alone doesn't make a BLOB column: JSON carries no
+# bytes, so a binary value travels as text, and only a declared encoding says
+# how to read it back (see ``declares_base64_binary``).
+_BINARY_TYPE_HINT = re.compile(
+    r"^(?:binary|varbinary|blob|bytea|bytes)(?:\s*\(\s*(?:\d+|max)\s*\))?$"
+)
+BASE64_CONTENT_ENCODING = "base64"
+
 # MySQL's (deprecated) `unsigned` on a decimal or float changes no type here.
 _UNSIGNED_SUFFIX = re.compile(r"(?:\s+unsigned)?(?:\s+zerofill)?$")
 
@@ -226,4 +234,31 @@ def hint_fits_json_type(jsonschema: dict[str, Any], column_type: str) -> bool:
         column_type in _HINTABLE_COLUMN_TYPES[t]
         for t in _json_types(jsonschema)
         if t in _HINTABLE_COLUMN_TYPES
+    )
+
+
+def is_binary_hint(jsonschema: dict[str, Any]) -> bool:
+    """Whether the hint names a binary type (``bytea``, ``varbinary(16)``, ...)."""
+    return bool(_BINARY_TYPE_HINT.match(sql_datatype_hint(jsonschema)))
+
+
+def declares_base64_binary(jsonschema: dict[str, Any]) -> bool:
+    """Whether a property is binary data sent as base64 text: a BLOB column.
+
+    A string property (no other JSON type) with ``contentEncoding: base64``,
+    as target-iceberg reads it. A ``format`` decides first, as does a
+    supported hint other than a binary or text type (``uuid``, a timestamp):
+    hints decide the column everywhere else too. A binary hint without the
+    encoding doesn't make a BLOB: decoding text the wrong way would store
+    plausible, wrong bytes.
+    """
+    encoding = str(jsonschema.get("contentEncoding") or "").strip().lower()
+    if encoding != BASE64_CONTENT_ENCODING or jsonschema.get("format"):
+        return False
+    if _json_types(jsonschema) != ["string"]:
+        return False
+    return (
+        is_binary_hint(jsonschema)
+        or is_default_type_hint(jsonschema)
+        or (hinted_type(jsonschema) is None and not is_decimal_hint(jsonschema))
     )

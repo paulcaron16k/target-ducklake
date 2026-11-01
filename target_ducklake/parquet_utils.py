@@ -1,4 +1,6 @@
 # taken from https://github.com/Automattic/target-parquet/blob/master/target_parquet/utils/parquet.py
+import base64
+import binascii
 import logging
 import math
 import re
@@ -84,11 +86,13 @@ def _capped_to_38(precision: int, scale: int) -> tuple[int, int]:
     return DECIMAL_MAX_PRECISION, capped_scale
 
 
-# DuckDB column types staged as int64 or float64. Every other type except
-# DECIMAL and BOOLEAN (VARCHAR, JSON, UUID, temporal types) is staged as text,
-# which DuckDB parses on insert.
+# DuckDB column types staged as int64, float64 or binary. Every other type
+# except DECIMAL and BOOLEAN (VARCHAR, JSON, UUID, temporal types) is staged as
+# text, which DuckDB parses on insert.
 _INTEGER_COLUMN_TYPES = {"TINYINT", "SMALLINT", "INT", "INTEGER", "BIGINT"}
 _FLOAT_COLUMN_TYPES = {"REAL", "FLOAT", "FLOAT4", "DOUBLE", "FLOAT8"}
+# DuckDB's names for BLOB; PRAGMA table_info reports BLOB.
+_BINARY_COLUMN_TYPES = {"BLOB", "BYTEA", "BINARY", "VARBINARY"}
 _DECIMAL_COLUMN_TYPE = re.compile(
     r"^(?:DECIMAL|NUMERIC)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)$"
 )
@@ -113,6 +117,8 @@ def staging_type(column_type: str) -> pa.DataType:
         return pa.float64()
     if name == "BOOLEAN":
         return pa.bool_()
+    if name in _BINARY_COLUMN_TYPES:
+        return pa.binary()
     return pa.string()
 
 
@@ -543,6 +549,27 @@ def _integer_column(
     return integers
 
 
+def _base64_bytes(value: object, column: str) -> bytes | None:
+    """Decode a BLOB column's value, sent as base64 text (DUCKLKD-91).
+
+    Strictly, as target-iceberg decodes it: without ``validate``,
+    ``b64decode`` drops characters outside the alphabet and returns whatever
+    is left. A value that isn't base64 text fails the batch, naming the column.
+    """
+    if value is None or isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        try:
+            return base64.b64decode(value, validate=True)
+        except binascii.Error:
+            pass
+    msg = (
+        f"Column {column!r} holds binary data sent as base64; "
+        f"{_shown(value)} is not valid base64."
+    )
+    raise ValueError(msg)
+
+
 def _coerce_column(
     values: list, field: pa.Field, rules: StagingRules = DEFAULT_STAGING_RULES
 ) -> list:
@@ -566,6 +593,8 @@ def _coerce_column(
                     f"{_shown(value)} is not a number."
                 )
                 raise ValueError(msg)  # noqa: TRY004
+    if pa.types.is_binary(field.type):
+        return [_base64_bytes(v, field.name) for v in values]
     if pa.types.is_string(field.type):
         values = [_scalar_text(v) for v in values]
     if (

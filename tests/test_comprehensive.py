@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import io
 import itertools
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import threading
 import uuid
+import warnings
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -4045,6 +4047,346 @@ class TestDateTimeType:
         ).fetchone()[0]
         five_minutes = timedelta(minutes=5).total_seconds()
         assert abs(datetime.now(timezone.utc).timestamp() - deleted_at) < five_minutes
+
+
+class TestBase64Binary:
+    """contentEncoding: base64 strings are BLOB columns, decoded strictly (DUCKLKD-91).
+
+    As in target-iceberg. Handing the base64 text to a binary column unread
+    would store the text's own bytes, not the payload.
+    """
+
+    PAYLOAD: ClassVar[bytes] = b"\x00\x01\xfe\xff binary payload"
+    TEXT: ClassVar[str] = "AAH+/yBiaW5hcnkgcGF5bG9hZA=="
+    B64: ClassVar[dict] = {"type": ["null", "string"], "contentEncoding": "base64"}
+
+    @staticmethod
+    def _ddl_type(prop: dict) -> str:
+        return str(JSONSchemaToDuckLake().to_sql_type(prop))
+
+    @pytest.mark.parametrize(
+        ("extra", "expected"),
+        [
+            ({}, "BLOB"),
+            ({"contentEncoding": " Base64 "}, "BLOB"),
+            ({"x-sql-datatype": "bytea"}, "BLOB"),
+            ({"x-sql-datatype": "varbinary(16)"}, "BLOB"),
+            ({"x-sql-datatype": "varchar(255)"}, "BLOB"),
+            ({"x-sql-datatype": "uuid"}, "UUID"),
+            ({"x-sql-datatype": "timestamptz"}, "TIMESTAMPTZ"),
+            ({"format": "date"}, "DATE"),
+            ({"contentEncoding": "quoted-printable"}, "VARCHAR"),
+            ({"type": ["string", "integer"]}, "VARCHAR"),
+        ],
+        ids=[
+            "encoding",
+            "encoding-spelling",
+            "binary-hint",
+            "sized-binary-hint",
+            "text-hint",
+            "uuid-hint-decides",
+            "timestamp-hint-decides",
+            "format-decides",
+            "other-encoding",
+            "several-json-types",
+        ],
+    )
+    def test_column_type(self, extra: dict, expected: str):
+        """BLOB for base64 text; a format or another supported hint decides first."""
+        assert self._ddl_type({**self.B64, **extra}) == expected
+
+    @pytest.mark.parametrize("hint", ["bytea", "binary(16)", "blob", "bytes"])
+    def test_a_binary_hint_without_the_encoding_keeps_text(
+        self, hint: str, caplog: pytest.LogCaptureFixture
+    ):
+        """VARCHAR, with a warning naming the property and the fix, not the SDK's."""
+        prop = {"type": ["null", "string"], "x-sql-datatype": hint}
+        connector = DuckLakeConnector(
+            {"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # no SDK "does not support" warning
+            with caplog.at_level("WARNING", logger="target_ducklake.connector"):
+                columns = connector.json_to_ducklake_schema({"raw": prop})
+        assert columns == [{"name": "raw", "type": "VARCHAR"}]
+        assert f"Property 'raw' declares x-sql-datatype '{hint}'" in caplog.text
+        assert "Add contentEncoding: base64 to load it as BLOB." in caplog.text
+
+    def test_staged_as_decoded_bytes(self):
+        """A BLOB column stages as parquet binary holding the payload."""
+        assert staging_type("BLOB") == pa.binary()
+        schema = pa.schema([pa.field("b", pa.binary())])
+        staged = create_pyarrow_table(
+            [{"b": self.TEXT}, {"b": None}, {"b": ""}], schema
+        )
+        assert staged.column("b").to_pylist() == [self.PAYLOAD, None, b""]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "not base64!",
+            "AAH+/yBiaW5hcnkgcGF5bG9hZA=",
+            "AAH+/yBi\naW5hcnkgcGF5bG9hZA==",
+            12,
+        ],
+        ids=["outside-alphabet", "bad-padding", "line-break", "number"],
+    )
+    def test_invalid_base64_fails_naming_the_column(self, value: object):
+        """Strict: b64decode without validate drops characters and guesses."""
+        schema = pa.schema([pa.field("b", pa.binary())])
+        with pytest.raises(
+            ValueError, match=r"Column 'b' holds binary data sent as base64; .* is not"
+        ):
+            create_pyarrow_table([{"b": value}], schema)
+
+    @staticmethod
+    def _run(
+        tmp_path: Path,
+        props: dict,
+        records: list[dict],
+        key: str = "id",
+        **extra: object,
+    ) -> None:
+        config = {
+            "catalog_type": "sqlite",
+            "catalog_url": str(tmp_path / "catalog.sqlite"),
+            "data_path": str(tmp_path / "data") + "/",
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging") + "/",
+            "flatten_max_level": 1,
+            **extra,
+        }
+        schema = {"type": "object", "properties": {"id": {"type": "integer"}, **props}}
+        messages = [
+            {
+                "type": "SCHEMA",
+                "stream": "t",
+                "schema": schema,
+                "key_properties": [key],
+            },
+            *({"type": "RECORD", "stream": "t", "record": r} for r in records),
+        ]
+        target = Targetducklake(config=config)
+        target.listen(
+            file_input=io.StringIO("".join(json.dumps(m) + "\n" for m in messages))
+        )
+        target.target_connector.close()
+
+    @staticmethod
+    def _query(tmp_path: Path, sql: str) -> list[tuple]:
+        con = duckdb.connect()
+        con.execute(
+            f"ATTACH 'ducklake:sqlite:{tmp_path / 'catalog.sqlite'}' AS lake "
+            f"(DATA_PATH '{tmp_path / 'data'}/')"
+        )
+        rows = con.execute(sql).fetchall()
+        con.close()
+        return rows
+
+    def test_round_trip(self, tmp_path: Path):
+        """Top-level and nested base64 values are stored as their bytes; NULL stays."""
+        props = {
+            "b": self.B64,
+            "o": {"type": "object", "properties": {"b": self.B64}},
+            "plain": {"type": ["null", "string"]},
+        }
+        records: list[dict] = [
+            {"id": 1, "b": self.TEXT, "o": {"b": self.TEXT}, "plain": self.TEXT},
+            {"id": 2, "b": None, "o": {"b": None}, "plain": None},
+        ]
+        self._run(tmp_path, props, records)
+        rows = self._query(
+            tmp_path,
+            "SELECT id, b, o__b, plain, typeof(b), typeof(o__b), typeof(plain)"
+            " FROM lake.s.t ORDER BY id",
+        )
+        assert rows == [
+            (1, self.PAYLOAD, self.PAYLOAD, self.TEXT, "BLOB", "BLOB", "VARCHAR"),
+            (2, None, None, None, "BLOB", "BLOB", "VARCHAR"),
+        ]
+
+    def test_a_binary_merge_key_replaces_its_row(self, tmp_path: Path):
+        """Keys are compared as bytes, cast to the BLOB column."""
+        props = {"k": self.B64, "v": {"type": "string"}}
+        schema = {"type": "object", "properties": {**props}}
+        for v in ("first", "second"):
+            config = {
+                "catalog_type": "sqlite",
+                "catalog_url": str(tmp_path / "catalog.sqlite"),
+                "data_path": str(tmp_path / "data") + "/",
+                "storage_type": "local",
+                "default_target_schema": "s",
+                "temp_file_dir": str(tmp_path / "staging") + "/",
+            }
+            messages = [
+                {
+                    "type": "SCHEMA",
+                    "stream": "t",
+                    "schema": schema,
+                    "key_properties": ["k"],
+                },
+                {"type": "RECORD", "stream": "t", "record": {"k": self.TEXT, "v": v}},
+            ]
+            target = Targetducklake(config=config)
+            target.listen(
+                file_input=io.StringIO("".join(json.dumps(m) + "\n" for m in messages))
+            )
+            target.target_connector.close()
+        assert self._query(tmp_path, "SELECT k, v FROM lake.s.t") == [
+            (self.PAYLOAD, "second")
+        ]
+
+    @pytest.mark.parametrize("load_method", ["append", "merge", "overwrite"])
+    def test_each_load_method_with_a_duplicate_blob_key(
+        self, tmp_path: Path, load_method: str
+    ):
+        """Two records for one BLOB key in a batch: each method keeps the last.
+
+        Run twice: append adds the batch again, merge and overwrite don't.
+        """
+        other = base64.b64encode(b"\xff\x00").decode()
+        records: list[dict] = [
+            {"id": 1, "k": self.TEXT, "v": "first"},
+            {"id": 2, "k": self.TEXT, "v": "last"},
+            {"id": 3, "k": other, "v": "other"},
+        ]
+        props = {"k": self.B64, "v": {"type": "string"}}
+        for _ in range(2):  # a second run: overwrite replaces, append adds
+            self._run(tmp_path, props, records, key="k", load_method=load_method)
+        rows = self._query(tmp_path, "SELECT k, v FROM lake.s.t ORDER BY v")
+        # The in-batch dedup keeps the last record of each BLOB key.
+        one_run = [(self.PAYLOAD, "last"), (b"\xff\x00", "other")]
+        runs = 2 if load_method == "append" else 1
+        assert rows == sorted(one_run * runs, key=lambda r: r[1])
+
+    def test_an_invalid_value_fails_the_run_naming_the_column(self, tmp_path: Path):
+        """Nothing is loaded from the batch, rather than wrong bytes."""
+        with pytest.raises(ValueError, match="Column 'b' holds binary data"):
+            self._run(tmp_path, {"b": self.B64}, [{"id": 1, "b": "not base64!"}])
+
+    @pytest.mark.parametrize("text", ["hello", "a\\x41", "é", "C:\\xyz"])
+    def test_text_without_the_encoding_into_a_blob_column_fails_naming_it(
+        self, tmp_path: Path, text: str
+    ):
+        """Not the text's own bytes, nor DuckDB's escapes, nor a bare cast error.
+
+        The table's column is BLOB (an earlier stream declared base64); this
+        stream doesn't say how its text stands for bytes.
+        """
+        self._run(tmp_path, {"b": self.B64}, [{"id": 1, "b": self.TEXT}])
+        plain = {"type": ["null", "string"]}
+        with pytest.raises(
+            ValueError,
+            match=r"Column 'b' is BLOB, but property 'b' doesn't declare "
+            r"contentEncoding: base64",
+        ):
+            self._run(tmp_path, {"b": plain}, [{"id": 2, "b": text}])
+        assert self._query(tmp_path, "SELECT id, b FROM lake.s.t") == [
+            (1, self.PAYLOAD)
+        ]
+
+    @staticmethod
+    def _identity_on_b(tmp_path: Path, source: str) -> dict:
+        """Config putting an identity partition on column b, from one source."""
+        if source == "stream_overrides":
+            return {"stream_overrides": {"t": {"partition": [{"column": "b"}]}}}
+        if source == "partition_fields":
+            return {
+                "partition_fields": {"t": [{"column_name": "b", "type": "identifier"}]}
+            }
+        document = {
+            "version": 2,
+            "warehouse": "w",
+            "namespaces": {
+                "s": {
+                    "tables": {
+                        "t": {"partition": [{"column": "b", "transform": "identity"}]}
+                    }
+                }
+            },
+        }
+        path = tmp_path / "table-config.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        _read_table_config.cache_clear()
+        return {"table_config": str(path)}
+
+    @pytest.mark.parametrize(
+        "source", ["stream_overrides", "partition_fields", "table_config"]
+    )
+    def test_an_identity_partition_on_a_blob_column_is_refused(
+        self, tmp_path: Path, source: str
+    ):
+        """DuckLake fails on non-UTF-8 bytes as identity partition values.
+
+        ("Invalid unicode (byte sequence mismatch)"); a bucket works.
+        """
+        with pytest.raises(LayoutError, match=r"identity partition on BLOB column 'b'"):
+            self._run(
+                tmp_path,
+                {"b": self.B64},
+                [{"id": 1, "b": self.TEXT}],
+                **self._identity_on_b(tmp_path, source),
+            )
+        bucket = [{"column": "b", "transform": "bucket", "num_buckets": 4}]
+        self._run(
+            tmp_path,
+            {"b": self.B64},
+            [{"id": 1, "b": self.TEXT}],
+            stream_overrides={"t": {"partition": bucket}},
+        )
+        assert self._query(tmp_path, "SELECT b FROM lake.s.t") == [(self.PAYLOAD,)]
+
+    @pytest.mark.parametrize(
+        ("partition", "reads"),
+        [
+            (None, 0),
+            ([{"column": "b", "transform": "bucket", "num_buckets": 4}], 0),
+            ([{"column": "b"}], 1),
+        ],
+        ids=["none", "bucket", "identity"],
+    )
+    def test_the_table_is_read_for_the_check_only_with_an_identity_partition(
+        self, tmp_path: Path, partition: list | None, reads: int
+    ):
+        """No extra catalog queries for the streams the check can't concern."""
+        overrides = {"t": {"partition": partition}} if partition else {}
+        with patch.object(
+            DuckLakeConnector,
+            "existing_column_types",
+            autospec=True,
+            return_value={},
+        ) as existing:
+            self._run(
+                tmp_path,
+                {"b": {"type": ["null", "string"]}},
+                [{"id": 1, "b": "x"}],
+                stream_overrides=overrides,
+            )
+        assert existing.call_count == reads
+
+    def test_an_identity_partition_on_an_existing_varchar_column_still_loads(
+        self, tmp_path: Path
+    ):
+        """The table's type decides: the column stays VARCHAR, keeping the text.
+
+        A tap that adds contentEncoding: base64 later doesn't break the layout.
+        """
+        partition = self._identity_on_b(tmp_path, "stream_overrides")
+        plain = {"type": ["null", "string"]}
+        self._run(tmp_path, {"b": plain}, [{"id": 1, "b": "x"}], **partition)
+        self._run(tmp_path, {"b": self.B64}, [{"id": 2, "b": self.TEXT}], **partition)
+        assert self._query(
+            tmp_path, "SELECT id, b, typeof(b) FROM lake.s.t ORDER BY id"
+        ) == [(1, "x", "VARCHAR"), (2, self.TEXT, "VARCHAR")]
+
+    def test_an_existing_varchar_column_keeps_its_text(self, tmp_path: Path):
+        """A column loaded as text before keeps the text as sent, not decoded."""
+        self._run(tmp_path, {"b": {"type": ["null", "string"]}}, [{"id": 1, "b": "x"}])
+        self._run(tmp_path, {"b": self.B64}, [{"id": 2, "b": self.TEXT}])
+        assert self._query(
+            tmp_path, "SELECT id, b, typeof(b) FROM lake.s.t ORDER BY id"
+        ) == [(1, "x", "VARCHAR"), (2, self.TEXT, "VARCHAR")]
 
 
 class TestErrorHandling:
