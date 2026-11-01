@@ -1,4 +1,4 @@
-"""Per-stream table layout: partition keys and sort order.
+"""Per-stream table settings: partition keys, sort order and date-time type.
 
 The config shape follows target-iceberg's, so xflow can configure both targets
 the same way. ``stream_defaults`` applies to every stream and
@@ -21,6 +21,9 @@ snapshot every run.
 
 The older ``partition_fields`` setting still works for a stream with no
 ``partition`` in the new shape.
+
+``date_time_type`` (``timestamptz`` or ``timestamp``) can be set the same way,
+over the top-level setting of that name; see ``resolve_date_time_type``.
 """
 
 from __future__ import annotations
@@ -37,12 +40,14 @@ if t.TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 __all__ = [
+    "DATE_TIME_TYPES",
     "LayoutError",
     "PartitionKey",
     "SortKey",
     "TableLayout",
     "check_layout_config",
     "read_table_config",
+    "resolve_date_time_type",
     "resolve_layout",
 ]
 
@@ -53,6 +58,10 @@ TRANSFORMS = frozenset({"identity", *_TIME_TRANSFORMS, "bucket"})
 _ICEBERG_ONLY_TRANSFORMS = frozenset({"truncate", "void"})
 _PARTITION_KEYS = frozenset({"column", "transform", "num_buckets", "width", "name"})
 _LAYOUT_KEYS = frozenset({"partition", "sort_order"})
+# The column type of a date-time property without an x-sql-datatype hint.
+DATE_TIME_TYPES = ("timestamptz", "timestamp")
+_DATE_TIME_TYPE_KEY = "date_time_type"
+_STREAM_KEYS = _LAYOUT_KEYS | {_DATE_TIME_TYPE_KEY}
 # Characters target-iceberg's conform_name strips from identifiers.
 _NOT_KEPT = re.compile(r"[^a-zA-Z0-9_\-\.\s]")
 # target-iceberg's per-stream settings. Those that only configure Iceberg are
@@ -267,6 +276,7 @@ def check_layout_config(
             _partition_keys(layout["partition"], None, where, logger)
         if layout.get("sort_order") is not None:
             _sort_keys(layout["sort_order"], None, where)
+        resolve_date_time_type(config, stream_name)
     if config.get("table_config"):
         _check_table_config(config, logger)
 
@@ -318,7 +328,40 @@ def _report_ignored(
         )
 
 
+def resolve_date_time_type(config: Mapping[str, t.Any], stream_name: str) -> str:
+    """The column type of the stream's date-time properties without a hint.
+
+    ``stream_overrides.<stream>``, else ``stream_defaults``, else the
+    top-level ``date_time_type``, else ``timestamptz``: a Singer date-time is
+    an instant, as target-iceberg loads it.
+
+    Raises:
+        LayoutError: If a per-stream value isn't one of ``DATE_TIME_TYPES``
+            (the top-level value is checked by the config schema).
+    """
+    where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
+    settings = _stream_settings(config, stream_name, where)
+    value = settings.get(_DATE_TIME_TYPE_KEY)
+    if value is None:
+        return config.get(_DATE_TIME_TYPE_KEY) or DATE_TIME_TYPES[0]
+    if value not in DATE_TIME_TYPES:
+        msg = (
+            f"{where}: date_time_type must be one of {list(DATE_TIME_TYPES)}, "
+            f"not {value!r}."
+        )
+        raise LayoutError(msg)
+    return value
+
+
 def _stream_layout(
+    config: Mapping[str, t.Any], stream_name: str, where: str
+) -> dict[str, t.Any]:
+    """The stream's layout settings: ``partition`` and ``sort_order``."""
+    settings = _stream_settings(config, stream_name, where)
+    return {key: value for key, value in settings.items() if key in _LAYOUT_KEYS}
+
+
+def _stream_settings(
     config: Mapping[str, t.Any], stream_name: str, where: str
 ) -> dict[str, t.Any]:
     """``stream_defaults`` with this stream's ``stream_overrides`` merged over it.
@@ -348,15 +391,15 @@ def _stream_layout(
         )
         raise LayoutError(msg)
     if unknown := sorted(
-        set(layout) - _LAYOUT_KEYS - _ICEBERG_ONLY_LAYOUT_KEYS - {_TYPE_SOURCE_ONLY_KEY}
+        set(layout) - _STREAM_KEYS - _ICEBERG_ONLY_LAYOUT_KEYS - {_TYPE_SOURCE_ONLY_KEY}
     ):
         msg = (
             f"{where}: unknown stream_defaults/stream_overrides setting(s) "
-            f"{unknown}. target-ducklake applies {sorted(_LAYOUT_KEYS)} and ignores "
+            f"{unknown}. target-ducklake applies {sorted(_STREAM_KEYS)} and ignores "
             f"the Iceberg-only {sorted(_ICEBERG_ONLY_LAYOUT_KEYS)}."
         )
         raise LayoutError(msg)
-    return {key: value for key, value in layout.items() if key in _LAYOUT_KEYS}
+    return {key: value for key, value in layout.items() if key in _STREAM_KEYS}
 
 
 def read_table_config(path: str) -> dict[str, t.Any]:

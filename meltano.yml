@@ -110,7 +110,7 @@ plugins:
     - name: stream_defaults
       kind: object
       label: Stream Defaults
-      description: Table layout for every stream, as in target-iceberg. partition ([{column, transform, num_buckets}]; identity, year, month, day, hour, bucket) and sort_order (column names, optionally with ASC/DESC and NULLS FIRST/LAST).
+      description: Table layout for every stream, as in target-iceberg. partition ([{column, transform, num_buckets}]; identity, year, month, day, hour, bucket) and sort_order (column names, optionally with ASC/DESC and NULLS FIRST/LAST). Also date_time_type, over the top-level setting.
 
     - name: stream_overrides
       kind: object
@@ -127,6 +127,17 @@ plugins:
       label: Auto Cast Timestamps
       description: When True, automatically attempts to cast timestamp-like fields to timestamp types in ducklake.
       default: false
+
+    - name: date_time_type
+      kind: options
+      label: Date-Time Type
+      description: The column type of a format date-time property without an x-sql-datatype hint. timestamptz loads instants, as target-iceberg does (a value without an offset is read as UTC); timestamp loads wall-clock times. Applies to new tables and new columns; an existing TIMESTAMP column keeps its type. Settable per stream in stream_defaults and stream_overrides.
+      default: timestamptz
+      options:
+        - label: TIMESTAMPTZ (instants)
+          value: timestamptz
+        - label: TIMESTAMP (wall-clock times)
+          value: timestamp
 
     - name: validate_records
       kind: boolean
