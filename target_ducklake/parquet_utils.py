@@ -399,6 +399,17 @@ def _mixes_zones(values: list) -> bool:
     return len({v.tzinfo for v in values if isinstance(v, datetime)}) > 1
 
 
+def _mixes_text_and_datetimes(values: list) -> bool:
+    """Whether a column holds both text and datetimes.
+
+    With convert_tz_to_utc, a datetime whose UTC time leaves Python's years
+    becomes text (``_utc_text``) while the others stay datetimes.
+    """
+    return any(isinstance(v, str) for v in values) and any(
+        isinstance(v, datetime) for v in values
+    )
+
+
 def _datetime_text(value: datetime) -> str:
     """Render a datetime as ISO text that DuckDB reads exactly.
 
@@ -557,11 +568,16 @@ def _coerce_column(
                 raise ValueError(msg)  # noqa: TRY004
     if pa.types.is_string(field.type):
         values = [_scalar_text(v) for v in values]
-    if any(_has_fixed_offset(v) for v in values) or _mixes_zones(values):
-        # pyarrow can't build a column with a fixed offset, and moves a column
-        # mixing zones into its first value's zone, so render every datetime
-        # in it as text, each in its own offset. Columns in one zone are left
-        # to pyarrow, so what loaded before stages byte-for-byte the same.
+    if (
+        any(_has_fixed_offset(v) for v in values)
+        or _mixes_zones(values)
+        or _mixes_text_and_datetimes(values)
+    ):
+        # pyarrow can't build a column with a fixed offset, moves a column
+        # mixing zones into its first value's zone, and can't build one from
+        # both text and datetimes, so render every datetime in it as text,
+        # each in its own offset. Other columns are left to pyarrow, so what
+        # loaded before stages byte-for-byte the same.
         values = [_datetime_text(v) if isinstance(v, datetime) else v for v in values]
     # Decimals in float columns become floats.
     return [float(v) if isinstance(v, Decimal) else v for v in values]

@@ -3311,6 +3311,35 @@ class TestTimezoneOffsets:
         ).fetchone()
         assert row == ("10000-01-01 04:59:59", value.timestamp())
 
+    @pytest.mark.parametrize("order", ["beyond-first", "beyond-last"])
+    def test_a_batch_mixing_in_range_and_beyond_loads(self, tmp_path: Path, order: str):
+        """One row beyond Python's years beside ordinary rows doesn't fail the batch.
+
+        The out-of-range value becomes text while the others stay datetimes,
+        and pyarrow can't build a string column from both.
+        """
+        beyond, _ = self.BEYOND[0]
+        ordinary = datetime(2024, 1, 1, 10, tzinfo=timezone(timedelta(hours=2)))
+        values = [beyond, ordinary] if order == "beyond-first" else [ordinary, beyond]
+        records = [
+            {"id": str(i), "at": v, "at_tz": v} for i, v in enumerate(values)
+        ] + [{"id": "none", "at": None, "at_tz": None}]
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        # One batch, so the values share a staged column.
+        self._load_into(con, tmp_path, [records], convert_tz_to_utc=True)
+        rows = dict(
+            con.execute(
+                'SELECT "at"::VARCHAR, epoch(at_tz) FROM ducklake_catalog.s.t'
+                " WHERE id <> 'none'"
+            ).fetchall()
+        )
+        assert rows == {
+            "10000-01-01 04:59:59": beyond.timestamp(),
+            "2024-01-01 08:00:00": ordinary.timestamp(),
+        }
+
     @pytest.mark.parametrize("shape", TEXT_SHAPES)
     def test_unparsed_text_beyond_python_years_loads_as_utc(
         self, tmp_path: Path, shape: str
