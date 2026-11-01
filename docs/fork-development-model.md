@@ -173,6 +173,8 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-99](https://github.com/paulcaron16k/target-ducklake-definite/issues/99) `value_type_checking`: rounding warned (permissive, default) or failed (strict); number on an integer column no longer rounded silently | squash `5ebe7f9` (fork PR #100) | — | In fork, PR not opened |
 | [DUCKLKD-22](https://github.com/paulcaron16k/target-ducklake-definite/issues/22) Decimals inside JSON columns keep every digit, as JSON numbers | squash `516db8c` (fork PR #101) | — | In fork, PR not opened |
 | [DUCKLKD-89](https://github.com/paulcaron16k/target-ducklake-definite/issues/89) date-time properties load as TIMESTAMPTZ by default (`date_time_type`), as in target-iceberg | squash `87d37d5` (fork PR #102) | — | In fork, PR not opened |
+| [DUCKLKD-103](https://github.com/paulcaron16k/target-ducklake-definite/issues/103) meltano.yml valid YAML and valid against Meltano's schema | squash `551d2be` (fork PR #105) | — | In fork, PR not opened |
+| [DUCKLKD-104](https://github.com/paulcaron16k/target-ducklake-definite/issues/104) Date-times whose UTC time leaves Python's years load as UTC instead of failing the batch | squash `131e348` (fork PR #106) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
