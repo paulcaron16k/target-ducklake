@@ -134,21 +134,46 @@ def _normalize_datetime(value):
     properties, so a flattened nested value arrives as text) is converted too:
     text with an offset, such as '2024-01-01T10:00:00+05:30', becomes UTC text
     ('2024-01-01 04:30:00.000000Z'). It is parsed as the SDK parses date-times.
-    Text without an offset, text that doesn't parse, and text whose UTC time
-    leaves the year range are left as they are.
+    Text without an offset, and text that doesn't parse, are left as they are.
+    A value whose UTC time is past year 9999 or before year 1, which Python
+    can't hold but DuckDB can, becomes UTC text too (see ``_utc_text``).
     """
     if isinstance(value, datetime) and value.tzinfo is not None:
-        # Convert to UTC timezone
-        return value.astimezone(timezone.utc)
+        try:
+            return value.astimezone(timezone.utc)
+        except OverflowError:
+            return _utc_text(value)
     if isinstance(value, str):
         try:
             parsed = datetime.fromisoformat(value)
-            utc = parsed.astimezone(timezone.utc) if parsed.tzinfo else None
-        except (ValueError, OverflowError):
-            utc = None
-        if utc is not None:
-            return _datetime_text(utc)
+        except ValueError:
+            return value
+        if parsed.tzinfo is not None:
+            return _utc_text(parsed)
     return value
+
+
+# The Gregorian calendar repeats every 400 years (146097 days, whole weeks).
+_GREGORIAN_CYCLE_YEARS = 400
+
+
+def _utc_text(value: datetime) -> str:
+    """An aware datetime's UTC time as text DuckDB reads ('...000000Z').
+
+    Python datetimes hold years 1 to 9999, so the UTC time of
+    9999-12-31T23:00-05:00 (10000-01-01 04:00) or of 0001-01-01T00:00+09:00
+    (year 0) can't be computed directly. It is computed 400 years nearer,
+    where the calendar is the same, and the year is put back in the text;
+    DuckDB reads '10000-01-01 04:00:00.000000Z' and '0000-12-31 ...Z'.
+    """
+    try:
+        return _datetime_text(value.astimezone(timezone.utc))
+    except OverflowError:
+        pass
+    shift = -_GREGORIAN_CYCLE_YEARS if value.year > 1 else _GREGORIAN_CYCLE_YEARS
+    utc = value.replace(year=value.year + shift).astimezone(timezone.utc)
+    text = _datetime_text(utc)
+    return f"{utc.year - shift:04d}{text[4:]}"
 
 
 def _as_utc_instant(value: object) -> object:
@@ -159,8 +184,9 @@ def _as_utc_instant(value: object) -> object:
     the staged values, sees '...12:00Z', '...21:00+09:00' and a naive
     '...12:00' as one key. Text the singer-sdk didn't parse (a flattened
     nested value, say) is parsed as the SDK parses date-times. Text that
-    doesn't parse, and a value whose UTC time leaves the year range, are left
-    as they are for DuckDB to read or refuse.
+    doesn't parse is left as it is, for DuckDB to read or refuse. A value
+    whose UTC time leaves Python's years 1 to 9999 is written as UTC text too
+    (see ``_utc_text``).
     """
     if isinstance(value, str):
         try:
@@ -171,10 +197,7 @@ def _as_utc_instant(value: object) -> object:
         return value
     if value.tzinfo is None:
         return _datetime_text(value.replace(tzinfo=timezone.utc))
-    try:
-        return _datetime_text(value.astimezone(timezone.utc))
-    except OverflowError:
-        return value
+    return _utc_text(value)
 
 
 def _normalize_data_for_pyarrow(data: dict, datetime_fields: list[str]) -> dict:
