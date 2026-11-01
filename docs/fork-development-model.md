@@ -172,6 +172,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-97](https://github.com/paulcaron16k/target-ducklake-definite/issues/97) Key values the key column would round fail the batch instead of merging distinct keys | squash `77991dc` (fork PR #98) | — | In fork, PR not opened |
 | [DUCKLKD-99](https://github.com/paulcaron16k/target-ducklake-definite/issues/99) `value_type_checking`: rounding warned (permissive, default) or failed (strict); number on an integer column no longer rounded silently | squash `5ebe7f9` (fork PR #100) | — | In fork, PR not opened |
 | [DUCKLKD-22](https://github.com/paulcaron16k/target-ducklake-definite/issues/22) Decimals inside JSON columns keep every digit, as JSON numbers | squash `516db8c` (fork PR #101) | — | In fork, PR not opened |
+| [DUCKLKD-89](https://github.com/paulcaron16k/target-ducklake-definite/issues/89) date-time properties load as TIMESTAMPTZ by default (`date_time_type`), as in target-iceberg | squash `87d37d5` (fork PR #102) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 

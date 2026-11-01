@@ -22,7 +22,6 @@ Each side was inventoried from its code against the same checklist, with `file:l
   - STATE emitted while a full refresh is still staged;
   - no transient-error retry.
 - **Divergences that matter for xflow.** The same tap gives different tables in the two targets:
-  - timestamps (TIMESTAMP vs timestamptz);
   - column names (raw vs conformed);
   - `hard_delete` semantics and default;
   - schema routing;
@@ -46,7 +45,7 @@ Each side was inventoried from its code against the same checklist, with `file:l
 | **Types** | decimals | ✅ exact decimal128, rounding reported; `x-singer.decimal` without integer precision and scale becomes exact VARCHAR, as in target-iceberg (DUCKLKD-84) | ✅ exact; an unbounded decimal becomes exact string | — |
 | | decimals inside JSON | ✅ exact JSON number, every digit kept (DUCKLKD-22) | ✅ exact string | Divergence (number vs string) |
 | | `x-sql-datatype` hints | ✅ wider vocabulary (MySQL unsigned, `datetime2`, unsized numeric); hints that conflict with the JSON type are ignored with a warning | ✅ core vocabulary; `timetz` maps to time with a warning; binary | — (see binary) |
-| | `date-time` default | TIMESTAMP (wall clock unless `convert_tz_to_utc`) | timestamptz (UTC) | Divergence · **DUCKLKD-89** |
+| | `date-time` default | ✅ TIMESTAMPTZ; a value without an offset is read as UTC; `date_time_type: timestamp` (global or per stream) gives wall-clock TIMESTAMP; existing TIMESTAMP columns keep their type (DUCKLKD-89) | timestamptz (UTC) | — (aligned) |
 | | objects / arrays | JSON text, or flattened | ✅ native struct / list when properties/items are declared; JSON text otherwise | DuckLake · **DUCKLKD-85** |
 | | `anyOf` / `oneOf` / `allOf` | ✅ first typed branch, wrapper hint carried | ✗ string with a warning | Iceberg |
 | | multi-type | ✅ VARCHAR, exact text | ◐ string with a warning | — |
@@ -108,7 +107,6 @@ Each of these is a design choice in one target; xflow sees different tables for 
 
 | Divergence | target-ducklake | target-iceberg | Issue |
 | --- | --- | --- | --- |
-| date-time type | TIMESTAMP, wall clock unless `convert_tz_to_utc` | timestamptz, UTC | DUCKLKD-89 |
 | column names | as sent; truncated to 63 on Postgres | conformed (lowercase, `_` separators) | DUCKLKD-87 |
 | `hard_delete` | SDK default false; ACTIVATE_VERSION soft-deletes unless true | default true; `false` refused | — (document) |
 | schema routing | `default_target_schema`, else derived from `schema-table` stream names | `default_target_schema`, default `elt_raw` | — (document) |
