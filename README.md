@@ -69,7 +69,12 @@ plugins:
 
 ### Binary columns
 
-A `string` property with `contentEncoding: base64` is a BLOB column, as in target-iceberg, with or without a binary `x-sql-datatype` hint. Each value is decoded strictly (`base64.b64decode(..., validate=True)`): text outside the base64 alphabet, bad padding or a line break fails the batch, naming the column, rather than storing the wrong bytes. A `format`, or a supported hint other than a binary or text type (`uuid`, a timestamp), decides the column first. A column already created as VARCHAR keeps the text as sent.
+A `string` property with `contentEncoding: base64` is a BLOB column, as in target-iceberg, with or without a binary `x-sql-datatype` hint. A `format`, or a supported hint other than a binary or text type (`uuid`, a timestamp), decides the column first.
+
+- **Decoded strictly** (`base64.b64decode(..., validate=True)`), always, whatever `value_type_checking` says: text outside the standard base64 alphabet, bad or missing padding, a line break, or the URL-safe alphabet (`-`, `_`) fails the batch, naming the column, rather than storing the wrong bytes.
+- **An existing VARCHAR column** keeps the text as sent.
+- **An existing BLOB column** fed by a property without `contentEncoding: base64` fails the stream at startup, naming the column: DuckDB's cast would store the text's own bytes, read its `\x` escapes, or fail without naming it.
+- **Partitioning:** an identity partition on a BLOB column is refused (DuckLake stores identity partition values as text and fails on bytes that aren't UTF-8); a `bucket` partition works.
 
 ### Date-time columns
 
