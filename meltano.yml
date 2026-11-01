@@ -32,14 +32,19 @@ plugins:
       sensitive: true
 
     - name: catalog_type
+      kind: options
       label: Catalog Type
       description: "Type of catalog database: postgres, sqlite, mysql, or duckdb"
-      default: postgres
+      value: postgres
       options:
-        - postgres
-        - sqlite
-        - mysql
-        - duckdb
+        - label: postgres
+          value: postgres
+        - label: sqlite
+          value: sqlite
+        - label: mysql
+          value: mysql
+        - label: duckdb
+          value: duckdb
 
     - name: meta_schema
       label: Meta Schema
@@ -50,13 +55,17 @@ plugins:
       description: GCS, S3, or local folder path for data storage
 
     - name: storage_type
+      kind: options
       label: Storage Type
       description: "Type of storage: GCS, S3, or local"
-      default: local
+      value: local
       options:
-        - GCS
-        - S3
-        - local
+        - label: GCS
+          value: GCS
+        - label: S3
+          value: S3
+        - label: local
+          value: local
 
     - name: public_key
       label: Public Key
@@ -83,24 +92,24 @@ plugins:
       kind: integer
       label: Flattening Max Level
       description: Maximum depth for flattening nested fields. Set to 0 to disable flattening.
-      default: 0
+      value: 0
 
     - name: temp_file_dir
       label: Temporary File Directory
       description: Directory path for storing temporary parquet files
-      default: temp_files/
+      value: temp_files/
 
     - name: max_batch_size
       kind: integer
       label: Max Batch Size
       description: Maximum number of records to process in a single batch
-      default: 10000
+      value: 10000
 
     - name: add_record_metadata
       kind: boolean
       label: Add Record Metadata
       description: When True, automatically adds Singer Data Capture (SDC) metadata columns to target tables
-      default: false
+      value: false
 
     - name: partition_fields
       kind: object
@@ -126,13 +135,13 @@ plugins:
       kind: boolean
       label: Auto Cast Timestamps
       description: When True, automatically attempts to cast timestamp-like fields to timestamp types in ducklake.
-      default: false
+      value: false
 
     - name: date_time_type
       kind: options
       label: Date-Time Type
       description: The column type of a format date-time property without an x-sql-datatype hint. timestamptz loads instants, as target-iceberg does (a value without an offset is read as UTC); timestamp loads wall-clock times. Applies to new tables and new columns; an existing TIMESTAMP column keeps its type. Settable per stream in stream_defaults and stream_overrides.
-      default: timestamptz
+      value: timestamptz
       options:
         - label: TIMESTAMPTZ (instants)
           value: timestamptz
@@ -143,13 +152,13 @@ plugins:
       kind: boolean
       label: Validate Records
       description: Whether to validate the schema of the incoming streams.
-      default: false
+      value: false
 
     - name: value_type_checking
       kind: options
       label: Value Type Checking
       description: What to do with a number its column would round (extra fraction digits for a DECIMAL column, a fraction for an integer column). permissive rounds it as DuckDB's cast of a DECIMAL does (half away from zero), with a warning; strict fails the batch naming the column and the value. A value a column can't hold at all fails either way.
-      default: permissive
+      value: permissive
       options:
         - label: Permissive
           value: permissive
@@ -157,37 +166,40 @@ plugins:
           value: strict
 
     - name: load_method
-      kind: string
+      kind: options
       label: Load Method
-      description: Method to use for loading data into the target table: append, merge, or overwrite
+      description: "Method to use for loading data into the target table: append, merge, or overwrite"
       options:
-        - append
-        - merge
-        - overwrite
+        - label: append
+          value: append
+        - label: merge
+          value: merge
+        - label: overwrite
+          value: overwrite
 
     - name: overwrite_if_no_pk
       kind: boolean
       label: Overwrite If No Primary Key
       description: When True, truncates the target table before inserting records if no primary keys are defined in the stream. Overrides load_method.
-      default: false
+      value: false
 
     - name: convert_tz_to_utc
       kind: boolean
       label: Convert TZ to UTC
       description: When True, automatically converts timezone of timestamp-like fields to UTC.
-      default: false
+      value: false
 
     - name: parallel_draining
       kind: boolean
       label: Parallel Draining
       description: When True, enables parallel draining with max_parallelism=10 (Meltano default). When False, sets max_parallelism=1 to disable parallel draining.
-      default: true
+      value: true
 
     - name: max_record_age_minutes
       kind: string
       label: Max Record Age (Minutes)
       description: Maximum age in minutes that records can sit in a sink before a drain is forced.
-      default: "10.0"
+      value: "10.0"
 
     settings_group_validation:
     - [catalog_url, data_path]

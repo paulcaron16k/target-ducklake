@@ -23,6 +23,7 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import yaml
 from singer_sdk.exceptions import ConfigValidationError, InvalidRecord
 
 from target_ducklake.connector import (
@@ -69,6 +70,18 @@ def _staging_schema(flat: dict) -> pa.Schema:
 
 class TestTargetducklakeConfig:
     """Test configuration validation and setup."""
+
+    def test_meltano_yml_parses_and_names_only_real_settings(self):
+        """DUCKLKD-103: meltano.yml is valid YAML and names only config properties.
+
+        An unquoted ': ' in a description broke the whole file.
+        """
+        meltano = Path(__file__).parents[1] / "meltano.yml"
+        project = yaml.safe_load(meltano.read_text())
+        (loader,) = project["plugins"]["loaders"]
+        names = [setting["name"] for setting in loader["settings"]]
+        properties = Targetducklake.config_jsonschema["properties"]
+        assert [name for name in names if name not in properties] == []
 
     def test_valid_minimal_config(self):
         """Test that minimal valid configuration works."""

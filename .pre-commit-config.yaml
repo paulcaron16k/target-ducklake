@@ -39,6 +39,7 @@ repos:
   - id: mypy
     additional_dependencies:
     - types-requests
+    - types-PyYAML
     - types-simplejson
 
 - repo: https://github.com/astral-sh/uv-pre-commit
