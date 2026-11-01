@@ -171,6 +171,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-84](https://github.com/paulcaron16k/target-ducklake-definite/issues/84) x-singer.decimal without integer precision and scale is VARCHAR, not DECIMAL(18,3) | squash `701991e` (fork PR #96) | — | In fork, PR not opened |
 | [DUCKLKD-97](https://github.com/paulcaron16k/target-ducklake-definite/issues/97) Key values the key column would round fail the batch instead of merging distinct keys | squash `77991dc` (fork PR #98) | — | In fork, PR not opened |
 | [DUCKLKD-99](https://github.com/paulcaron16k/target-ducklake-definite/issues/99) `value_type_checking`: rounding warned (permissive, default) or failed (strict); number on an integer column no longer rounded silently | squash `5ebe7f9` (fork PR #100) | — | In fork, PR not opened |
+| [DUCKLKD-22](https://github.com/paulcaron16k/target-ducklake-definite/issues/22) Decimals inside JSON columns keep every digit, as JSON numbers | squash `516db8c` (fork PR #101) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 

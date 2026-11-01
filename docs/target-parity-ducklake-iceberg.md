@@ -44,7 +44,7 @@ Each side was inventoried from its code against the same checklist, with `file:l
 | | NULL key values | ✅ NULL matches NULL | ◐ a nullable key is dropped from identifiers, then upsert refuses | Iceberg |
 | | key type handling | ✅ staged keys cast to the table type | ◐ dedup compares raw values | Iceberg |
 | **Types** | decimals | ✅ exact decimal128, rounding reported; `x-singer.decimal` without integer precision and scale becomes exact VARCHAR, as in target-iceberg (DUCKLKD-84) | ✅ exact; an unbounded decimal becomes exact string | — |
-| | decimals inside JSON | ◐ converted to float | ✅ exact string | DuckLake · DUCKLKD-22 |
+| | decimals inside JSON | ✅ exact JSON number, every digit kept (DUCKLKD-22) | ✅ exact string | Divergence (number vs string) |
 | | `x-sql-datatype` hints | ✅ wider vocabulary (MySQL unsigned, `datetime2`, unsized numeric); hints that conflict with the JSON type are ignored with a warning | ✅ core vocabulary; `timetz` maps to time with a warning; binary | — (see binary) |
 | | `date-time` default | TIMESTAMP (wall clock unless `convert_tz_to_utc`) | timestamptz (UTC) | Divergence · **DUCKLKD-89** |
 | | objects / arrays | JSON text, or flattened | ✅ native struct / list when properties/items are declared; JSON text otherwise | DuckLake · **DUCKLKD-85** |
