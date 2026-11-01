@@ -44,14 +44,14 @@ Each side was inventoried from its code against the same checklist, with `file:l
 | | key type handling | ✅ staged keys cast to the table type | ◐ dedup compares raw values | Iceberg |
 | **Types** | decimals | ✅ exact decimal128, rounding reported; `x-singer.decimal` without integer precision and scale becomes exact VARCHAR, as in target-iceberg (DUCKLKD-84) | ✅ exact; an unbounded decimal becomes exact string | — |
 | | decimals inside JSON | ✅ exact JSON number, every digit kept (DUCKLKD-22) | ✅ exact string | Divergence (number vs string) |
-| | `x-sql-datatype` hints | ✅ wider vocabulary (MySQL unsigned, `datetime2`, unsized numeric); hints that conflict with the JSON type are ignored with a warning | ✅ core vocabulary; `timetz` maps to time with a warning; binary | — (see binary) |
+| | `x-sql-datatype` hints | ✅ wider vocabulary (MySQL unsigned, `datetime2`, unsized numeric); hints that conflict with the JSON type are ignored with a warning | ✅ core vocabulary; `timetz` maps to time with a warning; binary | — |
 | | `date-time` default | ✅ TIMESTAMPTZ; a value without an offset is read as UTC; `date_time_type: timestamp` (global or per stream) gives wall-clock TIMESTAMP; existing TIMESTAMP columns keep their type (DUCKLKD-89) | timestamptz (UTC) | — (aligned) |
 | | objects / arrays | JSON text, or flattened | ✅ native struct / list when properties/items are declared; JSON text otherwise | DuckLake · **DUCKLKD-85** |
 | | `anyOf` / `oneOf` / `allOf` | ✅ first typed branch, wrapper hint carried | ✗ string with a warning | Iceberg |
 | | multi-type | ✅ VARCHAR, exact text | ◐ string with a warning | — |
 | | a number its column would round (extra fraction digits, a fraction for an integer) | ✅ `value_type_checking`: `permissive` (default) rounds as DuckDB's DECIMAL cast, with a warning (a key warning says records merge); `strict` fails naming column and value (DUCKLKD-97, DUCKLKD-99) | ◐ strict only: Arrow refuses a decimal rescale; no setting | Divergence (no shared setting) |
 | | `type_source` (all-string taps) | ✗ (`auto_cast_timestamps` only) | ✅ per stream, `on_error` policy | DuckLake · DUCKLKD-43 |
-| | binary (`contentEncoding: base64`) | ✗ text | ✅ strict decode | DuckLake · **DUCKLKD-91** |
+| | binary (`contentEncoding: base64`) | ✅ BLOB, strict decode; a binary hint alone keeps text with a warning; text into an existing BLOB column and identity partitions on BLOB are refused (DUCKLKD-91) | ✅ strict decode | — (aligned) |
 | **Schema** | add columns | ✅ | ✅ (refused on upsert tables with rows: a PyIceberg limit) | Iceberg (upstream limit) |
 | | type widening | ◐ int family, float→double | ◐ accepts an already-wider table; never alters | — |
 | | name conforming | ✗ raw names; truncation to 63 on Postgres | ✅ SDK `conform_name` parity, clash detection | Divergence · **DUCKLKD-87** |
