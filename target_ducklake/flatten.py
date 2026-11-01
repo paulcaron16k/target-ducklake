@@ -6,9 +6,9 @@ https://github.com/meltano/sdk/blob/35b499d6163f91752fd674f2a3e46a7e22a1fb47/sin
 import collections
 import copy
 import itertools
-import json
 from datetime import date, datetime
-from decimal import Decimal
+
+import simplejson
 
 from target_ducklake.type_hints import sql_datatype_hint
 
@@ -26,16 +26,22 @@ TIMESTAMP_COLUMN_NAMES = {
 }
 
 
-class CustomJSONEncoder(json.JSONEncoder):
-    # sometimes Python Decimal objects are returned, we need to convert them to floats when flattening the schema
-    def default(self, obj):
-        if isinstance(obj, Decimal):
-            return float(obj)  # Convert Decimal to float
-        if isinstance(obj, datetime):
-            return obj.isoformat()  # Convert datetime to ISO format string
-        if isinstance(obj, date):
-            return obj.isoformat()  # Convert date to ISO format string
-        return super().default(obj)
+def _json_default(obj: object) -> str:
+    """Encode the values JSON has no type for: dates and datetimes, as ISO text."""
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    msg = f"Object of type {type(obj).__name__} is not JSON serializable"
+    raise TypeError(msg)
+
+
+def dump_json_value(value: object) -> str:
+    """Serialise a value stored in a JSON column as JSON text.
+
+    The SDK parses every JSON number with a fraction as a Decimal. It is
+    written as a JSON number with all its digits (``use_decimal``), not
+    through float, which keeps only about 15 significant digits.
+    """
+    return simplejson.dumps(value, use_decimal=True, default=_json_default)
 
 
 def flatten_key(k, parent_key, sep):
@@ -96,9 +102,7 @@ def flatten_record(
             items.append(
                 (
                     new_key,
-                    json.dumps(
-                        v, cls=CustomJSONEncoder
-                    )  # use custom encoder to convert Decimal type to float
+                    dump_json_value(v)
                     # A missing value stays None (SQL NULL), not the JSON text
                     # 'null'; a null inside a value is still dumped as JSON.
                     if v is not None and _should_json_dump_value(k, v, flatten_schema)
@@ -302,8 +306,7 @@ def truncate_column_names(
 
 # pylint: disable=redefined-outer-name
 def _should_json_dump_value(key, value, flatten_schema=None):
-    """Adapted from here: https://github.com/jwills/target-duckdb/blob/36c8ce68a0b2584c4bbb07325482968b1edc0c40/target_duckdb/db_sync.py#L125
-    """
+    """Adapted from here: https://github.com/jwills/target-duckdb/blob/36c8ce68a0b2584c4bbb07325482968b1edc0c40/target_duckdb/db_sync.py#L125"""
     if isinstance(value, (dict, list)):
         return True
 

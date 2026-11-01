@@ -1355,6 +1355,7 @@ dependencies = [
     { name = "psutil" },
     { name = "pyarrow" },
     { name = "ruff" },
+    { name = "simplejson" },
     { name = "singer-sdk", extra = ["faker"] },
     { name = "sqlalchemy" },
 ]
@@ -1384,6 +1385,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=20.0.0" },
     { name = "ruff", specifier = ">=0.12.5" },
     { name = "s3fs", marker = "extra == 's3'", specifier = "~=2025.5.0" },
+    { name = "simplejson", specifier = ">=3.17.6" },
     { name = "singer-sdk", extras = ["faker"], specifier = "~=0.46.4" },
     { name = "sqlalchemy", specifier = ">=2.0.41" },
 ]

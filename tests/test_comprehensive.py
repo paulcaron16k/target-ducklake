@@ -31,9 +31,9 @@ from target_ducklake.connector import (
     JSONSchemaToDuckLake,
 )
 from target_ducklake.flatten import (
-    CustomJSONEncoder,
     _apply_timestamp_format,
     _should_auto_cast_to_timestamp,
+    dump_json_value,
     flatten_record,
     flatten_schema,
     truncate_column_names,
@@ -405,12 +405,15 @@ class TestFlattenModule:
         assert result["user__name"] == "John Doe"
         assert result["user__email"] == "john@example.com"
 
-    def test_custom_json_encoder(self):
-        """Test CustomJSONEncoder handles Decimal objects."""
-        encoder = CustomJSONEncoder()
-        result = encoder.default(Decimal("123.45"))
-        assert result == 123.45
-        assert isinstance(result, float)
+    def test_dump_json_value_encodes_dates_as_iso_text(self):
+        """Dates and datetimes inside a JSON value become ISO text."""
+        value = {
+            "d": date(2020, 1, 2),
+            "t": datetime(2020, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+        }
+        assert dump_json_value(value) == (
+            '{"d": "2020-01-02", "t": "2020-01-02T03:04:05+00:00"}'
+        )
 
     def test_should_auto_cast_to_timestamp(self):
         """Test timestamp auto-casting logic."""
@@ -1598,6 +1601,80 @@ class TestSingerDecimal:
         rows = self._load(tmp_path, prop, ["1.5"])
         assert rows == [("2", "DECIMAL(10,0)")]
         assert "1 value(s) in column 'amount'" in capfd.readouterr().err
+
+
+class TestJsonColumnDecimals:
+    """Decimals inside JSON columns keep every digit (DUCKLKD-22)."""
+
+    def test_nested_decimals_keep_every_digit(self):
+        """Objects and arrays are dumped with the Decimal's digits, not a float's."""
+        record = {
+            "payload": {"amount": Decimal("12345678901234567890.123456789")},
+            "rates": [Decimal("0.1000000000000000055511"), Decimal("1E+400")],
+        }
+        result = flatten_record(record)
+        assert result["payload"] == '{"amount": 12345678901234567890.123456789}'
+        assert result["rates"] == "[0.1000000000000000055511, 1E+400]"
+
+    def test_a_scalar_in_an_object_column_keeps_every_digit(self):
+        """A bare Decimal in a column typed object is dumped as its digits too."""
+        schema = {"payload": {"type": ["null", "object"]}}
+        result = flatten_record(
+            {"payload": Decimal("0.12345678901234567890")}, flatten_schema=schema
+        )
+        assert result["payload"] == "0.12345678901234567890"
+
+    def test_loaded_json_keeps_every_digit_and_stays_numeric(self, tmp_path: Path):
+        """Through listen() on a real catalog: valid JSON, numbers stay numbers."""
+        config = {
+            "catalog_type": "sqlite",
+            "catalog_url": str(tmp_path / "catalog.sqlite"),
+            "data_path": str(tmp_path / "data") + "/",
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging") + "/",
+        }
+        schema = {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer"},
+                "payload": {"type": ["null", "object"]},
+                "rates": {"type": ["null", "array"]},
+            },
+        }
+        schema_message = {"type": "SCHEMA", "stream": "t", "schema": schema}
+        # Written by hand: json.dumps would round the numbers through float.
+        record = (
+            '{"type": "RECORD", "stream": "t", "record": {"id": 1, '
+            '"payload": {"amount": 12345678901234567890.123456789}, '
+            '"rates": [0.1000000000000000055511, 2.5]}}\n'
+        )
+        target = Targetducklake(config=config)
+        target.listen(
+            file_input=io.StringIO(
+                json.dumps({**schema_message, "key_properties": ["id"]}) + "\n" + record
+            )
+        )
+        target.target_connector.close()
+        con = duckdb.connect()
+        con.execute(
+            f"ATTACH 'ducklake:sqlite:{tmp_path / 'catalog.sqlite'}' AS lake "
+            f"(DATA_PATH '{tmp_path / 'data'}/')"
+        )
+        row = con.execute(
+            "SELECT payload::VARCHAR, rates::VARCHAR, json_valid(payload),"
+            " json_valid(rates), json_type(payload, '$.amount'),"
+            " json_type(rates, '$[0]') FROM lake.s.t"
+        ).fetchone()
+        con.close()
+        assert row == (
+            '{"amount": 12345678901234567890.123456789}',
+            "[0.1000000000000000055511, 2.5]",
+            True,
+            True,
+            "DOUBLE",
+            "DOUBLE",
+        )
 
 
 class TestIntegrationScenarios:
@@ -3544,7 +3621,9 @@ class TestExecuteRetry:
         """Test that execute raises DuckLakeConnectorError after exhausting retries."""
         connector = self._make_connector()
         mock_cursor = Mock()
-        mock_cursor.execute.side_effect = duckdb.IOException("Unable to connect to Postgres")
+        mock_cursor.execute.side_effect = duckdb.IOException(
+            "Unable to connect to Postgres"
+        )
         connector._connection = Mock()
         connector._connection.cursor.return_value = mock_cursor
 
@@ -3576,9 +3655,11 @@ class TestExecuteRetry:
         mock_cursor = Mock()
         mock_result = Mock()
         mock_cursor.execute.side_effect = [
-            duckdb.Error("Failed to query most recent snapshot for DuckLake: "
-                         'Failed to execute query "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ": '
-                         "SSL connection has been closed unexpectedly"),
+            duckdb.Error(
+                "Failed to query most recent snapshot for DuckLake: "
+                'Failed to execute query "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ": '
+                "SSL connection has been closed unexpectedly"
+            ),
             mock_result,
         ]
         connector._connection = Mock()
@@ -3711,6 +3792,7 @@ class TestTruncateColumnNames:
             assert sink.key_properties == ["a" * 63]
             assert long_key not in sink.flatten_schema
             assert "a" * 63 in sink.flatten_schema
+
 
 class TestStartupScriptGCS:
     """Verify GCS HMAC startup script wiring."""
@@ -4165,9 +4247,7 @@ class TestAtomicOverwrite:
         assert self._rows(con) == [(3, "new"), (4, "new")]
         assert not Path(sink.temp_file_dir).exists()
 
-    def test_a_run_that_fails_before_the_end_leaves_the_old_table(
-        self, tmp_path: Path
-    ):
+    def test_a_run_that_fails_before_the_end_leaves_the_old_table(self, tmp_path: Path):
         """Without clean_up (the run failed or was interrupted), nothing changed."""
         con = duckdb.connect()
         sink = self._sink(tmp_path, con)
@@ -4257,9 +4337,7 @@ class TestActivateVersion:
             "key_properties": ["id"],
         }
 
-    def test_rows_absent_from_the_new_version_are_marked_deleted(
-        self, tmp_path: Path
-    ):
+    def test_rows_absent_from_the_new_version_are_marked_deleted(self, tmp_path: Path):
         """By default row 2, gone at the source, is kept with _sdc_deleted_at set.
 
         When the source sends it again, its next load revives it.
