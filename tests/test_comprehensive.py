@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import collections
 import copy
 import io
 import itertools
@@ -16,7 +15,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NamedTuple
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
@@ -1604,6 +1603,11 @@ class TestSingerDecimal:
         assert "1 value(s) in column 'amount'" in capfd.readouterr().err
 
 
+class _Pair(NamedTuple):
+    a: int
+    b: int
+
+
 class TestJsonColumnDecimals:
     """Decimals inside JSON columns keep every digit (DUCKLKD-22)."""
 
@@ -1629,11 +1633,11 @@ class TestJsonColumnDecimals:
         "value",
         [
             {"a": {"b": [1, "x", None, True, False]}},
-            {"é": "ü\n\"q\""},
+            {"é": 'ü\n"q"'},
             [1e22, 1e-7, 2.5, -0.0, 10**30],
             {1: "int key", 2.5: "float key", None: "null key"},
             {"x": float("nan"), "y": [float("inf"), float("-inf")]},
-            {"x": collections.namedtuple("Pair", "a b")(1, 2)},
+            {"x": _Pair(1, 2)},
             {"x": (1, 2)},
         ],
         ids=[
