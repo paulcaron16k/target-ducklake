@@ -252,10 +252,7 @@ class ducklakeSink(SQLSink):
     def setup(self) -> None:
         # create the target schema if it doesn't exist
         self.connector.prepare_target_schema(target_schema_name=self.target_schema)
-        # Before prepare_table applies the layout to the table.
-        self._check_partition_types(
-            self.connector.existing_column_types(self.target_schema, self.target_table)
-        )
+        self._check_partition_types()
 
         # prepare the table
         table_types = self.connector.prepare_table(
@@ -275,7 +272,7 @@ class ducklakeSink(SQLSink):
             )
         )
 
-    def _check_partition_types(self, existing_types: dict[str, str]) -> None:
+    def _check_partition_types(self) -> None:
         """Refuse an identity partition on a BLOB column.
 
         DuckLake stores identity partition values as text and fails on bytes
@@ -284,15 +281,20 @@ class ducklakeSink(SQLSink):
 
         The table's own type decides for a column it has (one created as
         VARCHAR keeps its text, whatever the stream now declares), the
-        stream's for a new one.
+        stream's for a new one. Run before ``prepare_table`` applies the
+        layout; the table is read only when an identity partition is set.
         """
+        identity = [k for k in self.layout.partition or () if k.transform == "identity"]
+        if not identity:
+            return
         types = {c["name"].lower(): c["type"] for c in self.ducklake_schema}
-        types.update({name.lower(): typ for name, typ in existing_types.items()})
-        for key in self.layout.partition or ():
+        existing = self.connector.existing_column_types(
+            self.target_schema, self.target_table
+        )
+        types.update({name.lower(): typ for name, typ in existing.items()})
+        for key in identity:
             column_type = types.get(key.column.lower(), "")
-            if key.transform == "identity" and pa.types.is_binary(
-                staging_type(column_type)
-            ):
+            if pa.types.is_binary(staging_type(column_type)):
                 msg = (
                     f"stream {self.stream_name!r}: identity partition on BLOB "
                     f"column {key.column!r}. DuckLake stores identity partition "
