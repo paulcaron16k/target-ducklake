@@ -4286,7 +4286,37 @@ class TestBase64Binary:
             (1, self.PAYLOAD)
         ]
 
-    def test_an_identity_partition_on_a_blob_column_is_refused(self, tmp_path: Path):
+    @staticmethod
+    def _identity_on_b(tmp_path: Path, source: str) -> dict:
+        """Config putting an identity partition on column b, from one source."""
+        if source == "stream_overrides":
+            return {"stream_overrides": {"t": {"partition": [{"column": "b"}]}}}
+        if source == "partition_fields":
+            return {
+                "partition_fields": {"t": [{"column_name": "b", "type": "identifier"}]}
+            }
+        document = {
+            "version": 2,
+            "warehouse": "w",
+            "namespaces": {
+                "s": {
+                    "tables": {
+                        "t": {"partition": [{"column": "b", "transform": "identity"}]}
+                    }
+                }
+            },
+        }
+        path = tmp_path / "table-config.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        _read_table_config.cache_clear()
+        return {"table_config": str(path)}
+
+    @pytest.mark.parametrize(
+        "source", ["stream_overrides", "partition_fields", "table_config"]
+    )
+    def test_an_identity_partition_on_a_blob_column_is_refused(
+        self, tmp_path: Path, source: str
+    ):
         """DuckLake fails on non-UTF-8 bytes as identity partition values.
 
         ("Invalid unicode (byte sequence mismatch)"); a bucket works.
@@ -4296,7 +4326,7 @@ class TestBase64Binary:
                 tmp_path,
                 {"b": self.B64},
                 [{"id": 1, "b": self.TEXT}],
-                stream_overrides={"t": {"partition": [{"column": "b"}]}},
+                **self._identity_on_b(tmp_path, source),
             )
         bucket = [{"column": "b", "transform": "bucket", "num_buckets": 4}]
         self._run(
@@ -4306,6 +4336,21 @@ class TestBase64Binary:
             stream_overrides={"t": {"partition": bucket}},
         )
         assert self._query(tmp_path, "SELECT b FROM lake.s.t") == [(self.PAYLOAD,)]
+
+    def test_an_identity_partition_on_an_existing_varchar_column_still_loads(
+        self, tmp_path: Path
+    ):
+        """The table's type decides: the column stays VARCHAR, keeping the text.
+
+        A tap that adds contentEncoding: base64 later doesn't break the layout.
+        """
+        partition = self._identity_on_b(tmp_path, "stream_overrides")
+        plain = {"type": ["null", "string"]}
+        self._run(tmp_path, {"b": plain}, [{"id": 1, "b": "x"}], **partition)
+        self._run(tmp_path, {"b": self.B64}, [{"id": 2, "b": self.TEXT}], **partition)
+        assert self._query(
+            tmp_path, "SELECT id, b, typeof(b) FROM lake.s.t ORDER BY id"
+        ) == [(1, "x", "VARCHAR"), (2, self.TEXT, "VARCHAR")]
 
     def test_an_existing_varchar_column_keeps_its_text(self, tmp_path: Path):
         """A column loaded as text before keeps the text as sent, not decoded."""

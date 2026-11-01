@@ -543,6 +543,14 @@ class DuckLakeConnector(SQLConnector):
         result = self.execute(get_columns_query).fetchall()
         return [col[1] for col in result]
 
+    def existing_column_types(
+        self, target_schema_name: str, table_name: str
+    ) -> dict[str, str]:
+        """The table's columns mapped to their types; empty if it doesn't exist."""
+        if not self._check_if_table_exists(target_schema_name, table_name):
+            return {}
+        return self.get_table_column_types(target_schema_name, table_name)
+
     def get_table_column_types(
         self, target_schema_name: str, table_name: str
     ) -> dict[str, str]:

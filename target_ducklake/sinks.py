@@ -137,7 +137,6 @@ class ducklakeSink(SQLSink):
             # A shared config names columns in full; Postgres catalogs truncate.
             aliases=self._column_name_mapping,
         )
-        self._check_partition_types()
 
         if not self.config.get("load_method"):
             self.logger.info(
@@ -253,6 +252,10 @@ class ducklakeSink(SQLSink):
     def setup(self) -> None:
         # create the target schema if it doesn't exist
         self.connector.prepare_target_schema(target_schema_name=self.target_schema)
+        # Before prepare_table applies the layout to the table.
+        self._check_partition_types(
+            self.connector.existing_column_types(self.target_schema, self.target_table)
+        )
 
         # prepare the table
         table_types = self.connector.prepare_table(
@@ -272,14 +275,19 @@ class ducklakeSink(SQLSink):
             )
         )
 
-    def _check_partition_types(self) -> None:
+    def _check_partition_types(self, existing_types: dict[str, str]) -> None:
         """Refuse an identity partition on a BLOB column.
 
         DuckLake stores identity partition values as text and fails on bytes
         that aren't UTF-8 ("Invalid unicode (byte sequence mismatch)"), so the
         batch would fail at insert for most binary values. A bucket works.
+
+        The table's own type decides for a column it has (one created as
+        VARCHAR keeps its text, whatever the stream now declares), the
+        stream's for a new one.
         """
         types = {c["name"].lower(): c["type"] for c in self.ducklake_schema}
+        types.update({name.lower(): typ for name, typ in existing_types.items()})
         for key in self.layout.partition or ():
             column_type = types.get(key.column.lower(), "")
             if key.transform == "identity" and pa.types.is_binary(
