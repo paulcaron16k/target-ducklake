@@ -969,7 +969,7 @@ class DuckLakeConnector(SQLConnector):
         DELETE FROM {table_ref} AS "target"
         USING (SELECT {staged_keys_sql} FROM '{file_location}') AS "staged"
         WHERE {key_match_sql};
-        INSERT INTO {table_ref}
+        INSERT INTO {table_ref} 
         SELECT {columns_sql} FROM '{file_location}';
         COMMIT;
         """
