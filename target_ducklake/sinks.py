@@ -17,6 +17,7 @@ from singer_sdk.sinks import SQLSink
 from singer_sdk.sinks.core import JSONSchemaValidator
 
 from target_ducklake.connector import (
+    DELETED_AT_COLUMN,
     SINGER_DECIMAL_FORMAT,
     VERSION_COLUMN,
     DuckLakeConnector,
@@ -27,7 +28,7 @@ from target_ducklake.flatten import (
     nullable_choices,
     truncate_column_names,
 )
-from target_ducklake.layout import resolve_layout
+from target_ducklake.layout import resolve_date_time_type, resolve_layout
 from target_ducklake.parquet_utils import (
     STRICT,
     StagingRules,
@@ -35,6 +36,12 @@ from target_ducklake.parquet_utils import (
     staging_schema,
     staging_type,
 )
+
+
+def _is_timestamptz(column_type: str) -> bool:
+    """Whether a DuckDB column type is TIMESTAMPTZ, by either of its names."""
+    name = " ".join(column_type.upper().split())
+    return name in {"TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE"}
 
 
 def _is_fractional(staged: pa.DataType) -> bool:
@@ -92,8 +99,10 @@ class ducklakeSink(SQLSink):
         self._column_name_mapping: dict[str, str] = {}
         self._apply_column_name_truncation()
 
+        # The column type of unhinted date-time properties, for this stream.
+        self.date_time_type = resolve_date_time_type(self.config, self.stream_name)
         self.ducklake_schema = self.connector.json_to_ducklake_schema(
-            self.flatten_schema
+            self.flatten_schema, self.date_time_type
         )
         # Staged at the columns' own types, so every value they hold stages.
         self.pyarrow_schema = staging_schema(self.ducklake_schema)
@@ -317,10 +326,20 @@ class ducklakeSink(SQLSink):
 
         From ``value_type_checking``; key columns are named so a rounded key
         is reported as one (it can merge records), or fails under strict.
+        With ``date_time_type`` timestamptz, the table's TIMESTAMPTZ columns
+        are named so a date-time without a zone is read as UTC.
         """
+        utc_columns: frozenset[str] = frozenset()
+        if self.date_time_type == "timestamptz":
+            utc_columns = frozenset(
+                name
+                for name, column_type in self._table_types.items()
+                if _is_timestamptz(column_type)
+            )
         return StagingRules(
             strict=self.config.get("value_type_checking") == STRICT,
             key_columns=frozenset(key.lower() for key in self.key_properties or ()),
+            utc_columns=utc_columns,
         )
 
     def _key_column_types(self) -> dict[str, str]:
@@ -616,8 +635,12 @@ class ducklakeSink(SQLSink):
         # As the SDK does by default: mark them deleted, at the current UTC
         # time, and keep them. A row the source sends again is revived when
         # it is next loaded (its own _sdc_deleted_at is empty).
+        deleted_at_type = self._table_types.get(DELETED_AT_COLUMN, "")
         self.connector.mark_other_versions_deleted(
-            self.target_schema, self.target_table, new_version
+            self.target_schema,
+            self.target_table,
+            new_version,
+            deleted_at_is_timestamptz=_is_timestamptz(deleted_at_type),
         )
 
 

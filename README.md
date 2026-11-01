@@ -33,7 +33,8 @@ Supports append, merge, and overwrite load methods (default is merge). The load 
 | `max_batch_size` | integer | ❌ | `10000` | Maximum number of records to process in a single batch |
 | `partition_fields` | object | ❌ | - | Object mapping stream names to arrays of partition column definitions. Each stream key maps directly to an array of column definitions |
 | `auto_cast_timestamps` | boolean | ❌ | `false` | When True, automatically attempts to cast timestamp-like fields to timestamp types in ducklake |
-| `convert_tz_to_utc` | boolean | ❌ | `false` | When True, converts timezone-aware date-time values to UTC before loading, so a timestamp column without time zone stores the UTC time. When False, such a column stores each value's local wall-clock time (its offset is dropped). With the default, a timestamp column fed values in different offsets holds local times that aren't directly comparable; turn this on, or declare the column `timestamptz` (via `x-sql-datatype`), to compare instants. Either way, a `timestamptz` column stores the correct instant, and values with any offset, such as `+05:30`, load. Values without a time zone are loaded as given; a `timestamptz` column reads them in the DuckDB session's time zone. |
+| `convert_tz_to_utc` | boolean | ❌ | `false` | When True, converts timezone-aware date-time values to UTC before loading, so a timestamp column without time zone stores the UTC time. When False, such a column stores each value's local wall-clock time (its offset is dropped). With the default, a timestamp column fed values in different offsets holds local times that aren't directly comparable; turn this on, or declare the column `timestamptz` (via `x-sql-datatype`), to compare instants. Either way, a `timestamptz` column stores the correct instant, and values with any offset, such as `+05:30`, load. Values without a time zone are loaded as given into a `timestamp` column; a `timestamptz` column reads them as UTC with `date_time_type: timestamptz` (the default), and in the DuckDB session's time zone with `timestamp`. |
+| `date_time_type` | string | ❌ | `timestamptz` | The column type of a `format: date-time` property without an `x-sql-datatype` hint. `timestamptz` loads instants, as target-iceberg does: a value with an offset is stored as its UTC instant, and one without an offset is read as UTC. `timestamp` loads wall-clock times (see `convert_tz_to_utc`). Also settable per stream in `stream_defaults`/`stream_overrides`. See [Date-time columns](#date-time-columns) |
 | `validate_records` | boolean | ❌ | `false` | Whether to validate the schema of the incoming streams |
 | `value_type_checking` | string | ❌ | `permissive` | What to do with a number its column would round: `permissive` rounds it as DuckDB's cast of a DECIMAL does, with a warning; `strict` fails the batch naming the column and the value. See [Values a column would round](#values-a-column-would-round) |
 | `overwrite_if_no_pk` | boolean | ❌ | `false` | When True, a stream without primary keys replaces the target table's rows, as `load_method: overwrite` does. Overrides load_method. |
@@ -65,6 +66,18 @@ plugins:
         overwrite_if_no_pk: true # Optional (default false)
         partition_fields: {"my_stream": [{"column_name": "created_at", "type": "timestamp", "granularity": ["year", "month"]}]} # Optional
 ```
+
+### Date-time columns
+
+A Singer `date-time` is an instant: sources send UTC, and a value with another offset stands for its UTC instant. So by default (`date_time_type: timestamptz`) a `format: date-time` property without an `x-sql-datatype` hint is a TIMESTAMPTZ column, as in target-iceberg:
+
+- A value with an offset (`2024-01-01T21:00:00+09:00`) is stored as its instant (`12:00 UTC`).
+- A value without one (`2024-01-01T12:00:00`) is read as UTC, in every TIMESTAMPTZ column of the stream, including nested and auto-cast values that arrive as text, and merge keys. DuckDB alone would read it in its session time zone, the machine's local zone.
+- **Existing tables keep their columns.** A column already created as TIMESTAMP stays TIMESTAMP, and its values load as before; new tables and new columns get TIMESTAMPTZ.
+- `_sdc_deleted_at`, set when ACTIVATE_VERSION retires rows, is the current instant in either column type.
+- An `x-sql-datatype` hint still decides: `timestamp` gives TIMESTAMP, `timestamptz` TIMESTAMPTZ.
+
+`date_time_type: timestamp` gives the earlier behaviour: TIMESTAMP columns holding wall-clock times (each value's own, or UTC with `convert_tz_to_utc`), and hinted TIMESTAMPTZ columns that read a value without an offset in the session time zone. It can be set for all streams, in `stream_defaults`, or per stream in `stream_overrides`.
 
 ### Partitioning and sort order
 
@@ -105,6 +118,7 @@ target-iceberg ignores `write_mode`, and silently appends where upsert was meant
 
 - **Checked at startup:** the `stream_defaults`/`stream_overrides` settings of every stream, and every table's layout sections in `table_config`, are checked when the target starts (a missing or invalid file fails here). Column names, and the older `partition_fields`, are checked when each stream's schema arrives.
 - **Both settings can be given as JSON strings** (for environment variables).
+- **`date_time_type`** can be set in `stream_defaults` and `stream_overrides` too, over the top-level setting (see [Date-time columns](#date-time-columns)).
 
 The older `partition_fields` setting still works for a stream without a `partition`:
 
@@ -126,7 +140,7 @@ target-ducklake --about
 
 ### Column types
 
-Each property's JSON Schema type and format give its column type: `integer` is BIGINT (INTEGER with 32-bit bounds), `number` is DECIMAL(38, 9) (or its `precision`/`scale`), `boolean` is BOOLEAN, `object` and `array` are JSON, and `string` is VARCHAR, or DATE, TIME, TIMESTAMP or UUID by its `format`. A string with format `x-singer.decimal` (the singer-sdk's `use_singer_decimal`) is DECIMAL(precision, scale) when both `precision` and `scale` are integers (precision at least 1, scale from 0 to precision), with a precision above 38 capped as for a number. Otherwise, including a precision without a scale, it is VARCHAR, keeping the decimal's text digit for digit (with a warning naming the property), as target-iceberg keeps it as a string: no DuckDB DECIMAL holds an unsized decimal, a bare DECIMAL would be DECIMAL(18, 3), rounding to 3 places, and DECIMAL(p) is scale 0, rounding every fraction. A bare `decimal`/`numeric` `x-sql-datatype` doesn't size it; a sized `decimal(p,s)` or a non-decimal hint such as `double` decides the column. A property declaring several non-null types, such as `["integer", "string"]`, is VARCHAR, and each value is stored as its text (`5`, `1.50`, `true`). Values are staged at their column's own type, so any value a column can hold loads, and one it can't hold fails the batch instead of being changed. One it would round is rounded with a warning, or fails under strict `value_type_checking` (see [Values a column would round](#values-a-column-would-round)).
+Each property's JSON Schema type and format give its column type: `integer` is BIGINT (INTEGER with 32-bit bounds), `number` is DECIMAL(38, 9) (or its `precision`/`scale`), `boolean` is BOOLEAN, `object` and `array` are JSON, and `string` is VARCHAR, or DATE, TIME, TIMESTAMPTZ (`date-time`; see [Date-time columns](#date-time-columns)) or UUID by its `format`. A string with format `x-singer.decimal` (the singer-sdk's `use_singer_decimal`) is DECIMAL(precision, scale) when both `precision` and `scale` are integers (precision at least 1, scale from 0 to precision), with a precision above 38 capped as for a number. Otherwise, including a precision without a scale, it is VARCHAR, keeping the decimal's text digit for digit (with a warning naming the property), as target-iceberg keeps it as a string: no DuckDB DECIMAL holds an unsized decimal, a bare DECIMAL would be DECIMAL(18, 3), rounding to 3 places, and DECIMAL(p) is scale 0, rounding every fraction. A bare `decimal`/`numeric` `x-sql-datatype` doesn't size it; a sized `decimal(p,s)` or a non-decimal hint such as `double` decides the column. A property declaring several non-null types, such as `["integer", "string"]`, is VARCHAR, and each value is stored as its text (`5`, `1.50`, `true`). Values are staged at their column's own type, so any value a column can hold loads, and one it can't hold fails the batch instead of being changed. One it would round is rounded with a warning, or fails under strict `value_type_checking` (see [Values a column would round](#values-a-column-would-round)).
 
 An `x-sql-datatype` annotation (as database taps emit, e.g. `smallint`, `numeric(12,4)`, `timestamptz`, `uuid`, `jsonb`) sets the column type instead, when the property's values can be loaded into it:
 

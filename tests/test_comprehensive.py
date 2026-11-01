@@ -45,9 +45,12 @@ from target_ducklake.layout import (
     TableLayout,
     _read_table_config,
     check_layout_config,
+    resolve_date_time_type,
     resolve_layout,
 )
 from target_ducklake.parquet_utils import (
+    StagingRules,
+    _as_utc_instant,
     _normalize_data_for_pyarrow,
     create_pyarrow_table,
     number_precision_and_scale,
@@ -633,7 +636,7 @@ class TestUntypedAndChoiceProperties:
         flat = flatten_schema(schema, auto_cast_timestamps=True)
         assert flat["created_at"]["format"] == "date-time"
         connector = DuckLakeConnector(self.CONFIG)
-        assert connector.json_to_ducklake_schema(flat)[0]["type"] == "DATETIME"
+        assert connector.json_to_ducklake_schema(flat)[0]["type"] == "TIMESTAMPTZ"
         # Off (the default), the column is left as it was.
         assert "format" not in flatten_schema(schema)["created_at"]
 
@@ -1906,18 +1909,32 @@ class TestTemporalMergeKeys:
     }
 
     @pytest.mark.parametrize(
-        ("json_format", "column_type", "value"),
+        ("json_format", "date_time_type", "column_type", "value"),
         [
             # Naive values on purpose: taps send zone-less timestamps.
-            ("date-time", "DATETIME", datetime(2024, 1, 1, 10, 0, 0)),  # noqa: DTZ001
-            ("date-time", "DATETIME", datetime(2024, 1, 1, 10, 0, 0, 500000)),  # noqa: DTZ001
-            ("date-time", "DATETIME", datetime(2024, 1, 1, 10, tzinfo=timezone.utc)),
-            ("date", "DATE", date(2024, 1, 1)),
-            ("time", "TIME", time(10, 0, 0)),
+            *(
+                ("date-time", date_time_type, column_type, value)
+                for date_time_type, column_type in (
+                    ("timestamptz", "TIMESTAMPTZ"),
+                    ("timestamp", "DATETIME"),
+                )
+                for value in (
+                    datetime(2024, 1, 1, 10, 0, 0),  # noqa: DTZ001
+                    datetime(2024, 1, 1, 10, 0, 0, 500000),  # noqa: DTZ001
+                    datetime(2024, 1, 1, 10, tzinfo=timezone.utc),
+                )
+            ),
+            ("date", "timestamptz", "DATE", date(2024, 1, 1)),
+            ("time", "timestamptz", "TIME", time(10, 0, 0)),
         ],
     )
     def test_remerge_replaces_row(
-        self, tmp_path: Path, json_format: str, column_type: str, value: object
+        self,
+        tmp_path: Path,
+        json_format: str,
+        date_time_type: str,
+        column_type: str,
+        value: object,
     ):
         """The second merge of the same key replaces the first row."""
         flat_schema = {
@@ -1925,7 +1942,8 @@ class TestTemporalMergeKeys:
             "v": {"type": ["null", "string"]},
         }
         connector = DuckLakeConnector(self.CONFIG)
-        assert connector.json_to_ducklake_schema(flat_schema)[0]["type"] == column_type
+        ddl = connector.json_to_ducklake_schema(flat_schema, date_time_type)
+        assert ddl[0]["type"] == column_type
 
         con = duckdb.connect()
         con.execute("ATTACH ':memory:' AS ducklake_catalog")
@@ -2025,7 +2043,7 @@ class TestSqlDatatypeHints:
             ({"type": "string", "x-sql-datatype": "time with time zone"}, "VARCHAR"),
             (
                 {"type": "string", "format": "date-time", "x-sql-datatype": "datetime"},
-                "DATETIME",
+                "TIMESTAMPTZ",
             ),
         ],
     )
@@ -2035,10 +2053,16 @@ class TestSqlDatatypeHints:
             assert self._ddl_type(prop) == expected
 
     def test_no_hint_keeps_existing_mapping(self):
-        """Properties without a hint map exactly as before."""
+        """Properties without a hint map as before; date-time follows date_time_type.
+
+        TIMESTAMPTZ by default (DUCKLKD-89), TIMESTAMP with ``timestamp``.
+        """
+        date_time = {"type": "string", "format": "date-time"}
         assert self._ddl_type({"type": "number"}) == "DECIMAL(38, 9)"
         assert self._ddl_type({"type": "integer"}) == "BIGINT"
-        assert self._ddl_type({"type": "string", "format": "date-time"}) == "DATETIME"
+        assert self._ddl_type(date_time) == "TIMESTAMPTZ"
+        converter = JSONSchemaToDuckLake(date_time_type="timestamp")
+        assert str(converter.to_sql_type(date_time)) == "DATETIME"
 
     def test_staging_matches_ddl(self):
         """Decimal hints stage at the hinted precision; float hints stage as float64."""
@@ -3085,6 +3109,8 @@ class TestTimezoneOffsets:
             "temp_file_dir": str(tmp_path / "staging"),
             "load_method": "merge",
             "convert_tz_to_utc": convert_tz_to_utc,
+            # The wall-clock path; TestDateTimeType covers timestamptz.
+            "date_time_type": "timestamp",
         }
         target = Mock()
         target.config = config
@@ -3138,6 +3164,7 @@ class TestTimezoneOffsets:
             "flatten_max_level": 1,
             "auto_cast_timestamps": True,
             "convert_tz_to_utc": convert_tz_to_utc,
+            "date_time_type": "timestamp",
         }
         target = Mock()
         target.config = config
@@ -3547,6 +3574,341 @@ class TestTimezoneOffsets:
         )
         count = con.execute("SELECT count(*) FROM ducklake_catalog.s.t").fetchone()
         assert count == (1,)
+
+
+class TestDateTimeType:
+    """date_time_type: date-time properties load as TIMESTAMPTZ by default (DUCKLKD-89).
+
+    Values with an offset are stored as their instant, and values without one
+    are read as UTC, as target-iceberg reads them, whatever DuckDB's session
+    time zone (Asia/Tokyo here, where reading them locally is 9 hours off).
+    """
+
+    DATE_TIME: ClassVar[dict] = {"type": "string", "format": "date-time"}
+    NOON_UTC: ClassVar[float] = datetime(
+        2024, 1, 1, 12, tzinfo=timezone.utc
+    ).timestamp()
+
+    @staticmethod
+    def _config(**extra: object) -> dict:
+        return {
+            "catalog_url": "x",
+            "data_path": "/x",
+            "storage_type": "local",
+            **extra,
+        }
+
+    @pytest.mark.parametrize(
+        ("config", "expected"),
+        [
+            ({}, "timestamptz"),
+            ({"date_time_type": "timestamp"}, "timestamp"),
+            (
+                {
+                    "date_time_type": "timestamptz",
+                    "stream_defaults": {"date_time_type": "timestamp"},
+                },
+                "timestamp",
+            ),
+            (
+                {
+                    "date_time_type": "timestamp",
+                    "stream_defaults": {"date_time_type": "timestamp"},
+                    "stream_overrides": {"t": {"date_time_type": "timestamptz"}},
+                },
+                "timestamptz",
+            ),
+            (
+                {"stream_overrides": {"other": {"date_time_type": "timestamp"}}},
+                "timestamptz",
+            ),
+        ],
+        ids=["default", "top-level", "stream-defaults", "stream-override", "other"],
+    )
+    def test_precedence(self, config: dict, expected: str):
+        """stream_overrides, then stream_defaults, the top level, timestamptz."""
+        assert resolve_date_time_type(config, "t") == expected
+
+    def test_a_bad_stream_value_is_rejected_at_startup(self):
+        """Checked for every override, even a stream whose records never arrive."""
+        config = {"stream_overrides": {"t": {"date_time_type": "TIMESTAMPTZ"}}}
+        with pytest.raises(
+            LayoutError,
+            match=r"stream 't': date_time_type must be one of "
+            r"\['timestamptz', 'timestamp'\], not 'TIMESTAMPTZ'",
+        ):
+            check_layout_config(config)
+
+    def test_the_setting_leaves_the_layout_alone(self):
+        """Beside partition and sort_order, it isn't a layout setting."""
+        config = {
+            "stream_defaults": {"date_time_type": "timestamp", "sort_order": ["a"]}
+        }
+        check_layout_config(config)
+        layout = resolve_layout(config, "t", ["a"])
+        assert [key.column for key in layout.sort or ()] == ["a"]
+        assert layout.partition is None
+
+    def test_the_top_level_value_is_checked_by_the_config_schema(self):
+        """An unknown value fails the config validation, naming the allowed ones."""
+        with pytest.raises(ConfigValidationError):
+            Targetducklake(config=self._config(date_time_type="wall_clock"))
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (datetime(2024, 1, 1, 12), datetime(2024, 1, 1, 12, tzinfo=timezone.utc)),  # noqa: DTZ001
+            (
+                datetime(2024, 1, 1, 21, tzinfo=ZoneInfo("Asia/Tokyo")),
+                datetime(2024, 1, 1, 21, tzinfo=ZoneInfo("Asia/Tokyo")),
+            ),
+            ("2024-01-01T12:00:00", "2024-01-01 12:00:00.000000Z"),
+            ("2024-01-01 12:00", "2024-01-01 12:00:00.000000Z"),
+            ("2024-01-01T14:00:00+02:00", "2024-01-01T14:00:00+02:00"),
+            ("2024-01-01T12:00:00Z", "2024-01-01T12:00:00Z"),
+            ("not a date", "not a date"),
+            (None, None),
+        ],
+        ids=[
+            "naive",
+            "aware",
+            "naive-text",
+            "naive-text-minutes",
+            "offset-text",
+            "z-text",
+            "unparsable",
+            "null",
+        ],
+    )
+    def test_as_utc_instant(self, value: object, expected: object):
+        """Only values without a zone or offset change; DuckDB reads the rest."""
+        result = _as_utc_instant(value)
+        assert result == expected
+        if isinstance(expected, datetime):
+            assert result.tzinfo == expected.tzinfo
+
+    def test_staging_reads_zone_less_values_as_utc_only_in_named_columns(self):
+        """Columns not in utc_columns stage naive values as before."""
+        naive = datetime(2024, 1, 1, 12)  # noqa: DTZ001
+        schema = pa.schema([pa.field("At", pa.string()), pa.field("b", pa.string())])
+        rules = StagingRules(utc_columns=frozenset({"at"}))
+        staged = create_pyarrow_table([{"At": naive, "b": naive}], schema, rules=rules)
+        at, b = staged.column("At")[0].as_py(), staged.column("b")[0].as_py()
+        assert at.endswith("Z")
+        assert at.startswith("2024-01-01 12:00:00")
+        assert b == "2024-01-01 12:00:00.000000"
+
+    def _load(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        tmp_path: Path,
+        props: dict,
+        records: list[dict],
+        *,
+        key_properties: tuple[str, ...] = ("id",),
+        **config: object,
+    ) -> ducklakeSink:
+        """Merge records through the real sink, parsed as the singer-sdk parses them."""
+        full_config = {
+            **self._config(
+                data_path=str(tmp_path / "data"),
+                default_target_schema="s",
+                temp_file_dir=str(tmp_path / "staging"),
+                load_method="merge",
+                flatten_max_level=1,
+            ),
+            **config,
+        }
+        target = Mock()
+        target.config = full_config
+        connector = DuckLakeConnector(full_config)
+        schema = {"type": "object", "properties": {"id": {"type": "string"}, **props}}
+        with patch.object(
+            connector, "execute", side_effect=lambda sql: con.execute(sql)
+        ):
+            sink = ducklakeSink(
+                target=target,
+                stream_name="t",
+                schema=schema,
+                key_properties=list(key_properties),
+                connector=connector,
+            )
+            sink.setup()
+            context: dict = {}
+            for record in records:
+                sink.process_record(sink._validate_and_parse(record), context)
+            sink.process_batch(context)
+        return sink
+
+    @staticmethod
+    def _tokyo() -> duckdb.DuckDBPyConnection:
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'Asia/Tokyo'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        return con
+
+    def _types(self, con: duckdb.DuckDBPyConnection) -> dict[str, str]:
+        rows = con.execute("PRAGMA table_info('ducklake_catalog.s.t')").fetchall()
+        return {row[1]: row[2] for row in rows}
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "2024-01-01T12:00:00",
+            "2024-01-01T12:00:00Z",
+            "2024-01-01T21:00:00+09:00",
+            "2024-01-01T07:00:00-05:00",
+        ],
+        ids=["naive", "utc", "plus-9", "minus-5"],
+    )
+    def test_every_value_is_stored_as_its_utc_instant(self, tmp_path: Path, value: str):
+        """Top-level (parsed by the SDK), nested and auto-cast values alike.
+
+        The nested and auto-cast values reach staging as text, the top-level
+        one as a datetime.
+        """
+        con = self._tokyo()
+        props = {
+            "at": self.DATE_TIME,
+            "p": {"type": "object", "properties": {"at": self.DATE_TIME}},
+            "created_at": {"type": "string"},
+        }
+        self._load(
+            con,
+            tmp_path,
+            props,
+            [{"id": "a", "at": value, "p": {"at": value}, "created_at": value}],
+            auto_cast_timestamps=True,
+        )
+        types = self._types(con)
+        assert [types[c] for c in ("at", "p__at", "created_at")] == [
+            "TIMESTAMP WITH TIME ZONE"
+        ] * 3
+        row = con.execute(
+            'SELECT epoch("at"), epoch(p__at), epoch(created_at)'
+            " FROM ducklake_catalog.s.t"
+        ).fetchone()
+        assert row == (self.NOON_UTC,) * 3
+
+    def test_a_naive_merge_key_replaces_its_row(self, tmp_path: Path):
+        """The staged key and the stored key are the same UTC instant."""
+        con = self._tokyo()
+        props = {"at": self.DATE_TIME, "v": {"type": "string"}}
+        for v in ("first", "second"):
+            self._load(
+                con,
+                tmp_path,
+                props,
+                [{"id": "a", "at": "2024-01-01T12:00:00", "v": v}],
+                key_properties=("at",),
+            )
+        rows = con.execute('SELECT epoch("at"), v FROM ducklake_catalog.s.t').fetchall()
+        assert rows == [(self.NOON_UTC, "second")]
+
+    def test_an_existing_timestamp_column_keeps_its_type_and_values(
+        self, tmp_path: Path
+    ):
+        """Wall-clock times, staged as before; a new column gets TIMESTAMPTZ."""
+        con = self._tokyo()
+        con.execute("CREATE SCHEMA ducklake_catalog.s")
+        con.execute('CREATE TABLE ducklake_catalog.s.t (id VARCHAR, "at" TIMESTAMP)')
+        props = {"at": self.DATE_TIME, "later": self.DATE_TIME}
+        value = "2024-01-01T21:00:00+09:00"
+        self._load(con, tmp_path, props, [{"id": "a", "at": value, "later": value}])
+        types = self._types(con)
+        assert (types["at"], types["later"]) == (
+            "TIMESTAMP",
+            "TIMESTAMP WITH TIME ZONE",
+        )
+        row = con.execute(
+            'SELECT "at"::VARCHAR, epoch(later) FROM ducklake_catalog.s.t'
+        ).fetchone()
+        # As with date_time_type timestamp: the value's own wall-clock time.
+        assert row == ("2024-01-01 21:00:00", self.NOON_UTC)
+
+    def test_a_hint_still_decides(self, tmp_path: Path):
+        """A timestamp hint gives TIMESTAMP, whatever date_time_type says."""
+        con = self._tokyo()
+        props = {"at": {**self.DATE_TIME, "x-sql-datatype": "timestamp"}}
+        self._load(con, tmp_path, props, [{"id": "a", "at": "2024-01-01T12:00:00"}])
+        assert self._types(con)["at"] == "TIMESTAMP"
+
+    @pytest.mark.parametrize(
+        ("date_time_type", "expected"),
+        [("timestamptz", NOON_UTC), ("timestamp", NOON_UTC - 9 * 3600)],
+    )
+    def test_a_hinted_timestamptz_column_follows_the_setting(
+        self, tmp_path: Path, date_time_type: str, expected: float
+    ):
+        """With timestamp, a naive value is read in the session zone, as before."""
+        con = self._tokyo()
+        props = {"at": {**self.DATE_TIME, "x-sql-datatype": "timestamptz"}}
+        self._load(
+            con,
+            tmp_path,
+            props,
+            [{"id": "a", "at": "2024-01-01T12:00:00"}],
+            date_time_type=date_time_type,
+        )
+        assert (
+            con.execute('SELECT epoch("at") FROM ducklake_catalog.s.t').fetchone()[0]
+            == expected
+        )
+
+    @pytest.mark.parametrize(
+        ("column_type", "timestamptz"),
+        [("TIMESTAMPTZ", True), ("TIMESTAMP", False)],
+    )
+    def test_soft_delete_time_is_now_in_either_column_type(
+        self, column_type: str, *, timestamptz: bool
+    ):
+        """A TIMESTAMPTZ _sdc_deleted_at isn't set 9 hours early in Tokyo."""
+        con = self._tokyo()
+        con.execute("CREATE SCHEMA ducklake_catalog.s")
+        con.execute(
+            "CREATE TABLE ducklake_catalog.s.t "
+            f"(_sdc_table_version BIGINT, _sdc_deleted_at {column_type})"
+        )
+        con.execute("INSERT INTO ducklake_catalog.s.t VALUES (1, NULL)")
+        connector = DuckLakeConnector(self._config())
+        with patch.object(
+            connector, "execute", side_effect=lambda sql: con.execute(sql)
+        ):
+            connector.mark_other_versions_deleted(
+                "s", "t", 2, deleted_at_is_timestamptz=timestamptz
+            )
+        # epoch() of a TIMESTAMP reads its wall-clock time as UTC.
+        deleted_at = con.execute(
+            "SELECT epoch(_sdc_deleted_at) FROM ducklake_catalog.s.t"
+        ).fetchone()[0]
+        five_minutes = timedelta(minutes=5).total_seconds()
+        assert abs(datetime.now(timezone.utc).timestamp() - deleted_at) < five_minutes
+
+    def test_activate_version_marks_a_timestamptz_deleted_at_with_now(
+        self, tmp_path: Path
+    ):
+        """Through the sink: it passes the column's type to the soft delete."""
+        con = self._tokyo()
+        sink = self._load(
+            con,
+            tmp_path,
+            {},
+            [
+                {"id": "old", "_sdc_table_version": 1},
+                {"id": "new", "_sdc_table_version": 2},
+            ],
+            add_record_metadata=True,
+        )
+        with patch.object(
+            sink.connector, "execute", side_effect=lambda sql: con.execute(sql)
+        ):
+            sink.activate_version(2)
+        assert self._types(con)["_sdc_deleted_at"] == "TIMESTAMP WITH TIME ZONE"
+        deleted_at = con.execute(
+            "SELECT epoch(_sdc_deleted_at) FROM ducklake_catalog.s.t WHERE id = 'old'"
+        ).fetchone()[0]
+        five_minutes = timedelta(minutes=5).total_seconds()
+        assert abs(datetime.now(timezone.utc).timestamp() - deleted_at) < five_minutes
 
 
 class TestErrorHandling:
@@ -4379,10 +4741,9 @@ class TestActivateVersion:
             (2, "b", 1, True),
             (3, "c2", 2, False),
         ]
-        deleted_at = self._rows(tmp_path, "id, _sdc_deleted_at")[1][1]
-        assert abs(datetime.now(timezone.utc).replace(tzinfo=None) - deleted_at) < (
-            timedelta(minutes=5)
-        )
+        deleted_at = self._rows(tmp_path, "id, epoch(_sdc_deleted_at)")[1][1]
+        five_minutes = timedelta(minutes=5).total_seconds()
+        assert abs(datetime.now(timezone.utc).timestamp() - deleted_at) < five_minutes
         self._run(tmp_path, self._sync(3, {1: "a3", 2: "b3", 3: "c3"}))
         assert self._rows(tmp_path, columns) == [
             (1, "a3", 3, False),

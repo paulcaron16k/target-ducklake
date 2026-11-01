@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 from singer_sdk import typing as th
 from singer_sdk.target_base import SQLTarget
 
-from target_ducklake.layout import LayoutError, check_layout_config
+from target_ducklake.layout import DATE_TIME_TYPES, LayoutError, check_layout_config
 from target_ducklake.parquet_utils import PERMISSIVE, VALUE_TYPE_CHECKING_MODES
 from target_ducklake.sinks import (
     ducklakeSink,
@@ -510,6 +510,21 @@ class Targetducklake(SQLTarget):
                 "column and the value: use it while onboarding a source. A value a "
                 "column can't hold at all, such as one with too many integer digits, "
                 "fails either way, as DuckDB's cast would."
+            ),
+        ),
+        th.Property(
+            "date_time_type",
+            th.StringType(allowed_values=list(DATE_TIME_TYPES)),
+            default=DATE_TIME_TYPES[0],
+            title="Date-Time Type",
+            description=(
+                "The column type of a format date-time property without an "
+                "x-sql-datatype hint. timestamptz (default) loads instants, as "
+                "target-iceberg does: a value with an offset is stored as its UTC "
+                "instant, and a value without one is read as UTC. timestamp loads "
+                "wall-clock times, as before (see convert_tz_to_utc). Applies to new "
+                "tables and new columns; an existing TIMESTAMP column keeps its "
+                "type. Can be set per stream in stream_defaults and stream_overrides."
             ),
         ),
         th.Property(

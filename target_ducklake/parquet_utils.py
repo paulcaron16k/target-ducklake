@@ -151,6 +151,27 @@ def _normalize_datetime(value):
     return value
 
 
+def _as_utc_instant(value: object) -> object:
+    """A date-time without a zone or offset, read as UTC.
+
+    A naive datetime gets the UTC zone. Text the singer-sdk didn't parse (a
+    flattened nested value, say) is parsed as the SDK parses date-times; text
+    without an offset becomes UTC text ('2024-01-01 10:00:00.000000Z'). Aware
+    values, and text that has an offset or doesn't parse, are left as they
+    are: DuckDB reads their offset itself.
+    """
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return value
+        if parsed.tzinfo is None:
+            return _datetime_text(parsed.replace(tzinfo=timezone.utc))
+    return value
+
+
 def _normalize_data_for_pyarrow(data: dict, datetime_fields: list[str]) -> dict:
     """Normalize data values to be compatible with PyArrow.
 
@@ -192,14 +213,24 @@ class StagingRules:
     that isn't a number) fails either way, as DuckDB's cast fails on it.
 
     ``key_columns`` holds the key columns' lowercased names.
+
+    ``utc_columns`` holds the lowercased names of the TIMESTAMPTZ columns in
+    which a date-time without a zone or offset is read as UTC, as
+    target-iceberg reads it, instead of in DuckDB's session time zone (the
+    machine's local zone by default).
     """
 
     strict: bool = False
     key_columns: frozenset[str] = frozenset()
+    utc_columns: frozenset[str] = frozenset()
 
     def is_key(self, column: str) -> bool:
         """Whether the column is a key column, matched case-insensitively."""
         return column.lower() in self.key_columns
+
+    def is_utc(self, column: str) -> bool:
+        """Whether a zone-less date-time in the column is UTC (case-insensitive)."""
+        return column.lower() in self.utc_columns
 
 
 DEFAULT_STAGING_RULES = StagingRules()
@@ -522,6 +553,9 @@ def create_pyarrow_table(
         field.name: [row.get(field.name) for row in list_dict]
         for field in pyarrow_schema
     }
+    for name, values in data.items():
+        if rules.is_utc(name):
+            data[name] = [_as_utc_instant(v) for v in values]
     # With convert_tz_to_utc, move aware datetimes to UTC before they are
     # formatted as text below.
     normalized_data = _normalize_data_for_pyarrow(data, datetime_fields)

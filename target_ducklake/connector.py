@@ -165,7 +165,12 @@ def is_unsized_singer_decimal(schema: dict) -> bool:
 
 
 class JSONSchemaToDuckLake(JSONSchemaToSQL):
-    """Convert JSON Schema types to DuckLake compatible types."""
+    """Convert JSON Schema types to DuckLake compatible types.
+
+    ``date_time_type`` is the column type of a ``date-time`` property without
+    an ``x-sql-datatype`` hint: ``timestamptz`` (TIMESTAMPTZ, the default) or
+    ``timestamp`` (TIMESTAMP, wall-clock time).
+    """
 
     def to_sql_type(self, schema: dict) -> TypeEngine:
         """Convert a property schema, honouring its ``x-sql-datatype`` hint first.
@@ -196,8 +201,12 @@ class JSONSchemaToDuckLake(JSONSchemaToSQL):
         )
         return super().to_sql_type(unhinted)
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, date_time_type: str = "timestamptz", **kwargs):
         super().__init__(*args, **kwargs)
+        if date_time_type == "timestamptz":
+            self.register_format_handler(
+                "date-time", lambda _: DuckDBType("TIMESTAMPTZ")
+            )
         # Override the default type handler for object and array types
         self.register_type_handler("object", JSON)
         self.register_type_handler("array", JSON)
@@ -829,19 +838,27 @@ class DuckLakeConnector(SQLConnector):
         self.execute(delete_sql)
 
     def mark_other_versions_deleted(
-        self, target_schema_name: str, table_name: str, version: int
+        self,
+        target_schema_name: str,
+        table_name: str,
+        version: int,
+        *,
+        deleted_at_is_timestamptz: bool = False,
     ) -> None:
         """Soft-delete the rows whose table version is not the given one.
 
-        Sets their ``_sdc_deleted_at`` to the current UTC time in one
-        transaction, keeping the time of rows already marked deleted. Rows
-        without a version are marked too, as in ``delete_other_versions``.
+        Sets their ``_sdc_deleted_at`` to the current time in one transaction,
+        keeping the time of rows already marked deleted. Rows without a
+        version are marked too, as in ``delete_other_versions``. A TIMESTAMP
+        column gets the UTC wall-clock time; a TIMESTAMPTZ column gets the
+        instant itself, since the UTC wall-clock time would be read in the
+        session time zone.
         """
         table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
+        now = "now()" if deleted_at_is_timestamptz else "now() AT TIME ZONE 'UTC'"
         update_sql = (
             "BEGIN TRANSACTION;\n"
-            f'UPDATE {table_ref} SET "{DELETED_AT_COLUMN}" = '
-            "now() AT TIME ZONE 'UTC' "
+            f'UPDATE {table_ref} SET "{DELETED_AT_COLUMN}" = {now} '
             f'WHERE "{VERSION_COLUMN}" IS DISTINCT FROM {int(version)} '
             f'AND "{DELETED_AT_COLUMN}" IS NULL;\n'
             "COMMIT;"
@@ -943,12 +960,17 @@ class DuckLakeConnector(SQLConnector):
 
         self.execute(combined_sql)
 
-    def json_to_ducklake_schema(self, schema: dict) -> list[dict[str, str]]:
+    def json_to_ducklake_schema(
+        self, schema: dict, date_time_type: str = "timestamptz"
+    ) -> list[dict[str, str]]:
         """Convert a JSON schema to an array of dictionaries with column name and type.
         Example Output: [{'name': 'id', 'type': 'INTEGER'}, {'name': 'name', 'type': 'STRING'}]
+
+        ``date_time_type`` is the type of unhinted date-time properties (see
+        ``JSONSchemaToDuckLake``).
         """
         ducklake_schema = []
-        converter = JSONSchemaToDuckLake()
+        converter = JSONSchemaToDuckLake(date_time_type=date_time_type)
         for prop_name, prop_schema in schema.items():
             if is_unsized_singer_decimal(prop_schema):
                 logger.warning(
