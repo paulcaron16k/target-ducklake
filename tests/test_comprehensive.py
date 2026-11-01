@@ -3277,12 +3277,24 @@ class TestTimezoneOffsets:
             datetime(1, 1, 1, 0, 5, tzinfo=ZoneInfo("Europe/Paris")),
             "0000-12-31 23:55:39.000000Z",
         ),
+        (
+            datetime(
+                9999, 12, 31, 23, 59, 59, 999999, tzinfo=timezone(-timedelta(hours=5))
+            ),
+            "10000-01-01 04:59:59.999999Z",
+        ),
+        (
+            datetime(1, 1, 1, 0, 0, tzinfo=timezone(timedelta(hours=9, seconds=30))),
+            "0000-12-31 14:59:30.000000Z",
+        ),
     ]
     BEYOND_IDS: ClassVar[list[str]] = [
         "past-9999",
         "before-1",
         "named-zone-past-9999",
         "lmt-before-1",
+        "microseconds",
+        "offset-with-seconds",
     ]
 
     @pytest.mark.parametrize(("value", "utc"), BEYOND, ids=BEYOND_IDS)
