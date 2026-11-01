@@ -152,24 +152,29 @@ def _normalize_datetime(value):
 
 
 def _as_utc_instant(value: object) -> object:
-    """A date-time without a zone or offset, read as UTC.
+    """A date-time as UTC text, a value without a zone or offset read as UTC.
 
-    A naive datetime gets the UTC zone. Text the singer-sdk didn't parse (a
-    flattened nested value, say) is parsed as the SDK parses date-times; text
-    without an offset becomes UTC text ('2024-01-01 10:00:00.000000Z'). Aware
-    values, and text that has an offset or doesn't parse, are left as they
-    are: DuckDB reads their offset itself.
+    Every spelling of an instant becomes the same text
+    ('2024-01-01 12:00:00.000000Z'), so the in-batch key dedup, which compares
+    the staged values, sees '...12:00Z', '...21:00+09:00' and a naive
+    '...12:00' as one key. Text the singer-sdk didn't parse (a flattened
+    nested value, say) is parsed as the SDK parses date-times. Text that
+    doesn't parse, and a value whose UTC time leaves the year range, are left
+    as they are for DuckDB to read or refuse.
     """
-    if isinstance(value, datetime):
-        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
     if isinstance(value, str):
         try:
-            parsed = datetime.fromisoformat(value)
+            value = datetime.fromisoformat(value)
         except ValueError:
             return value
-        if parsed.tzinfo is None:
-            return _datetime_text(parsed.replace(tzinfo=timezone.utc))
-    return value
+    if not isinstance(value, datetime):
+        return value
+    if value.tzinfo is None:
+        return _datetime_text(value.replace(tzinfo=timezone.utc))
+    try:
+        return _datetime_text(value.astimezone(timezone.utc))
+    except OverflowError:
+        return value
 
 
 def _normalize_data_for_pyarrow(data: dict, datetime_fields: list[str]) -> dict:

@@ -3654,18 +3654,24 @@ class TestDateTimeType:
         with pytest.raises(ConfigValidationError):
             Targetducklake(config=self._config(date_time_type="wall_clock"))
 
+    LATE: ClassVar[datetime] = datetime(
+        9999, 12, 31, 23, tzinfo=timezone(timedelta(hours=-5))
+    )
+
     @pytest.mark.parametrize(
         ("value", "expected"),
         [
-            (datetime(2024, 1, 1, 12), datetime(2024, 1, 1, 12, tzinfo=timezone.utc)),  # noqa: DTZ001
+            (datetime(2024, 1, 1, 12), "2024-01-01 12:00:00.000000Z"),  # noqa: DTZ001
             (
                 datetime(2024, 1, 1, 21, tzinfo=ZoneInfo("Asia/Tokyo")),
-                datetime(2024, 1, 1, 21, tzinfo=ZoneInfo("Asia/Tokyo")),
+                "2024-01-01 12:00:00.000000Z",
             ),
             ("2024-01-01T12:00:00", "2024-01-01 12:00:00.000000Z"),
             ("2024-01-01 12:00", "2024-01-01 12:00:00.000000Z"),
-            ("2024-01-01T14:00:00+02:00", "2024-01-01T14:00:00+02:00"),
-            ("2024-01-01T12:00:00Z", "2024-01-01T12:00:00Z"),
+            ("2024-01-01T14:00:00+02:00", "2024-01-01 12:00:00.000000Z"),
+            ("2024-01-01T12:00:00Z", "2024-01-01 12:00:00.000000Z"),
+            ("2024-01-01T12:00:00.5", "2024-01-01 12:00:00.500000Z"),
+            (LATE, LATE),
             ("not a date", "not a date"),
             (None, None),
         ],
@@ -3676,16 +3682,15 @@ class TestDateTimeType:
             "naive-text-minutes",
             "offset-text",
             "z-text",
+            "fraction-text",
+            "beyond-year-9999-in-utc",
             "unparsable",
             "null",
         ],
     )
     def test_as_utc_instant(self, value: object, expected: object):
-        """Only values without a zone or offset change; DuckDB reads the rest."""
-        result = _as_utc_instant(value)
-        assert result == expected
-        if isinstance(expected, datetime):
-            assert result.tzinfo == expected.tzinfo
+        """Every spelling of an instant is the same UTC text; the rest is unchanged."""
+        assert _as_utc_instant(value) == expected
 
     def test_staging_reads_zone_less_values_as_utc_only_in_named_columns(self):
         """Columns not in utc_columns stage naive values as before."""
@@ -3804,6 +3809,19 @@ class TestDateTimeType:
             )
         rows = con.execute('SELECT epoch("at"), v FROM ducklake_catalog.s.t').fetchall()
         assert rows == [(self.NOON_UTC, "second")]
+
+    def test_one_instant_spelt_three_ways_is_one_key(self, tmp_path: Path):
+        """The in-batch dedup compares instants: 'Z', '+09:00' and naive are one key."""
+        con = self._tokyo()
+        props = {"at": self.DATE_TIME, "v": {"type": "string"}}
+        records = [
+            {"id": "a", "at": "2024-01-01T12:00:00Z", "v": "z"},
+            {"id": "a", "at": "2024-01-01T21:00:00+09:00", "v": "tokyo"},
+            {"id": "a", "at": "2024-01-01T12:00:00", "v": "naive"},
+        ]
+        self._load(con, tmp_path, props, records, key_properties=("at",))
+        rows = con.execute('SELECT epoch("at"), v FROM ducklake_catalog.s.t').fetchall()
+        assert rows == [(self.NOON_UTC, "naive")]
 
     def test_an_existing_timestamp_column_keeps_its_type_and_values(
         self, tmp_path: Path
