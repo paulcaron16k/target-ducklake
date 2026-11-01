@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import io
 import itertools
@@ -4139,7 +4140,13 @@ class TestBase64Binary:
             create_pyarrow_table([{"b": value}], schema)
 
     @staticmethod
-    def _run(tmp_path: Path, props: dict, records: list[dict]) -> None:
+    def _run(
+        tmp_path: Path,
+        props: dict,
+        records: list[dict],
+        key: str = "id",
+        **extra: object,
+    ) -> None:
         config = {
             "catalog_type": "sqlite",
             "catalog_url": str(tmp_path / "catalog.sqlite"),
@@ -4148,6 +4155,7 @@ class TestBase64Binary:
             "default_target_schema": "s",
             "temp_file_dir": str(tmp_path / "staging") + "/",
             "flatten_max_level": 1,
+            **extra,
         }
         schema = {"type": "object", "properties": {"id": {"type": "integer"}, **props}}
         messages = [
@@ -4155,7 +4163,7 @@ class TestBase64Binary:
                 "type": "SCHEMA",
                 "stream": "t",
                 "schema": schema,
-                "key_properties": ["id"],
+                "key_properties": [key],
             },
             *({"type": "RECORD", "stream": "t", "record": r} for r in records),
         ]
@@ -4229,10 +4237,75 @@ class TestBase64Binary:
             (self.PAYLOAD, "second")
         ]
 
+    @pytest.mark.parametrize("load_method", ["append", "merge", "overwrite"])
+    def test_each_load_method_with_a_duplicate_blob_key(
+        self, tmp_path: Path, load_method: str
+    ):
+        """Two records for one BLOB key in a batch: each method keeps the last.
+
+        Run twice: append adds the batch again, merge and overwrite don't.
+        """
+        other = base64.b64encode(b"\xff\x00").decode()
+        records: list[dict] = [
+            {"id": 1, "k": self.TEXT, "v": "first"},
+            {"id": 2, "k": self.TEXT, "v": "last"},
+            {"id": 3, "k": other, "v": "other"},
+        ]
+        props = {"k": self.B64, "v": {"type": "string"}}
+        for _ in range(2):  # a second run: overwrite replaces, append adds
+            self._run(tmp_path, props, records, key="k", load_method=load_method)
+        rows = self._query(tmp_path, "SELECT k, v FROM lake.s.t ORDER BY v")
+        # The in-batch dedup keeps the last record of each BLOB key.
+        one_run = [(self.PAYLOAD, "last"), (b"\xff\x00", "other")]
+        runs = 2 if load_method == "append" else 1
+        assert rows == sorted(one_run * runs, key=lambda r: r[1])
+
     def test_an_invalid_value_fails_the_run_naming_the_column(self, tmp_path: Path):
         """Nothing is loaded from the batch, rather than wrong bytes."""
         with pytest.raises(ValueError, match="Column 'b' holds binary data"):
             self._run(tmp_path, {"b": self.B64}, [{"id": 1, "b": "not base64!"}])
+
+    @pytest.mark.parametrize("text", ["hello", "a\\x41", "é", "C:\\xyz"])
+    def test_text_without_the_encoding_into_a_blob_column_fails_naming_it(
+        self, tmp_path: Path, text: str
+    ):
+        """Not the text's own bytes, nor DuckDB's escapes, nor a bare cast error.
+
+        The table's column is BLOB (an earlier stream declared base64); this
+        stream doesn't say how its text stands for bytes.
+        """
+        self._run(tmp_path, {"b": self.B64}, [{"id": 1, "b": self.TEXT}])
+        plain = {"type": ["null", "string"]}
+        with pytest.raises(
+            ValueError,
+            match=r"Column 'b' is BLOB, but property 'b' doesn't declare "
+            r"contentEncoding: base64",
+        ):
+            self._run(tmp_path, {"b": plain}, [{"id": 2, "b": text}])
+        assert self._query(tmp_path, "SELECT id, b FROM lake.s.t") == [
+            (1, self.PAYLOAD)
+        ]
+
+    def test_an_identity_partition_on_a_blob_column_is_refused(self, tmp_path: Path):
+        """DuckLake fails on non-UTF-8 bytes as identity partition values.
+
+        ("Invalid unicode (byte sequence mismatch)"); a bucket works.
+        """
+        with pytest.raises(LayoutError, match=r"identity partition on BLOB column 'b'"):
+            self._run(
+                tmp_path,
+                {"b": self.B64},
+                [{"id": 1, "b": self.TEXT}],
+                stream_overrides={"t": {"partition": [{"column": "b"}]}},
+            )
+        bucket = [{"column": "b", "transform": "bucket", "num_buckets": 4}]
+        self._run(
+            tmp_path,
+            {"b": self.B64},
+            [{"id": 1, "b": self.TEXT}],
+            stream_overrides={"t": {"partition": bucket}},
+        )
+        assert self._query(tmp_path, "SELECT b FROM lake.s.t") == [(self.PAYLOAD,)]
 
     def test_an_existing_varchar_column_keeps_its_text(self, tmp_path: Path):
         """A column loaded as text before keeps the text as sent, not decoded."""

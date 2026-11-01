@@ -28,7 +28,11 @@ from target_ducklake.flatten import (
     nullable_choices,
     truncate_column_names,
 )
-from target_ducklake.layout import resolve_date_time_type, resolve_layout
+from target_ducklake.layout import (
+    LayoutError,
+    resolve_date_time_type,
+    resolve_layout,
+)
 from target_ducklake.parquet_utils import (
     STRICT,
     StagingRules,
@@ -36,6 +40,7 @@ from target_ducklake.parquet_utils import (
     staging_schema,
     staging_type,
 )
+from target_ducklake.type_hints import declares_base64_binary
 
 
 def _is_timestamptz(column_type: str) -> bool:
@@ -132,6 +137,7 @@ class ducklakeSink(SQLSink):
             # A shared config names columns in full; Postgres catalogs truncate.
             aliases=self._column_name_mapping,
         )
+        self._check_partition_types()
 
         if not self.config.get("load_method"):
             self.logger.info(
@@ -259,11 +265,57 @@ class ducklakeSink(SQLSink):
         # DuckDB matches identifiers case-insensitively, and the singer-sdk
         # lowercases key_properties while columns keep the property's case.
         self._table_types = {name.lower(): typ for name, typ in table_types.items()}
+        self._check_blob_columns()
         self.pyarrow_schema = staging_schema(
             self._staged_columns(
                 self.ducklake_schema, self._table_types, self.flatten_schema
             )
         )
+
+    def _check_partition_types(self) -> None:
+        """Refuse an identity partition on a BLOB column.
+
+        DuckLake stores identity partition values as text and fails on bytes
+        that aren't UTF-8 ("Invalid unicode (byte sequence mismatch)"), so the
+        batch would fail at insert for most binary values. A bucket works.
+        """
+        types = {c["name"].lower(): c["type"] for c in self.ducklake_schema}
+        for key in self.layout.partition or ():
+            column_type = types.get(key.column.lower(), "")
+            if key.transform == "identity" and pa.types.is_binary(
+                staging_type(column_type)
+            ):
+                msg = (
+                    f"stream {self.stream_name!r}: identity partition on BLOB "
+                    f"column {key.column!r}. DuckLake stores identity partition "
+                    "values as text and fails on bytes that aren't UTF-8; use "
+                    "transform: bucket (with num_buckets) instead."
+                )
+                raise LayoutError(msg)
+
+    def _check_blob_columns(self) -> None:
+        r"""Refuse to load text into a BLOB column without its encoding.
+
+        A table's BLOB column holds bytes; a property that doesn't declare
+        ``contentEncoding: base64`` doesn't say how its text stands for them.
+        DuckDB's VARCHAR to BLOB cast would store the text's own bytes
+        ('hello'), read its backslash escapes ('a\x41' as 'aA'), or fail
+        on other text without naming the property.
+        """
+        for column in self.ducklake_schema:
+            name = column["name"]
+            table_type = self._table_types.get(name.lower())
+            if table_type is None or not pa.types.is_binary(staging_type(table_type)):
+                continue
+            if declares_base64_binary(self.flatten_schema.get(name, {})):
+                continue
+            msg = (
+                f"Column {name!r} is BLOB, but property {name!r} doesn't declare "
+                "contentEncoding: base64, so how its text stands for bytes is "
+                "unknown. Declare contentEncoding: base64, as the column was "
+                "loaded, or load the text into another column."
+            )
+            raise ValueError(msg)
 
     @staticmethod
     def _staged_columns(
