@@ -27,6 +27,7 @@ dependencies = [
     "psutil>=5.9.0",
     "pyarrow>=20.0.0",
     "ruff>=0.12.5",
+    "simplejson>=3.17.6",
     "singer-sdk[faker]~=0.46.4",
     "sqlalchemy>=2.0.41",
 ]

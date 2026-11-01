@@ -15,7 +15,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NamedTuple
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
@@ -31,9 +31,9 @@ from target_ducklake.connector import (
     JSONSchemaToDuckLake,
 )
 from target_ducklake.flatten import (
-    CustomJSONEncoder,
     _apply_timestamp_format,
     _should_auto_cast_to_timestamp,
+    dump_json_value,
     flatten_record,
     flatten_schema,
     truncate_column_names,
@@ -405,12 +405,15 @@ class TestFlattenModule:
         assert result["user__name"] == "John Doe"
         assert result["user__email"] == "john@example.com"
 
-    def test_custom_json_encoder(self):
-        """Test CustomJSONEncoder handles Decimal objects."""
-        encoder = CustomJSONEncoder()
-        result = encoder.default(Decimal("123.45"))
-        assert result == 123.45
-        assert isinstance(result, float)
+    def test_dump_json_value_encodes_dates_as_iso_text(self):
+        """Dates and datetimes inside a JSON value become ISO text."""
+        value = {
+            "d": date(2020, 1, 2),
+            "t": datetime(2020, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+        }
+        assert dump_json_value(value) == (
+            '{"d": "2020-01-02", "t": "2020-01-02T03:04:05+00:00"}'
+        )
 
     def test_should_auto_cast_to_timestamp(self):
         """Test timestamp auto-casting logic."""
@@ -1598,6 +1601,110 @@ class TestSingerDecimal:
         rows = self._load(tmp_path, prop, ["1.5"])
         assert rows == [("2", "DECIMAL(10,0)")]
         assert "1 value(s) in column 'amount'" in capfd.readouterr().err
+
+
+class _Pair(NamedTuple):
+    a: int
+    b: int
+
+
+class TestJsonColumnDecimals:
+    """Decimals inside JSON columns keep every digit (DUCKLKD-22)."""
+
+    def test_nested_decimals_keep_every_digit(self):
+        """Objects and arrays are dumped with the Decimal's digits, not a float's."""
+        record = {
+            "payload": {"amount": Decimal("12345678901234567890.123456789")},
+            "rates": [Decimal("0.1000000000000000055511"), Decimal("1E+400")],
+        }
+        result = flatten_record(record)
+        assert result["payload"] == '{"amount": 12345678901234567890.123456789}'
+        assert result["rates"] == "[0.1000000000000000055511, 1E+400]"
+
+    def test_a_scalar_in_an_object_column_keeps_every_digit(self):
+        """A bare Decimal in a column typed object is dumped as its digits too."""
+        schema = {"payload": {"type": ["null", "object"]}}
+        result = flatten_record(
+            {"payload": Decimal("0.12345678901234567890")}, flatten_schema=schema
+        )
+        assert result["payload"] == "0.12345678901234567890"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            {"a": {"b": [1, "x", None, True, False]}},
+            {"é": 'ü\n"q"'},
+            [1e22, 1e-7, 2.5, -0.0, 10**30],
+            {1: "int key", 2.5: "float key", None: "null key"},
+            {"x": float("nan"), "y": [float("inf"), float("-inf")]},
+            {"x": _Pair(1, 2)},
+            {"x": (1, 2)},
+        ],
+        ids=[
+            "nested",
+            "unicode",
+            "numbers",
+            "non-str-keys",
+            "nan-and-infinity",
+            "namedtuple",
+            "tuple",
+        ],
+    )
+    def test_values_without_decimals_are_dumped_as_before(self, value: object):
+        """Byte for byte what json.dumps wrote, NaN and namedtuples included."""
+        assert dump_json_value(value) == json.dumps(value)
+
+    def test_loaded_json_keeps_every_digit_and_stays_numeric(self, tmp_path: Path):
+        """Through listen() on a real catalog: valid JSON, numbers stay numbers."""
+        config = {
+            "catalog_type": "sqlite",
+            "catalog_url": str(tmp_path / "catalog.sqlite"),
+            "data_path": str(tmp_path / "data") + "/",
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging") + "/",
+        }
+        schema = {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer"},
+                "payload": {"type": ["null", "object"]},
+                "rates": {"type": ["null", "array"]},
+            },
+        }
+        schema_message = {"type": "SCHEMA", "stream": "t", "schema": schema}
+        # Written by hand: json.dumps would round the numbers through float.
+        record = (
+            '{"type": "RECORD", "stream": "t", "record": {"id": 1, '
+            '"payload": {"amount": 12345678901234567890.123456789}, '
+            '"rates": [0.1000000000000000055511, 2.5]}}\n'
+        )
+        target = Targetducklake(config=config)
+        target.listen(
+            file_input=io.StringIO(
+                json.dumps({**schema_message, "key_properties": ["id"]}) + "\n" + record
+            )
+        )
+        target.target_connector.close()
+        con = duckdb.connect()
+        con.execute(
+            f"ATTACH 'ducklake:sqlite:{tmp_path / 'catalog.sqlite'}' AS lake "
+            f"(DATA_PATH '{tmp_path / 'data'}/')"
+        )
+        row = con.execute(
+            "SELECT payload::VARCHAR, rates::VARCHAR, json_valid(payload),"
+            " json_valid(rates), json_type(payload, '$.amount'),"
+            " json_type(rates, '$[0]') FROM lake.s.t"
+        ).fetchone()
+        con.close()
+        assert row == (
+            '{"amount": 12345678901234567890.123456789}',
+            "[0.1000000000000000055511, 2.5]",
+            True,
+            True,
+            "DOUBLE",
+            "DOUBLE",
+        )
 
 
 class TestIntegrationScenarios:
